@@ -1,0 +1,96 @@
+#!/usr/sbin/nft -f
+# gatekeeper static egress baseline (decisions D9 / R6 / R7) — applied at boot
+# by gatekeeper-baseline.service BEFORE gatekeeper.service starts.
+#
+# Ownership contract: the gatekeeper NEVER edits this layer. It only adds or
+# removes ELEMENTS inside grants_v4/grants_v6 (per-element kernel TTL = D3).
+# This file pre-creates those two sets EMPTY so the lookup rules below parse;
+# their definitions MUST stay byte-compatible with gk_core::nft ensure_base()
+# (crates/core/src/nft.rs) or gatekeeper startup fails.
+#
+# Grammar is the probe-verified nft 1.1.6 form (tool-planning/01-nftables-probe.md):
+# set keys are `ip daddr . meta l4proto . th dport` and rule concats match that
+# key order exactly; no `counter` flag on sets — named counter objects only.
+#
+# RELOAD CONTRACT (open item O3): do not reload this file while grants are
+# live (`add set` on an existing set aborts). Change sequence:
+#   systemctl stop gatekeeper \
+#     && nft delete table inet gatekeeper || true \
+#     && nft -f /etc/gatekeeper/baseline.nft \
+#     && systemctl start gatekeeper
+# Escape hatch if the egress policy ever locks you out: LXC console from the
+# Proxmox host (never network-dependent), then `nft delete table inet gatekeeper`.
+
+table inet gatekeeper {
+    # ---- human-managed carve-outs -------------------------------------
+    # Same key grammar as the grant sets so one rule shape serves both.
+    # Populate with engagement-essential services (dnf/mirrors, admin ssh
+    # egress, ...). Example:
+    #   nft add element inet gatekeeper carve_v4 '{ 151.101.0.0/16 . tcp . 443 }'
+    set carve_v4 {
+        typeof ip daddr . meta l4proto . th dport
+        flags interval
+    }
+    set carve_v6 {
+        typeof ip6 daddr . meta l4proto . th dport
+        flags interval
+    }
+
+    # ---- gatekeeper-owned element sets (created EMPTY here) ------------
+    set grants_v4 {
+        typeof ip daddr . meta l4proto . th dport
+        flags interval,timeout
+        timeout 86400s
+    }
+    set grants_v6 {
+        typeof ip6 daddr . meta l4proto . th dport
+        flags interval,timeout
+        timeout 86400s
+    }
+
+    counter gk_drops { }
+
+    # Accounting chains (R4): declared EMPTY by the baseline, but CONTENTS are
+    # owned exclusively by gatekeeper (flush + rebuild from its ledger). Rules
+    # here only ever carry named counters — no verdict can live in these
+    # chains, so they cannot influence enforcement. Priority filter-10: they
+    # observe every locally-generated packet BEFORE the egress verdict runs,
+    # and the input chain catches established replies (reply-tuple trick).
+    chain acct_out {
+        type filter hook output priority -10; policy accept;
+    }
+    chain acct_in {
+        type filter hook input priority -10; policy accept;
+    }
+
+    chain egress {
+        type filter hook output priority filter; policy drop;
+
+        oifname "lo" accept
+        ct state established,related accept
+
+        # R7 v1 carve-outs: DHCP (v4 client/server, v6), DNS (D6: not blocked),
+        # ICMP + ICMPv6 to any host.
+        meta l4proto udp th dport { 67, 68, 546, 547 } accept
+        meta l4proto udp th dport 53 accept
+        meta l4proto tcp th dport 53 accept
+        meta l4proto icmp accept
+        meta l4proto icmpv6 accept
+
+        # human-populated essential services (dnf/mirrors live here)
+        ip  daddr . meta l4proto . tcp dport @carve_v4 accept
+        ip  daddr . meta l4proto . udp dport @carve_v4 accept
+        ip6 daddr . meta l4proto . tcp dport @carve_v6 accept
+        ip6 daddr . meta l4proto . udp dport @carve_v6 accept
+
+        # model-approved grants (elements + kernel TTL owned by gatekeeper)
+        ip  daddr . meta l4proto . tcp dport @grants_v4 accept
+        ip  daddr . meta l4proto . udp dport @grants_v4 accept
+        ip6 daddr . meta l4proto . tcp dport @grants_v6 accept
+        ip6 daddr . meta l4proto . udp dport @grants_v6 accept
+
+        # R8: the kill switch is `scopeadm stop` (grant removal), never this
+        # chain — baseline needs no off-switch; it is the safe-by-default state.
+        counter name gk_drops limit rate 20/second log prefix "GK-DROP: " drop
+    }
+}

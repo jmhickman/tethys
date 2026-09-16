@@ -1,0 +1,22 @@
+# /etc/gatekeeper/config.toml — gatekeeper daemon configuration.
+# Unknown keys are rejected at startup (loud typos). CLI flags override these.
+
+# Sockets
+mcp_socket  = "/run/gatekeeper/mcp.sock"    # scope-mcp connects here (SO_PEERCRED-pinned)
+admin_socket = "/run/gatekeeper/admin.sock"  # scopeadm/TUI, 0600 root-only
+
+# Persistence
+db = "/var/lib/gatekeeper/ledger.db"         # rusqlite WAL ledger
+
+# Policy knobs
+max_ttl = "4h"              # ceiling on any grant, even human-approved
+approver_timeout_secs = 300 # pending request auto-deny after this silence
+
+# Identities (names resolved to uids at startup)
+agent_user = "hermes-agent" # uid model-run tooling executes under; used by the
+                            # firewall baseline + future per-agent rules.
+mcp_user   = "scopemcp"     # runs scope-mcp; ONLY this uid is accepted on
+                            # mcp.sock. Missing user => startup error (deploy bug),
+                            # unless dev-only --allow-missing-users is passed.
+
+dry_run = false             # true: sockets+ledger only, never touch nftables

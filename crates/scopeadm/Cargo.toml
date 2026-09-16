@@ -1,0 +1,12 @@
+[package]
+name = "scopeadm"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+gk-core.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+clap.workspace = true
+anyhow.workspace = true

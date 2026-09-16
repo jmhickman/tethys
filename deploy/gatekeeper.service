@@ -1,0 +1,23 @@
+[Unit]
+Description=Pentest scope enforcement gatekeeper (grant ledger + nft enforcer)
+Documentation=file:///root/gatekeeper/deploy/README.md
+Requires=gatekeeper-baseline.service
+After=gatekeeper-baseline.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/gatekeeper --config /etc/gatekeeper/config.toml
+Restart=on-failure
+RestartSec=2s
+User=root
+# Hardening: needs CAP_NET_ADMIN for `nft`; nothing else beyond sockets + db.
+AmbientCapabilities=CAP_NET_ADMIN
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_SETUID CAP_SETGID
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/var/lib/gatekeeper /run/gatekeeper
+PrivateTmp=yes
+NoNewPrivileges=no
+
+[Install]
+WantedBy=multi-user.target
