@@ -62,6 +62,7 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
             .await
             .map_err(|e| anyhow::anyhow!("nft base install failed: {e}"))?;
         tracing::info!("nft base table ready");
+        reconcile_on_boot(&st).await;
     } else {
         tracing::warn!("--dry-run: nft objects NOT installed (dev mode)");
     }
@@ -425,7 +426,7 @@ fn dispatch_access(
         {
             Ok(Ok(HumanDecision::Approve { ttl_secs })) => {
                 let granted = cap_ttl(ttl_secs.map(Duration::from_secs).unwrap_or(ttl), &st);
-                match install_grant(&st, &row, params.proto, granted).await {
+                match install_grant(&st, &row, gid, params.proto, granted).await {
                     Ok((eff, dsts)) => {
                         let exp = ttl_expires(granted);
                         if !st.ledger.decide(gid, "approved", Some(exp), None, None).await {
@@ -529,6 +530,7 @@ fn dispatch_access(
 async fn install_grant(
     st: &Arc<State>,
     row: &GrantRow,
+    gid: i64,
     proto: Proto,
     ttl: Duration,
 ) -> Result<(EffectiveGrant, Vec<ElemDst>), String> {
@@ -537,7 +539,7 @@ async fn install_grant(
 
     let mut b = Batch::new();
     for d in &dsts {
-        b.add_grant(&GrantElem { dst: d.clone(), proto, port }, ttl);
+        b.add_grant(&GrantElem { dst: d.clone(), proto, port }, ttl, gid);
     }
     if !st.cfg.dry_run {
         st.nft.apply(&b).await.map_err(|e| e.to_string())?;
@@ -654,6 +656,87 @@ async fn sweep_grant_objs(st: &Arc<State>, gid: i64) {
         if let Err(e) = st.nft.apply(&b).await {
             tracing::debug!(gid, %e, obj = %name, "acct sweep delete (ignored)");
         }
+    }
+}
+
+// ---------------------------------------------------------------- reconciliation
+//
+// Boot policy (user decision 2026-09-17): grants are EPHEMERAL across reboots —
+// the kernel/netns teardown is the reaper, the gatekeeper never revives a grant.
+// Across crashes/restarts within one boot, live kernel elements (attributed via
+// their `gk:g<gid>` comments) are ADOPTED; the ledger follows the kernel, and
+// the gatekeeper takes NO corrective action on enforcement state — orphaned
+// elements are left for their kernel TTL to reap.
+
+/// Parse a `gk:g<gid>` attribution comment.
+fn grant_gid_of_comment(c: &Option<String>) -> Option<i64> {
+    c.as_deref()?.strip_prefix("gk:g")?.parse().ok()
+}
+
+/// Reconcile ledger against kernel truth at startup (see policy block above).
+async fn reconcile_on_boot(st: &Arc<State>) {
+    let elements = match st.nft.poll_live().await {
+        Ok(p) => p.elements,
+        Err(e) => {
+            // Can't read kernel truth → assume none of our grants exist
+            // (reboot-like). Fails closed: stale 'approved' rows would lie.
+            tracing::error!(%e, "reconcile: cannot read nft state; reaping all ledger rows");
+            Vec::new()
+        }
+    };
+    let live_gids: std::collections::HashSet<i64> =
+        elements.iter().filter_map(|el| grant_gid_of_comment(&el.comment)).collect();
+
+    // Approved rows: adopt iff an element attributed to the row is live AND the
+    // ledger expiry hasn't passed. Everything else is reaped — no revival.
+    let now = now_secs() as f64;
+    let mut adopted: std::collections::HashSet<i64> = std::collections::HashSet::new();
+    for g in st.ledger.list("approved").await {
+        let adopt = live_gids.contains(&(g.id as i64))
+            && g.expires_at.map(|e| e > now).unwrap_or(false);
+        if adopt {
+            adopted.insert(g.id);
+            tracing::info!(gid = g.id, target = %g.target, "reconcile: adopted live kernel grant");
+            continue;
+        }
+        st.ledger
+            .decide_from(g.id, "expired", &["approved"], Some(now), None, Some("restart-reconcile".into()))
+            .await;
+        st.ledger.audit("reconcile", g.id, format!("reaped: {} -> expired (no live attributed element or lapsed)", g.target));
+        tracing::info!(gid = g.id, "reconcile: reaped stale approved row");
+    }
+
+    // Pending rows cannot survive a restart: their oneshot channels lived in the
+    // dead process and the MCP client connection is gone.
+    for g in st.ledger.list("pending").await {
+        st.ledger
+            .decide_from(g.id, "denied", &["pending"], None, Some("restart_orphan".into()), Some("daemon restarted before decision".into()))
+            .await;
+        st.ledger.audit("reconcile", g.id, "pending row denied: orphaned by restart");
+    }
+
+    // Orphaned live elements (attributed to a row we just reaped/denied — the
+    // crash window between nft apply and ledger flip): NOT deleted. Kernel TTL
+    // expires them normally. Unattributed elements (pre-marker binary or an
+    // operator hand) likewise: warn only. Accounting rebuild below simply won't
+    // cover them, which is honest — their ledger rows don't exist anymore.
+    for el in &elements {
+        match grant_gid_of_comment(&el.comment) {
+            Some(gid) if !adopted.contains(&gid) => {
+                tracing::warn!(gid, dst = %el.dst, ttl = el.expires_secs,
+                    "reconcile: orphaned grant element left for kernel TTL (no corrective action)");
+            }
+            None => {
+                tracing::warn!(dst = %el.dst,
+                    "reconcile: unattributed element in grant set (left alone; check table ownership)");
+            }
+            _ => {}
+        }
+    }
+
+    // Accounting is derived state (counters only) — rebuild from the adopted set.
+    if let Err(e) = rebuild_acct(st).await {
+        tracing::warn!(%e, "reconcile: acct rebuild failed");
     }
 }
 

@@ -9,6 +9,9 @@ set -u
 NS=gk-enf
 SRV=gk-srv
 cd /root/gatekeeper
+# build first: the stale-binary trap bit once (daemon without reconcile/comment-stamping
+# silently changed what scenarios 6-7 prove). cargo is incremental; ~free when fresh.
+cargo build --workspace -q || { echo "build failed"; exit 1; }
 
 ip netns del $NS 2>/dev/null || true
 ip netns del $SRV 2>/dev/null || true
@@ -135,5 +138,33 @@ print(sum(len(s.get("elem",[])) for it in d["nftables"] for s in [it.get("set") 
 echo "kernel reaped element ✓"
 expect_blocked 8878
 ./target/debug/scopeadm --socket /tmp/gk-enf/admin.sock list | grep -q "\"id\": $GID2" && { echo "FAIL: ledger still lists expired grant"; exit 1; } || echo "reconciler flipped row to expired ✓"
+
+# 6. Crash + restart within one boot: kernel elements survive the crash and
+# kept enforcing throughout (daemon absence ≠ loss of enforcement). The fresh
+# daemon must ADOPT them via the gk:g<gid> attribution — no corrective action.
+$S python3 -m http.server --bind 10.99.0.2 8879 >/dev/null 2>&1 & sleep 0.4
+GID3=$(python3 /tmp/gk-enf/appr.py 8879 10m) || { echo FAIL approve3; exit 1; }
+expect_allowed 8879
+pkill -9 -f 'gk-enf/config.toml'; sleep 0.5        # hard crash, no graceful stop
+expect_allowed 8879                                 # enforcement continued WITHOUT the daemon
+$N env RUST_LOG=info ./target/debug/gatekeeper --config /tmp/gk-enf/config.toml --allow-missing-users >>/tmp/gk-enf/gk.log 2>&1 &
+sleep 1
+expect_allowed 8879
+grep -q "adopted live kernel grant" /tmp/gk-enf/gk.log || { echo "FAIL: no adoption on restart"; exit 1; }
+./target/debug/scopeadm --socket /tmp/gk-enf/admin.sock list | grep -q "\"id\": $GID3" || { echo "FAIL: adopted grant lost from ledger"; exit 1; }
+echo "crash->restart: live grant kept enforcing, ledger adopted (id $GID3) ✓"
+
+# 7. Simulated reboot: table wiped + baseline re-applied empty (netns teardown
+# equivalent). Policy: grants are EPHEMERAL across reboots — NO revival; the
+# ledger must reap to expired so it can never claim a grant that isn't there.
+pkill -9 -f 'gk-enf/config.toml'; sleep 0.3
+$N nft delete table inet gatekeeper
+$N nft -f deploy/gatekeeper-baseline.nft            # fresh-boot state: empty sets
+$N env RUST_LOG=info ./target/debug/gatekeeper --config /tmp/gk-enf/config.toml --allow-missing-users >>/tmp/gk-enf/gk.log 2>&1 &
+sleep 1
+expect_blocked 8879                                 # baseline floor; grant NOT revived
+./target/debug/scopeadm --socket /tmp/gk-enf/admin.sock list | grep -q "\"id\": $GID3" && { echo FAIL: reboot revived grant in ledger; exit 1; } || true
+grep -q "reaped stale approved row" /tmp/gk-enf/gk.log || { echo "FAIL: no reap log after wipe"; exit 1; }
+echo "simulated reboot: grants ephemeral, ledger reaped to expired ✓"
 
 echo "ENFORCEMENT E2E PASSED"

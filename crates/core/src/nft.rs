@@ -189,11 +189,15 @@ impl Batch {
         }
     }
 
-    /// Install one grant element with a per-element kernel TTL.
-    pub fn add_grant(&mut self, e: &GrantElem, ttl: Duration) {
+    /// Install one grant element with a per-element kernel TTL, attributed to
+    /// its ledger row via the `gk:g<gid>` comment (verified 1.1.6: persists in
+    /// the live dump AND plain-concat deletes still match commented elements —
+    /// so attribution costs the revoke path nothing).
+    pub fn add_grant(&mut self, e: &GrantElem, ttl: Duration, gid: i64) {
         self.0.push(json!({"add":{"element":{
             "family":"inet","table":TABLE,"name":e.set_name(),
-            "elem":[{"elem":{"val": e.concat(), "expires": ttl.as_secs()}}]
+            "elem":[{"elem":{"val": e.concat(), "expires": ttl.as_secs(),
+                              "comment": format!("gk:g{gid}")}}]
         }}}));
     }
 
@@ -306,6 +310,10 @@ pub struct LiveElement {
     pub port_from: u16,
     pub port_to: u16,
     pub expires_secs: f64,
+    /// Attribution marker written by add_grant ("gk:g<gid>"), if present.
+    /// Provenance only (attribution), never authentication — the security
+    /// boundary is capability separation, not this string.
+    pub comment: Option<String>,
 }
 
 #[derive(Debug)]
@@ -456,6 +464,10 @@ pub fn parse_poll(table: &Value, counters: &Value) -> PollState {
                     .or_else(|| val.get("expires"))
                     .and_then(|v| v.as_f64())
                     .unwrap_or(0.0);
+                let comment = wrapper
+                    .and_then(|w| w.get("comment"))
+                    .and_then(|v| v.as_str())
+                    .map(String::from);
                 let Some(concat) = val.get("concat").and_then(|v| v.as_array()) else {
                     continue;
                 };
@@ -504,6 +516,7 @@ pub fn parse_poll(table: &Value, counters: &Value) -> PollState {
                     port_from: pf,
                     port_to: pt,
                     expires_secs: expires,
+                    comment,
                 });
             }
         }
@@ -577,6 +590,7 @@ mod tests {
                 port: PortSpec { from: 22, to: 22 },
             },
             Duration::from_secs(600),
+            7,
         );
         let j: serde_json::Value = serde_json::from_str(&b.to_json()).unwrap();
         // structural check (serde_json sorts keys, so no substring assumptions):
@@ -585,6 +599,7 @@ mod tests {
         let e0 = &cmds[0]["add"]["element"]["elem"][0];
         assert_eq!(e0["elem"]["expires"], 600);
         assert_eq!(e0["elem"]["val"]["concat"][0], "203.0.113.7");
+        assert_eq!(e0["elem"]["comment"], "gk:g7"); // attribution marker (reconcile)
     }
 
     #[test]
@@ -651,7 +666,7 @@ mod tests {
             {"set":{"name":SET_V4,"family":"inet","table":TABLE,
                 "elem":[{"elem":{"val":{"concat":["1.2.3.4","tcp",53]},"expires":41.9}},
                         {"elem":{"val":{"concat":[{"prefix":{"addr":"10.0.0.0","len":8}},"udp",
-                            {"range":[8000,8100]}]},"expires":12.0}}]}}
+                            {"range":[8000,8100]}]},"expires":12.0,"comment":"gk:g7"}}]}}
         ]});
         let counters = json!({"nftables":[
             {"counter":{"name":"g7_out","table":TABLE,"packets":3,"bytes":120}},
@@ -662,6 +677,8 @@ mod tests {
         assert!((st.elements[0].expires_secs - 41.9).abs() < 0.01);
         assert_eq!(st.elements[1].dst, "10.0.0.0/8");
         assert_eq!((st.elements[1].port_from, st.elements[1].port_to), (8000, 8100));
+        assert_eq!(st.elements[0].comment, None); // unattributed tolerated
+        assert_eq!(st.elements[1].comment.as_deref(), Some("gk:g7"));
         assert_eq!(st.counters.get("g7_out"), Some(&(3u64, 120u64)));
         assert!(!st.counters.contains_key("other"));
     }
