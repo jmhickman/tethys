@@ -56,6 +56,7 @@ enum LedgerCmd {
         String,
         tokio::sync::oneshot::Sender<bool>,
     ),
+    FindByIdem(String, tokio::sync::oneshot::Sender<Option<GrantRow>>),
     Audit(String, String, i64),
 }
 
@@ -229,6 +230,16 @@ impl Ledger {
                             .unwrap_or(0);
                         let _ = reply.send(n == 1);
                     }
+                    LedgerCmd::FindByIdem(key, reply) => {
+                        let row = conn
+                            .query_row(
+                                &format!("SELECT {COLS} FROM grants WHERE idem_key=?1"),
+                                params![key],
+                                row_from,
+                            )
+                            .ok();
+                        let _ = reply.send(row);
+                    }
                     LedgerCmd::Audit(event, detail, grant_id) => {
                         let _ = conn.execute(
                             "INSERT INTO audit(ts,event,grant_id,detail) VALUES(?1,?2,?3,?4)",
@@ -305,6 +316,11 @@ impl Ledger {
     pub async fn set_dst(&self, id: i64, dst_json: String) -> bool {
         self.ask(move |reply| LedgerCmd::SetDst(id, dst_json, reply)).await
     }
+    /// Idempotency lookup for replayed request ids.
+    pub async fn find_by_idem(&self, key: &str) -> Option<GrantRow> {
+        let k = key.to_string();
+        self.ask(move |reply| LedgerCmd::FindByIdem(k, reply)).await
+    }
     pub fn audit(&self, event: &str, grant_id: i64, detail: impl Into<String>) {
         self.tx
             .send(LedgerCmd::Audit(event.into(), detail.into(), grant_id))
@@ -361,6 +377,46 @@ mod tests {
             .await);
 
         let _ = ledger.list("revoked").await; // sanity query path
+        actor.abort();
+        std::fs::remove_dir_all(&dir).ok();
+    }
+}
+
+#[cfg(test)]
+mod idem_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn find_by_idem_returns_row_regardless_of_state() {
+        let dir = std::env::temp_dir().join(format!("gk-idem-{}", now_secs()));
+        let (ledger, actor) = Ledger::open(&dir.join("t.db")).unwrap();
+        let row = GrantRow {
+            id: 0,
+            idem_key: Some("req-x".into()),
+            target: "ip:10.9.9.9".into(),
+            dst_json: "[]".into(),
+            port_from: 443,
+            port_to: 443,
+            proto: "tcp".into(),
+            reason: "r".into(),
+            tool: "t".into(),
+            ttl_secs: 60,
+            granted_ttl_secs: None,
+            state: "pending".into(),
+            created_at: now_secs(),
+            expires_at: None,
+            deny_code: None,
+            note: None,
+        };
+        let gid = ledger.insert_pending(&row).await.expect("insert");
+        // duplicate insert must be rejected (None), and the original found
+        assert!(ledger.insert_pending(&row).await.is_none(), "UNIQUE must reject dup");
+        let found = ledger.find_by_idem("req-x").await.expect("must find row by idem key");
+        assert_eq!(found.id, gid);
+        // survives a state flip to revoked (replay-after-revoke path)
+        ledger.decide_from(gid, "revoked", &["pending"], Some(now_secs() as f64), None, None).await;
+        let found = ledger.find_by_idem("req-x").await.expect("still found after revoke");
+        assert_eq!(found.state, "revoked");
         actor.abort();
         std::fs::remove_dir_all(&dir).ok();
     }

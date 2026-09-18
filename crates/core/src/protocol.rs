@@ -148,6 +148,9 @@ pub enum DenyReason {
     HumanDenied,
     ApproverOffline,
     ApproverTimeout,
+    /// idempotent replay whose original grant is gone (expired/revoked) —
+    /// the caller must re-request under a NEW id (R: re-delivery never re-popups).
+    GrantExpired,
 }
 
 /// server-push payload for `traffic.stat` (TUI view, decision R4).

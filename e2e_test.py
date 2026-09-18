@@ -27,6 +27,11 @@ def nft_grants():
 
 
 def main():
+    # build first — stale-binary trap bit twice (cargo test does NOT refresh
+    # target/debug/<bin>; e2e runs must compile the binaries they execute)
+    b = subprocess.run(["cargo", "build", "--workspace"], cwd=ROOT, capture_output=True, text=True)
+    if b.returncode != 0:
+        print("BUILD FAILED:\n", b.stderr[-2000:]); sys.exit(1)
     subprocess.run(["pkill", "-x", "gatekeeper"])
     time.sleep(0.3)
     os.system(f"rm -rf {DIR} && mkdir -p {DIR}")
@@ -216,6 +221,45 @@ def main():
     if d_pend.get("reason_code") != "human_denied" or "stopped" not in (d_pend.get("note") or ""):
         fails.append(f"S6 pending not denied by stop: {d_pend}")
     print("S6 stop.grants:", "ok" if "S6" not in str(fails) else fails[-1])
+
+    # S7: idempotency re-delivery — replaying a request id must NOT re-popup and
+    # must return the ORIGINAL verdict; after revoke, replay says grant_expired.
+    base7 = len([e for e in events if e.get("method") == "grant.request.new"])
+    a7 = request("r7", {"dst_ip": "192.0.2.33", "dst_port": {"from": 443, "to": 443}, "proto": "tcp",
+                        "reason": "idempotency", "tool": "t", "ttl_requested": "300s"})
+    g7 = new_gid()
+    scopeadm("approve", g7)
+    a7.settimeout(5)
+    d7 = json.loads(a7.recv(65536).decode())["result"]
+
+    # replay while ACTIVE -> approved + dedup, no second popup
+    a7b = request("r7", {"dst_ip": "192.0.2.33", "dst_port": {"from": 443, "to": 443}, "proto": "tcp",
+                         "reason": "retry", "tool": "t", "ttl_requested": "300s"})
+    a7b.settimeout(5)
+    r7b = json.loads(a7b.recv(65536).decode())
+    pops7 = len([e for e in events if e.get("method") == "grant.request.new"])
+    if (r7b.get("result", {}).get("decision") != "approved"
+            or not r7b["result"].get("dedup")
+            or r7b.get("id") != "r7"
+            or pops7 != base7 + 1):  # exactly ONE popup for both sends
+        fails.append(f"S7 replay-active: {r7b} pops={pops7 - base7}")
+
+    # revoke, then replay -> denied/grant_expired with guidance to use a new id
+    scopeadm("revoke", d7["grant_id"])
+    time.sleep(0.3)
+    a7c = request("r7", {"dst_ip": "192.0.2.33", "dst_port": {"from": 443, "to": 443}, "proto": "tcp",
+                         "reason": "retry after revoke", "tool": "t", "ttl_requested": "300s"})
+    a7c.settimeout(5)
+    d7raw = a7c.recv(65536).decode()
+    d7c = json.loads(d7raw).get("result", {})
+    if "error" in d7raw:
+        fails.append(f"S7 replay-revoked got error envelope: {d7raw[:160]}")
+    if d7c.get("decision") != "denied" or d7c.get("reason_code") != "grant_expired":
+        fails.append(f"S7 replay-revoked: {d7c}")
+    pops7b = len([e for e in events if e.get("method") == "grant.request.new"])
+    if pops7b != base7 + 1:
+        fails.append(f"S7 replay re-popuped ({pops7b - base7} popups)")
+    print("S7 idempotent-replay:", "ok" if "S7" not in str(fails) else fails[-1])
 
     gk.send_signal(signal.SIGTERM)
     if fails:

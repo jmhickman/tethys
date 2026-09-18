@@ -396,8 +396,15 @@ fn dispatch_access(
         let gid = match st.ledger.insert_pending(&row).await {
             Some(gid) => gid,
             None => {
-                // duplicate idempotency key (UNIQUE violation) — same client retry
-                respond(rpc_err_str(&id, -32001, "duplicate request id"));
+                // UNIQUE idem_key violation = REDELIVERY of a request we've seen.
+                // Spec: re-delivery must not re-popup — return the ORIGINAL row's
+                // verdict instead of an error. (Approver channels are per-process:
+                // a pending original from a previous boot was already denied by
+                // reconcile_on_boot, so 'pending' here means same-boot in flight.)
+                match st.ledger.find_by_idem(&id).await {
+                    Some(orig) => respond(replay_verdict(&orig)),
+                    None => respond(rpc_err_str(&id, -32001, "duplicate request id")),
+                }
                 return;
             }
         };
@@ -988,6 +995,71 @@ fn cap_ttl(d: Duration, st: &State) -> Duration {
     d.min(max)
 }
 
+/// Verdict line for a REDELIVERED request id (spec: re-delivery must not
+/// re-popup; the caller gets the original row's outcome, never a fresh ask).
+fn replay_verdict(orig: &GrantRow) -> String {
+    let gid = orig.id.to_string();
+    let d = match orig.state.as_str() {
+        "pending" => AccessDecision {
+            // Original popup is still live (same boot). We don't attach a second
+            // waiter to its channel; protocol has no "waiting" verdict, so answer
+            // FAIL-CLOSED: access is NOT granted yet. Caller must not act on it.
+            decision: Decision::Denied,
+            grant_id: Some(gid),
+            dedup: true,
+            effective: None,
+            ttl_granted: None,
+            expires_at: None,
+            reason_code: Some(DenyReason::HumanDenied),
+            note: Some(
+                "request with this id is already pending approval (no second popup); \
+                 do not send traffic — await the original verdict or re-request with a new id"
+                    .into(),
+            ),
+        },
+        "approved" => AccessDecision {
+            decision: Decision::Approved,
+            grant_id: Some(gid),
+            dedup: true,
+            effective: None,
+            ttl_granted: None,
+            expires_at: orig.expires_at.map(fmt_unix),
+            reason_code: None,
+            note: None,
+        },
+        "expired" | "revoked" => AccessDecision {
+            decision: Decision::Denied,
+            grant_id: Some(gid),
+            dedup: false,
+            effective: None,
+            ttl_granted: None,
+            expires_at: None,
+            reason_code: Some(DenyReason::GrantExpired),
+            note: Some(format!(
+                "re-delivered request id {}; that grant is {} — re-request with a new id",
+                orig.id, orig.state
+            )),
+        },
+        _ => AccessDecision {
+            // denied / install_failed / restart_orphan: replay the original denial
+            decision: Decision::Denied,
+            grant_id: Some(gid),
+            dedup: false,
+            effective: None,
+            ttl_granted: None,
+            expires_at: None,
+            reason_code: Some(match orig.deny_code.as_deref() {
+                Some("approver_offline") => DenyReason::ApproverOffline,
+                Some("approver_timeout") => DenyReason::ApproverTimeout,
+                _ => DenyReason::HumanDenied,
+            }),
+            note: orig.note.clone(),
+        },
+    };
+    // reply id = the replayed request id (== idem_key)
+    serde_json::to_string(&RpcResponse::ok(orig.idem_key.as_deref().unwrap_or(""), &d)).unwrap()
+}
+
 /// Strip control chars so free-text can't spoof TUI rows (docs §hardening).
 fn sanitize(s: &str) -> String {
     s.chars().filter(|c| !c.is_control()).take(280).collect()
@@ -1077,6 +1149,54 @@ mod tests {
         let s = sanitize(evil);
         assert!(!s.contains('\r') && !s.contains('\n') && !s.contains('\x1b'));
         assert!(sanitize(&"x".repeat(9999)).len() <= 280);
+    }
+
+    #[test]
+    fn replay_verdict_per_state() {
+        let row = |state: &str, deny: Option<&str>, note: Option<&str>| GrantRow {
+            id: 42,
+            idem_key: Some("req-abc".into()),
+            target: "ip:10.0.0.1".into(),
+            dst_json: "[]".into(),
+            port_from: 80,
+            port_to: 80,
+            proto: "tcp".into(),
+            reason: String::new(),
+            tool: String::new(),
+            ttl_secs: 60,
+            granted_ttl_secs: None,
+            state: state.into(),
+            created_at: 0,
+            expires_at: Some(1_757_925_600.0),
+            deny_code: deny.map(String::from),
+            note: note.map(String::from),
+        };
+        let parse = |s: String| -> serde_json::Value { serde_json::from_str(&s).unwrap() };
+
+        let v = parse(replay_verdict(&row("approved", None, None)));
+        assert_eq!(v["id"], "req-abc");
+        assert_eq!(v["result"]["decision"], "approved");
+        assert_eq!(v["result"]["dedup"], true);
+        assert_eq!(v["result"]["grant_id"], "42");
+
+        let v = parse(replay_verdict(&row("expired", None, None)));
+        assert_eq!(v["result"]["decision"], "denied");
+        assert_eq!(v["result"]["reason_code"], "grant_expired");
+
+        let v = parse(replay_verdict(&row("denied", Some("approver_timeout"), None)));
+        assert_eq!(v["result"]["reason_code"], "approver_timeout");
+
+        let v = parse(replay_verdict(&row("denied", Some("human_denied"), Some("out of scope"))));
+        assert_eq!(v["result"]["reason_code"], "human_denied");
+        assert_eq!(v["result"]["note"], "out of scope");
+
+        // reply id must equal the REPLAYED request id (the idem key), or the
+        // waiting MCP client would never match its own pending call.
+        let v = parse(replay_verdict(&row("pending", None, None)));
+        assert_eq!(v["id"], "req-abc");
+        // fail-closed: a pending original is NOT a grant; caller must not act
+        assert_eq!(v["result"]["decision"], "denied");
+        assert_eq!(v["result"]["dedup"], true);
     }
 
     #[test]
