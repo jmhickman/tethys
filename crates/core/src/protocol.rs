@@ -104,39 +104,9 @@ pub struct AccessRequestParams {
     pub ttl_requested: String,
 }
 
+/// The IP or CIDR actually installed (post-resolution for host targets).
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
-#[serde(rename_all = "snake_case")]
-pub enum Decision {
-    Approved,
-    Denied,
-}
-
-/// result of `access.request`.
-#[derive(Serialize, Deserialize, Clone, Debug)]
-pub struct AccessDecision {
-    pub decision: Decision,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub grant_id: Option<String>,
-    /// request was covered by an active grant -> no human round-trip.
-    #[serde(default)]
-    pub dedup: bool,
-    /// Effective (possibly human-reduced) grant; present when approved.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub effective: Option<EffectiveGrant>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub ttl_granted: Option<String>,
-    /// RFC3339 UTC expiry.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub expires_at: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub reason_code: Option<DenyReason>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub note: Option<String>,
-}
-
-#[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct EffectiveGrant {
-    /// the IP or CIDR actually installed (post-resolution for host targets)
     pub dst: String,
     pub dst_port: PortSpec,
     pub proto: Proto,
@@ -151,6 +121,45 @@ pub enum DenyReason {
     /// idempotent replay whose original grant is gone (expired/revoked) —
     /// the caller must re-request under a NEW id (R: re-delivery never re-popups).
     GrantExpired,
+    /// nft apply failed; prior kernel state kept (fail-closed).
+    InstallFailed,
+    /// replay of a request whose original is STILL awaiting its human decision:
+    /// fail-closed — pending is not a grant, and no second popup is created.
+    AlreadyPending,
+}
+
+/// result of `access.request` — a SUM TYPE by design (design principle: make
+/// illegal states unrepresentable). "approved with no effective grant",
+/// "denied with no reason" etc. are not constructible; each variant carries
+/// exactly what it means. Wire shape stays internally tagged on `decision`
+/// so heterogeneous consumers keep matching `.decision`.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+#[serde(tag = "decision", rename_all = "snake_case")]
+pub enum Verdict {
+    /// New grant installed in the kernel by this very request.
+    Approved {
+        grant_id: String,
+        effective: EffectiveGrant,
+        ttl_granted: String,
+        /// RFC3339 UTC expiry.
+        expires_at: String,
+    },
+    /// Covered by an existing request/grant — NO human round-trip happened.
+    /// `expires_at` absent only while the original is still pending.
+    AlreadyGranted {
+        grant_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expires_at: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        note: Option<String>,
+    },
+    Denied {
+        reason_code: DenyReason,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        grant_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        note: Option<String>,
+    },
 }
 
 /// server-push payload for `traffic.stat` (TUI view, decision R4).
@@ -184,20 +193,38 @@ mod tests {
     }
 
     #[test]
-    fn decision_serde_shape() {
-        let d = AccessDecision {
-            decision: Decision::Denied,
+    fn verdict_serde_shape() {
+        // internally tagged on `decision`: consumers keep matching .decision,
+        // but malformed combinations (denied + reason-less, approved - effective)
+        // are now UNCONSTRUCTIBLE, not merely discouraged.
+        let d = Verdict::Denied {
+            reason_code: DenyReason::ApproverOffline,
             grant_id: None,
-            dedup: false,
-            effective: None,
-            ttl_granted: None,
-            expires_at: None,
-            reason_code: Some(DenyReason::ApproverOffline),
             note: None,
         };
         let j = serde_json::to_string(&d).unwrap();
         assert!(j.contains("\"decision\":\"denied\""));
         assert!(j.contains("\"reason_code\":\"approver_offline\""));
         assert!(!j.contains("effective"));
+
+        let a = Verdict::Approved {
+            grant_id: "7".into(),
+            effective: EffectiveGrant {
+                dst: "203.0.113.7".into(),
+                dst_port: PortSpec { from: 443, to: 443 },
+                proto: Proto::Tcp,
+            },
+            ttl_granted: "10m".into(),
+            expires_at: "2026-09-15T02:41:00Z".into(),
+        };
+        let s = serde_json::to_string(&a).unwrap();
+        assert!(s.contains("\"decision\":\"approved\""));
+        // round-trip must be exact (parse-don't-validate on both ends)
+        assert_eq!(serde_json::from_str::<Verdict>(&s).unwrap(), a);
+
+        // an "approved" blob WITHOUT effective must fail to parse — the old
+        // flat struct silently accepted it.
+        let bad = r#"{"decision":"approved","grant_id":"7"}"#;
+        assert!(serde_json::from_str::<Verdict>(bad).is_err());
     }
 }

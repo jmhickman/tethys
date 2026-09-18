@@ -6,7 +6,7 @@ Run from workspace root with a daemon already listening on /tmp/gk-test/*
 
 Scenarios (all must pass):
   S1 request -> admin event -> approve -> verdict + kernel element w/ expiry
-  S2 identical request while active -> instant approved, dedup=true, NO popup
+  S2 identical request while active -> instant already_granted, NO popup
   S3 human deny propagates note to the model side
   S4 no admin connected -> immediate denied/approver_offline (R2a)
   S5 revoke deletes the live kernel element
@@ -98,13 +98,13 @@ def main():
         fails.append(f"S1 {d1}")
     print("S1 approve:", "ok" if not fails else fails)
 
-    # S2: dedup
+    # S2: dedup (sum-type verdict: already_granted carries grant_id + expiry)
     a2 = request("r2", {"dst_ip": "192.0.2.77", "dst_port": {"from": 443, "to": 443}, "proto": "tcp",
                         "reason": "again", "tool": "t", "ttl_requested": "60s"})
     a2.settimeout(5)
     d2 = json.loads(a2.recv(65536).decode())["result"]
     popups = len([e for e in events if e.get("method") == "grant.request.new"])
-    if d2.get("decision") != "approved" or not d2.get("dedup") or popups != 1:
+    if d2.get("decision") != "already_granted" or not d2.get("expires_at") or popups != 1:
         fails.append(f"S2 {d2} popups={popups}")
     print("S2 dedup:", "ok" if "S2" not in str(fails) else fails[-1])
 
@@ -232,14 +232,13 @@ def main():
     a7.settimeout(5)
     d7 = json.loads(a7.recv(65536).decode())["result"]
 
-    # replay while ACTIVE -> approved + dedup, no second popup
+    # replay while ACTIVE -> already_granted, no second popup
     a7b = request("r7", {"dst_ip": "192.0.2.33", "dst_port": {"from": 443, "to": 443}, "proto": "tcp",
                          "reason": "retry", "tool": "t", "ttl_requested": "300s"})
     a7b.settimeout(5)
     r7b = json.loads(a7b.recv(65536).decode())
     pops7 = len([e for e in events if e.get("method") == "grant.request.new"])
-    if (r7b.get("result", {}).get("decision") != "approved"
-            or not r7b["result"].get("dedup")
+    if (r7b.get("result", {}).get("decision") != "already_granted"
             or r7b.get("id") != "r7"
             or pops7 != base7 + 1):  # exactly ONE popup for both sends
         fails.append(f"S7 replay-active: {r7b} pops={pops7 - base7}")

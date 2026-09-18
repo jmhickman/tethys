@@ -141,35 +141,41 @@ impl ScopeMcp {
 
 /// Human/LLM-readable one-liner, e.g.:
 /// "APPROVED: 203.0.113.7 tcp 443 granted for 15m (expires 2026-09-15T02:41:00Z)"
+/// Decode into the protocol SUM type (parse-don't-validate): a malformed or
+/// unknown verdict is an error, never a silent default branch.
 fn render_verdict(r: &serde_json::Value) -> String {
-    match r.get("decision").and_then(|d| d.as_str()) {
-        Some("approved") => {
-            let dedup = r.get("dedup").and_then(|v| v.as_bool()).unwrap_or(false);
-            let mut s = if dedup {
-                String::from("APPROVED (already active)")
-            } else {
-                String::from("APPROVED:")
-            };
-            if let Some(eff) = r.get("effective") {
-                s.push_str(&format!(
-                    " {} {} {}-{}",
-                    eff["dst"].as_str().unwrap_or("?"),
-                    eff["proto"].as_str().unwrap_or("?"),
-                    eff["dst_port"]["from"].as_u64().unwrap_or(0),
-                    eff["dst_port"]["to"].as_u64().unwrap_or(0),
-                ));
-            }
-            if let Some(t) = r.get("ttl_granted").and_then(|v| v.as_str()) {
-                s.push_str(&format!(" granted for {t}"));
-            }
-            if let Some(e) = r.get("expires_at").and_then(|v| v.as_str()) {
+    let v: gk_core::protocol::Verdict = match serde_json::from_value(r.clone()) {
+        Ok(v) => v,
+        Err(e) => return format!("DENIED (malformed_verdict): gatekeeper reply unparseable: {e}"),
+    };
+    use gk_core::protocol::Verdict as V;
+    match v {
+        V::Approved { effective, ttl_granted, expires_at, .. } => {
+            format!(
+                "APPROVED: {} {} {}-{} granted for {ttl_granted} (expires {expires_at})",
+                effective.dst,
+                serde_json::to_value(effective.proto).ok()
+                    .and_then(|p| p.as_str().map(String::from))
+                    .unwrap_or_else(|| "?".into()),
+                effective.dst_port.from,
+                effective.dst_port.to,
+            )
+        }
+        V::AlreadyGranted { grant_id, expires_at, note } => {
+            let mut s = format!("APPROVED (already active, grant {grant_id})");
+            if let Some(e) = expires_at {
                 s.push_str(&format!(" (expires {e})"));
+            }
+            if let Some(n) = note {
+                s.push_str(&format!(" — {n}"));
             }
             s
         }
-        _ => {
-            let code = r.get("reason_code").and_then(|v| v.as_str()).unwrap_or("denied");
-            match r.get("note").and_then(|v| v.as_str()) {
+        V::Denied { reason_code, note, .. } => {
+            let code = serde_json::to_value(reason_code).ok()
+                .and_then(|c| c.as_str().map(String::from))
+                .unwrap_or_else(|| "denied".into());
+            match note {
                 Some(n) => format!("DENIED ({code}): {n}"),
                 None => format!("DENIED ({code})"),
             }
@@ -218,7 +224,8 @@ mod tests {
     #[test]
     fn verdict_rendering() {
         let v = serde_json::json!({
-            "decision":"approved","dedup":false,
+            "decision":"approved",
+            "grant_id":"7",
             "effective":{"dst":"203.0.113.7","proto":"tcp","dst_port":{"from":443,"to":443}},
             "ttl_granted":"10m","expires_at":"2026-09-15T02:41:00Z"});
         let s = render_verdict(&v);
@@ -229,5 +236,16 @@ mod tests {
 
         let dn = serde_json::json!({"decision":"denied","reason_code":"human_denied","note":"out of scope"});
         assert!(render_verdict(&dn).contains("out of scope"));
+
+        // already_granted renders as approved-active, with grant id + expiry
+        let ag = serde_json::json!({"decision":"already_granted","grant_id":"9",
+            "expires_at":"2026-09-15T02:41:00Z"});
+        let s = render_verdict(&ag);
+        assert!(s.contains("already active") && s.contains("grant 9"), "{s}");
+
+        // malformed verdict (approved without effective) must NOT render as
+        // approved — the sum type rejects it, and we fail closed in the text.
+        let bad = serde_json::json!({"decision":"approved","grant_id":"7"});
+        assert!(render_verdict(&bad).starts_with("DENIED (malformed_verdict)"));
     }
 }
