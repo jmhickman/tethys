@@ -77,6 +77,7 @@ pub mod method {
     pub const DENY: &str = "deny";
     pub const REVOKE: &str = "revoke";
     pub const LIST_GRANTS: &str = "list.grants";
+    pub const LIST_HISTORY: &str = "list.history";
     pub const STOP_GRANTS: &str = "stop.grants";
     pub const SUBSCRIBE: &str = "subscribe";
     // gatekeeper -> TUI (server push notifications; id omitted per JSON-RPC)

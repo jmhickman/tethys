@@ -42,7 +42,7 @@ impl GrantState {
             GrantState::Revoked => "revoked",
         }
     }
-    fn parse(s: &str) -> Option<Self> {
+    pub(crate) fn parse(s: &str) -> Option<Self> {
         match s {
             "pending" => Some(GrantState::Pending),
             "approved" => Some(GrantState::Approved),
@@ -192,6 +192,7 @@ enum LedgerCmd {
     Insert(NewGrant, tokio::sync::oneshot::Sender<Option<i64>>),
     Decide(i64, Decide, tokio::sync::oneshot::Sender<bool>),
     List(GrantState, tokio::sync::oneshot::Sender<Vec<GrantRow>>),
+    History(Option<GrantState>, u32, tokio::sync::oneshot::Sender<Vec<GrantRow>>),
     FindActive(tokio::sync::oneshot::Sender<Vec<GrantRow>>),
     SetDst(i64, String, tokio::sync::oneshot::Sender<bool>),
     FindByIdem(String, tokio::sync::oneshot::Sender<Option<GrantRow>>),
@@ -376,6 +377,38 @@ impl Ledger {
                         }
                         let _ = reply.send(out);
                     }
+                    LedgerCmd::History(state, limit, reply) => {
+                        // Decided history for the TUI: every row that left the
+                        // pending state, newest first. Optional state filter;
+                        // `limit` is clamped by the caller (server).
+                        let q = match state {
+                            Some(_) => format!(
+                                "SELECT {COLS} FROM grants WHERE state!=?1 AND state=?2 \
+                                 ORDER BY id DESC LIMIT ?3"
+                            ),
+                            None => format!(
+                                "SELECT {COLS} FROM grants WHERE state!=?1 \
+                                 ORDER BY id DESC LIMIT ?2"
+                            ),
+                        };
+                        let mut out = Vec::new();
+                        if let Ok(mut st) = conn.prepare(&q) {
+                            let rows = match state {
+                                Some(s) => st.query_map(
+                                    params![GrantState::Pending.as_str(), s.as_str(), limit as i64],
+                                    row_from,
+                                ),
+                                None => st.query_map(
+                                    params![GrantState::Pending.as_str(), limit as i64],
+                                    row_from,
+                                ),
+                            };
+                            if let Ok(rows) = rows {
+                                out = rows.flatten().collect();
+                            }
+                        }
+                        let _ = reply.send(out);
+                    }
                     LedgerCmd::FindActive(reply) => {
                         let mut out = Vec::new();
                         if let Ok(mut st) = conn.prepare(&format!(
@@ -440,6 +473,11 @@ impl Ledger {
 
     pub async fn list(&self, state: GrantState) -> Vec<GrantRow> {
         self.ask(|reply| LedgerCmd::List(state, reply)).await
+    }
+    /// Decided rows (any state except pending), newest first. `state` narrows
+    /// to one terminal state; `limit` bounds the page.
+    pub async fn history(&self, state: Option<GrantState>, limit: u32) -> Vec<GrantRow> {
+        self.ask(|reply| LedgerCmd::History(state, limit, reply)).await
     }
     pub async fn active(&self) -> Vec<GrantRow> {
         self.ask(|reply| LedgerCmd::FindActive(reply)).await
@@ -527,6 +565,49 @@ mod tests {
         assert_eq!(r.note.as_deref(), Some("out of scope"));
         // Deny from a denied row: rejected
         assert!(!ledger.decide(gid2, Decide::Deny { code: DenyCode::HumanDenied, note: None }).await);
+
+        actor.abort();
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn history_excludes_pending_filters_and_limits() {
+        let dir = std::env::temp_dir().join(format!("gk-hist-{}", now_secs()));
+        let (ledger, actor) = Ledger::open(&dir.join("t.db")).unwrap();
+
+        // 3 decided rows in distinct terminal states + 1 still pending
+        let a = ledger.insert_pending(newg("h-a")).await.unwrap();
+        ledger.decide(a, Decide::Approve { expires_at: now_secs() as f64 + 60.0 }).await;
+        let b = ledger.insert_pending(newg("h-b")).await.unwrap();
+        ledger
+            .decide(b, Decide::Deny { code: DenyCode::HumanDenied, note: Some("n".into()) })
+            .await;
+        let c = ledger.insert_pending(newg("h-c")).await.unwrap();
+        // Revoke legally originates from Approved; pending origin is rejected,
+        // so approve first — otherwise c stays pending and (correctly) absent.
+        ledger.decide(c, Decide::Approve { expires_at: now_secs() as f64 + 60.0 }).await;
+        ledger.decide(c, Decide::Revoke { at: now_secs() as f64, note: None }).await;
+        // flip a approved row to expired via the kernel path
+        ledger.decide(a, Decide::ExpireByKernel).await;
+        let _d = ledger.insert_pending(newg("h-pending")).await.unwrap();
+
+        let all = ledger.history(None, 100).await;
+        // newest first; approved row landed in expired, pending excluded
+        assert_eq!(all.iter().map(|r| r.state).collect::<Vec<_>>(),
+            vec![GrantState::Revoked, GrantState::Denied, GrantState::Expired]);
+        assert!(all.iter().all(|r| r.state != GrantState::Pending));
+
+        let only_denied = ledger.history(Some(GrantState::Denied), 100).await;
+        assert_eq!(only_denied.len(), 1);
+        assert_eq!(only_denied[0].idem_key.as_deref(), Some("h-b"));
+        assert_eq!(only_denied[0].deny_code, Some(DenyCode::HumanDenied));
+
+        let page = ledger.history(None, 2).await;
+        assert_eq!(page.len(), 2);
+        assert_eq!(page[0].id, c, "limit must keep the NEWEST rows");
+
+        // revoked-only filter proves state narrowing on a second value
+        assert_eq!(ledger.history(Some(GrantState::Revoked), 100).await.len(), 1);
 
         actor.abort();
         std::fs::remove_dir_all(&dir).ok();

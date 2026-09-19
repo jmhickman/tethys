@@ -38,6 +38,13 @@ enum Cmd {
     Revoke {
         grant_id: String,
     },
+    /// decided rows (denied/expired/revoked/approved-past), newest first
+    History {
+        #[arg(long)]
+        state: Option<String>,
+        #[arg(long, default_value_t = 50)]
+        limit: u32,
+    },
     /// R8 kill switch: remove ALL active grants (baseline rules untouched)
     Stop,
 }
@@ -97,6 +104,19 @@ async fn main() -> anyhow::Result<()> {
             )
             .await?;
             drain_until_id(&mut lines, "a4").await?;
+        }
+        Cmd::History { state, limit } => {
+            let mut params = serde_json::json!({"limit": limit});
+            if let Some(s) = state {
+                params["state"] = serde_json::json!(s);
+            }
+            call(
+                &mut w,
+                &RpcRequest { jsonrpc: JsonRpcVersion::V2_0, id: "a6".into(), method: method::LIST_HISTORY.into(),
+                    params: Some(params) },
+            )
+            .await?;
+            drain_until_id(&mut lines, "a6").await?;
         }
         Cmd::Stop => {
             call(

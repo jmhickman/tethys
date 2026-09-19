@@ -796,6 +796,29 @@ async fn handle_admin_cmd(req: &RpcRequest, st: &Arc<State>) -> RpcResponse {
             let rows = st.ledger.list(GrantState::Approved).await;
             RpcResponse::ok(&req.id, serde_json::to_value(rows).unwrap())
         }
+        method::LIST_HISTORY => {
+            // Decided rows for the TUI history view. Optional params:
+            //   {"state": "denied|expired|revoked|approved", "limit": 100}
+            // Unknown state strings are a client error, never a silent empty.
+            let p = req.params.clone().unwrap_or(serde_json::Value::Null);
+            let state = match p.get("state").and_then(|v| v.as_str()) {
+                Some(s) => match GrantState::parse(s) {
+                    // pending is not history; asking for it is a client bug
+                    Some(GrantState::Pending) | None => {
+                        return RpcResponse::err(&req.id, -32602, format!("bad history state {s:?}"))
+                    }
+                    Some(other) => Some(other),
+                },
+                None => None,
+            };
+            let limit = match p.get("limit").and_then(|v| v.as_u64()) {
+                Some(l) if l > 0 && l <= 1000 => l as u32,
+                Some(_) => return RpcResponse::err(&req.id, -32602, "limit must be 1..=1000"),
+                None => 100,
+            };
+            let rows = st.ledger.history(state, limit).await;
+            RpcResponse::ok(&req.id, serde_json::to_value(rows).unwrap())
+        }
         method::STOP_GRANTS => {
             // R8 kill switch: terminate GRANTS only — baseline rules untouched.
             tracing::info!("stop.grants invoked");

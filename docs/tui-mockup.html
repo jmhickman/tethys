@@ -1,0 +1,72 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<style>
+  .term { font-family: ui-monospace, monospace; font-size: 13px; line-height: 1.45;
+          border: 1px solid var(--border); border-radius: 6px; padding: 14px 16px;
+          white-space: pre; overflow-x: auto; color: var(--foreground); }
+  .dim { color: var(--muted-foreground); }
+  .acc { color: var(--accent); font-weight: bold; }
+  .warn { color: #e0a500; } .ok { color: #4caf50; } .bad { color: #e05555; }
+  h3 { margin: 18px 0 6px; font-size: 14px; }
+  .cap { color: var(--muted-foreground); font-size: 12px; margin: 4px 0 0; white-space: normal; }
+</style>
+</head>
+<body>
+
+<h3>Default view — LIVE dominates</h3>
+<div class="term">┌─ gatekeeper @ pve-node01 ─ eth0 192.168.10.0/24 ─ <span class="acc">4 live</span> ─ 1 pending ●conn ─┐
+│ sort: <span class="acc">left ▲</span>  <span class="dim">1:id 2:tool 3:dst 4:ports 5:proto 6:ttl 7:left 8:↕bytes 9:reason</span>  F1 │
+├──────────────────────────────────────────────────────────────────────────────┤
+│ id  tool     dst              ports      proto  ttl    left  ↕B   reason        │
+│ <span class="warn">6   psql     198.51.100.9     5432       tcp    15m    0:47 ↓14k  migrate leg…</span> │
+│ 4   ssh      10.0.0.5         22         tcp    10m    3:12  ↑2k  deploy hotfi…│
+│ 5   python   203.0.113.7 ≠    443        tcp    15m    8:31  ↑1k  pull cert ch…│
+│ 3   curl     172.16.4.0/22    8000-8100  tcp    20m   12:04   ↓0  health probe…│
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+├──────────────────────────────────────────────────────────────────────────────┤
+│ <span class="dim">j/k select · Enter details · e revoke · ! stop all · P pending · q quit</span>         │
+└──────────────────────────────────────────────────────────────────────────────┘</div>
+<p class="cap">Header line 1: hostname, network, live count, pending badge, connection state. Line 2: active sort + column legend.
+<code>≠</code> marks installed ≠ requested (host was resolved); details view (<code>Enter</code>) shows both, full reason, deny/expire history.
+Reason truncated at column width with ellipsis. Row tint shifts warn/red as time runs low.
+Sort: number key selects column, same key again flips asc/desc (or <code>&lt;</code>/<code>&gt;</code> cycle).</p>
+
+<h3>Pending modal — centered overlay; auto-opens on arrival, or via <code>P</code></h3>
+<div class="term">┌─ gatekeeper @ pve-node01 ─ eth0 192.168.10.0/24 ─ <span class="acc">4 live</span> ─ <span class="warn">1 pending</span> ●conn ─┐
+│ sort: <span class="acc">left ▲</span>  <span class="dim">1:id 2:tool 3:dst 4:ports 5:proto 6:ttl 7:left 8:↕bytes 9:reason</span>  F1 │
+├──────────────────────────────────────────────────────────────────────────────┤
+│ <span class="dim">id  tool     dst              ports      proto  ttl    left  ↕B   reason</span>       │
+│ <span class="dim">6   psql     198.51.100.9     5432       tcp    15m    0:47 ↓14k  migrate leg…</span> │
+│ <span class="dim">4   ssh      10.0.0.5         22         tcp    10m    3:12  ↑2k  deploy hotfi…</span>│
+│     ┌──────────── REQUEST 7 · sqlmap · waiting 0:41 ────────────┐       │
+│     │ requested   host:api.acme.io                                   │       │
+│     │ ports       443/tcp          ttl req  15m                      │       │
+│     │ reason      "pull cert chain for TLS inspection               │       │
+│     │              of acme cert"                                     │       │
+│     │                                                                │       │
+│     │ <span class="acc">[a]pprove</span>  <span class="bad">[d]eny+note</span>  [t]tl→__  [n]ext 1/1  [Esc]close │       │
+│     └────────────────────────────────────────────────────────────┘       │
+├──────────────────────────────────────────────────────────────────────────────┤
+│ <span class="dim">a approve · d deny (inline note) · t edit ttl · n next · Esc dismiss, stays queued</span> │
+└──────────────────────────────────────────────────────────────────────────────┘</div>
+<p class="cap">Live table dims behind the modal. Multiple pendings: <code>n</code> cycles oldest→newest, badge shows 2/5.
+Esc dismisses without deciding — the request keeps waiting (approver-timeout clock runs), badge persists and flashes on new arrivals.
+<code>t</code> edits the granted TTL inline before approving; <code>d</code> becomes a one-line note input (Enter sends, Esc denies with empty note).</p>
+
+<h3>Row detail — <code>Enter</code> on a live grant</h3>
+<div class="term">┌─ GRANT 5 · python ── approved 19:11:02 ── expires 19:26:02 (8:31) ───────────┐
+│ requested   host:api.acme.io                                                 │
+│ installed   203.0.113.7, 203.0.113.8        <span class="warn">≠ resolved at approval time</span>      │
+│ ports/proto 443/tcp        ttl granted 15m (requested 15m)                   │
+│ reason      "pull cert chain for TLS inspection of acme cert"                │
+│ traffic     ↑ 1,204 B   ↓ 88,331 B   last packet 4s ago                     │
+│ <span class="dim">e revoke · Esc back</span>                                                             │
+└──────────────────────────────────────────────────────────────────────────────┘</div>
+
+</body>
+</html>

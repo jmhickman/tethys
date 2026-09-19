@@ -260,6 +260,34 @@ def main():
         fails.append(f"S7 replay re-popuped ({pops7b - base7} popups)")
     print("S7 idempotent-replay:", "ok" if "S7" not in str(fails) else fails[-1])
 
+    # S8: list.history — decided rows only, newest first; state filter + limit
+    # + client-error validation all ride the admin socket.
+    import re
+    def rpc_out(proc):
+        m = re.search(r"\{.*\}", proc.stdout, re.S)
+        return json.loads(m.group(0)) if m else {}
+    hist = rpc_out(scopeadm("history", "--limit", "100"))
+    rows = hist.get("result") or []
+    states = [x["state"] for x in rows]
+    ids = [int(x["id"]) for x in rows]
+    if "error" in hist or not rows:
+        fails.append(f"S8 history empty/error: {json.dumps(hist)[:200]}")
+    if "pending" in states:
+        fails.append("S8 history contains pending rows")
+    if ids != sorted(ids, reverse=True):
+        fails.append(f"S8 not newest-first: {ids}")
+    # this run produced denies (S3/S4/S6), a revoke (S5/S7) and expirables;
+    # at least the deny+revoke terminals must be represented
+    if "denied" not in states or "revoked" not in states:
+        fails.append(f"S8 missing terminal states: {sorted(set(states))}")
+    rows2 = rpc_out(scopeadm("history", "--state", "denied")).get("result") or []
+    if not rows2 or any(x["state"] != "denied" for x in rows2):
+        fails.append(f"S8 state filter broken: {[x.get('state') for x in rows2]}")
+    rows3 = rpc_out(scopeadm("history", "--limit", "1")).get("result") or []
+    if len(rows3) != 1 or int(rows3[0]["id"]) != ids[0]:
+        fails.append(f"S8 limit keeps wrong end: {rows3}")
+    print("S8 history:", "ok" if "S8" not in str(fails) else fails[-1])
+
     gk.send_signal(signal.SIGTERM)
     if fails:
         print("FAILURES:", *fails, sep="\n  ")
