@@ -171,10 +171,12 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
                             }
                         }
                     };
-                    stats.push(GrantStat {
+                    let stat = GrantStat {
                         grant_id: g.id.to_string(),
                         name: g.target.clone(),
-                        dst: g.dst_json.clone(),
+                        // installed dsts as a real array (parse the ledger's
+                        // JSON column once here, not in every consumer)
+                        dst: serde_json::from_str(&g.dst_json).unwrap_or_default(),
                         dst_port: PortSpec { from: g.port_from, to: g.port_to },
                         proto: g.proto,
                         seconds_remaining: g
@@ -184,7 +186,8 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
                         secs_since_last_packet: since_moved,
                         bytes_sent: b_out,
                         bytes_received: b_in,
-                    });
+                    };
+                    stats.push(stat);
                 }
                 seen.retain(|gid, _| rows.iter().any(|g| g.id == *gid));
                 let _ = st.events.send(json_line(&notification(
@@ -408,6 +411,8 @@ fn dispatch_access(
                 "reason": reason,
                 "tool": tool,
                 "ttl_requested": params.ttl_requested,
+                // lets a reconnecting TUI render honest "waiting m:ss"
+                "created_at": now_secs(),
             }),
         )));
 
@@ -488,6 +493,20 @@ fn dispatch_access(
         };
 
         let resp = RpcResponse::ok(&id, &verdict);
+        // Every verdict with a row gets an event too: the TUI clears its
+        // pending modal / updates history live instead of polling. (Offline
+        // denies have no row and no connected admin — nothing to tell.)
+        if let Verdict::Denied { grant_id: Some(gid), reason_code, note } = &verdict {
+            let _ = st.events.send(json_line(&notification(
+                method::EV_DECIDED,
+                serde_json::json!({
+                    "grant_id": gid,
+                    "state": "denied",
+                    "reason_code": reason_code,
+                    "note": note,
+                }),
+            )));
+        }
         respond(serde_json::to_string(&resp).unwrap());
     });
 }
@@ -796,6 +815,22 @@ async fn handle_admin_cmd(req: &RpcRequest, st: &Arc<State>) -> RpcResponse {
             let rows = st.ledger.list(GrantState::Approved).await;
             RpcResponse::ok(&req.id, serde_json::to_value(rows).unwrap())
         }
+        method::LIST_PENDING => {
+            // Snapshot to re-hydrate the TUI's pending modal queue after a
+            // reconnect. Only rows with a LIVE decision channel are decidable;
+            // `waiting` tells the client which ones it can actually act on.
+            let rows = st.ledger.list(GrantState::Pending).await;
+            let live = st.pending.lock().await;
+            let out: Vec<serde_json::Value> = rows
+                .into_iter()
+                .map(|r| {
+                    let mut v = serde_json::to_value(&r).unwrap();
+                    v["waiting"] = serde_json::json!(live.contains_key(&r.id));
+                    v
+                })
+                .collect();
+            RpcResponse::ok(&req.id, out)
+        }
         method::LIST_HISTORY => {
             // Decided rows for the TUI history view. Optional params:
             //   {"state": "denied|expired|revoked|approved", "limit": 100}
@@ -890,7 +925,16 @@ async fn handle_admin_cmd(req: &RpcRequest, st: &Arc<State>) -> RpcResponse {
         }
         method::SUBSCRIBE => RpcResponse::ok(
             &req.id,
-            serde_json::json!({"events": ["grant.request.new","grant.decided","grant.expired"]}),
+            serde_json::json!({
+                "events": [
+                    method::EV_REQUEST_NEW, method::EV_DECIDED,
+                    method::EV_EXPIRED, method::EV_TRAFFIC, method::EV_ERROR
+                ],
+                // TUI contract data: countdown-to-auto-deny needs the timeout;
+                // version lets the client detect daemon skew.
+                "approver_timeout_secs": st.cfg.approver_timeout_secs,
+                "version": env!("CARGO_PKG_VERSION"),
+            }),
         ),
         _ => RpcResponse::err(&req.id, -32601, "unknown method"),
     }

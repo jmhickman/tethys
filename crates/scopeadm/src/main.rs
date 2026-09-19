@@ -25,6 +25,8 @@ enum Cmd {
     List,
     /// stream pending-approval events until a decision is made interactively
     Pending,
+    /// snapshot of pending rows (with `waiting`: has a live decidable channel)
+    Pendings,
     Approve {
         grant_id: String,
         #[arg(long)]
@@ -125,6 +127,14 @@ async fn main() -> anyhow::Result<()> {
             )
             .await?;
             drain_until_id(&mut lines, "a5").await?;
+        }
+        Cmd::Pendings => {
+            call(
+                &mut w,
+                &RpcRequest { jsonrpc: JsonRpcVersion::V2_0, id: "a7".into(), method: method::LIST_PENDING.into(), params: None },
+            )
+            .await?;
+            drain_until_id(&mut lines, "a7").await?;
         }
         Cmd::Pending => {
             // events stream until SIGINT; approve/deny by running other subcommands

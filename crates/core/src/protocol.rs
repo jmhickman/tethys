@@ -77,6 +77,7 @@ pub mod method {
     pub const DENY: &str = "deny";
     pub const REVOKE: &str = "revoke";
     pub const LIST_GRANTS: &str = "list.grants";
+    pub const LIST_PENDING: &str = "list.pending";
     pub const LIST_HISTORY: &str = "list.history";
     pub const STOP_GRANTS: &str = "stop.grants";
     pub const SUBSCRIBE: &str = "subscribe";
@@ -168,7 +169,8 @@ pub enum Verdict {
 pub struct GrantStat {
     pub grant_id: String,
     pub name: String,
-    pub dst: String,
+    /// installed destinations (post-resolution), as a real array on the wire.
+    pub dst: Vec<String>,
     pub dst_port: PortSpec,
     pub proto: Proto,
     pub seconds_remaining: u64,

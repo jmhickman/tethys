@@ -288,6 +288,56 @@ def main():
         fails.append(f"S8 limit keeps wrong end: {rows3}")
     print("S8 history:", "ok" if "S8" not in str(fails) else fails[-1])
 
+    # S9: TUI daemon-contract — subscribe ack carries timeout+full event list;
+    # grant.request.new carries created_at; list.pending snapshots live pendings
+    # with a `waiting` flag; human deny emits grant.decided(state=denied).
+    adm2.sendall((json.dumps({"jsonrpc": "2.0", "id": "s9sub", "method": "subscribe"}) + "\n").encode())
+    ack = None
+    t0 = time.time()
+    while time.time() - t0 < 5 and ack is None:
+        for e in events:
+            if e.get("id") == "s9sub":
+                ack = e
+        time.sleep(0.1)
+    res = (ack or {}).get("result") or {}
+    if res.get("approver_timeout_secs") != 8 or len(res.get("events", [])) != 5:
+        fails.append(f"S9 subscribe ack: {res}")
+
+    a9 = request("r9", {"dst_ip": "192.0.2.99", "dst_port": {"from": 8080, "to": 8080}, "proto": "tcp",
+                        "reason": "contract", "tool": "t", "ttl_requested": "60s"})
+    g9 = None
+    t0 = time.time()
+    while time.time() - t0 < 5 and g9 is None:
+        for e in events:
+            if (e.get("method") == "grant.request.new" and e["params"].get("created_at")
+                    and e["params"].get("target") == "ip:192.0.2.99"):
+                g9 = e["params"]["grant_id"]
+        time.sleep(0.1)
+    if not g9:
+        fails.append("S9 popup missing created_at (or no popup)")
+
+    pends = rpc_out(scopeadm("pendings")).get("result") or []
+    mine = [p for p in pends if p["id"] == int(g9)] if g9 else []
+    if len(mine) != 1 or mine[0].get("waiting") is not True:
+        fails.append(f"S9 list.pending snapshot wrong: {mine}")
+
+    scopeadm("deny", g9, "--note", "contract test")
+    try:
+        a9.settimeout(5); a9.recv(65536)
+    except Exception:
+        pass
+    dec = None
+    t0 = time.time()
+    while time.time() - t0 < 5 and dec is None:
+        for e in events:
+            if (e.get("method") == "grant.decided" and e["params"].get("grant_id") == g9
+                    and e["params"].get("state") == "denied"):
+                dec = e["params"]
+        time.sleep(0.1)
+    if not dec or dec.get("reason_code") != "human_denied" or dec.get("note") != "contract test":
+        fails.append(f"S9 deny event missing/wrong: {dec}")
+    print("S9 tui-contract:", "ok" if "S9" not in str(fails) else fails[-1])
+
     gk.send_signal(signal.SIGTERM)
     if fails:
         print("FAILURES:", *fails, sep="\n  ")
