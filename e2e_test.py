@@ -2,13 +2,14 @@
 """E2E for gatekeeper over real unix sockets + live nftables.
 
 Run from workspace root with a daemon already listening on /tmp/gk-test/*
-(harness below starts one). Requires: built binaries, root, nft.
+(harness below starts one). Requires: built binaries, a privileged account
+(capable of nftables changes), and nft.
 
 Scenarios (all must pass):
   S1 request -> admin event -> approve -> verdict + kernel element w/ expiry
   S2 identical request while active -> instant already_granted, NO popup
   S3 human deny propagates note to the model side
-  S4 no admin connected -> immediate denied/approver_offline (R2a)
+  S4 no admin connected -> immediate denied/approver_offline
   S5 revoke deletes the live kernel element
 """
 import json, os, signal, socket, subprocess, sys, threading, time
@@ -125,7 +126,7 @@ def main():
         fails.append(f"S3 {d3}")
     print("S3 deny+note:", "ok" if "S3" not in str(fails) else fails[-1])
 
-    # S4: approver offline -> instant deny (R2a)
+    # S4: approver offline -> instant deny
     adm.close()
     time.sleep(0.3)
     a4 = request("r4", {"dst_ip": "203.0.113.5", "dst_port": {"from": 80, "to": 80}, "proto": "tcp",
@@ -165,9 +166,9 @@ def main():
         fails.append("S5 element still present after revoke")
     print("S5 revoke:", "ok" if "S5" not in str(fails) else fails[-1])
 
-    # S6: stop.grants kill switch — several grants + pending, all terminate,
-    # baseline table survives (R8: grants die, baseline rules do NOT).
-    # Reopen admin stream for popups (S4 closed the original by design).
+    # S6: stop.grants emergency stop — several grants + one pending, all
+    # terminate, while the baseline nftables table survives (grants die,
+    # baseline rules do not). Reopen the admin stream for popups first.
     ev_base = len([e for e in events if e.get("method") == "grant.request.new"])
 
     def new_gid():

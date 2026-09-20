@@ -1,8 +1,7 @@
 //! nftables batch construction + execution.
 //!
-//! Every encoding here was empirically verified on nft 1.1.6 against this
-//! kernel — see tool-planning/01-nftables-probe.md ("JSON API input encodings").
-//! Notably: CIDR elements MUST be `{"prefix":{...}}` objects (a "a.b.c.d/nn"
+//! Every encoding here was verified empirically on nft 1.1.6 against this
+//! kernel. Notably: CIDR elements MUST be `{"prefix":{...}}` objects (an "a.b.c.d/nn"
 //! string is parsed as a hostname → DNS lookup), per-element TTL goes in the
 //! `{"elem":{"val":...,"expires":N}}` wrapper, and batches apply atomically.
 
@@ -28,7 +27,8 @@ pub const CHAIN_ACCT_IN: &str = "acct_in";
 /// Long default so per-element `expires` is the only thing that reaps grants.
 const SET_DEFAULT_TIMEOUT_SECS: u64 = 24 * 3600;
 
-/// Per-grant accounting object names (survive element expiry by design, R4).
+/// Per-grant accounting object names. These outlive the grant's set element:
+/// counters are swept only when the ledger row leaves the approved state.
 pub fn counter_out(gid: i64) -> String {
     format!("gk_g{gid}_out")
 }
@@ -212,7 +212,7 @@ impl Batch {
         }}}));
     }
 
-    // ------------------------------------------------ accounting (R4)
+    // ------------------------------------------------ accounting
     // Rules in acct chains carry a named counter and NOTHING ELSE — no
     // verdict, so they cannot grant reachability even if stale. Chains are
     // rebuilt wholesale (flush + re-add from ledger): idempotent, handle-free.

@@ -23,7 +23,8 @@ pub struct Cli {
     pub max_ttl: Option<String>,
     #[arg(long)]
     pub approver_timeout_secs: Option<u64>,
-    /// user running scope-mcp; SO_PEERCRED pin (resolved to uid at startup)
+    /// username that runs gk-mcp; connections on mcp.sock must come from a
+    /// process with this uid (resolved at startup)
     #[arg(long)]
     pub mcp_user: Option<String>,
     /// user of the pentest agent workload (configurable name, default hermes-agent)
@@ -46,12 +47,13 @@ pub struct Config {
     pub max_ttl: String,
     pub approver_timeout_secs: u64,
     pub agent_user: String,
-    /// resolved uid of the pentest agent (None until provisioned — warn-only)
+    /// resolved uid of the pentest agent (None until the account exists)
     pub agent_uid: Option<u32>,
     pub mcp_user: String,
-    /// Some(uid) => enforce SO_PEERCRED on mcp.sock; None => warn, accept all
+    /// Some(uid) => only that uid is accepted on mcp.sock; None => accept all (dev)
     pub mcp_peer_uid: Option<u32>,
-    /// group that may connect to mcp.sock (mcp_user's primary gid); None => dev 0700 root only
+    /// group that may connect to mcp.sock (mcp_user's primary gid);
+    /// None => owner-only socket (dev)
     pub mcp_sock_gid: Option<u32>,
     pub dry_run: bool,
 }
@@ -65,8 +67,8 @@ async fn main() -> anyhow::Result<()> {
         .init();
     let cli = Cli::parse();
 
-    // config file: parse error on an existing file is fatal (loud typos);
-    // a missing file falls back to defaults with a warning.
+    // A parse error in an existing config file is fatal; a missing file
+    // falls back to defaults with a warning.
     let file: FileConfig = match std::fs::read_to_string(&cli.config) {
         Ok(s) => toml::from_str(&s)
             .map_err(|e| anyhow::anyhow!("parse {}: {e}", cli.config.display()))?,
@@ -95,8 +97,8 @@ async fn main() -> anyhow::Result<()> {
         dry_run: cli.dry_run || file.dry_run,
     };
 
-    // Identity resolution — strict for the pin (a named-but-missing mcp user
-    // means an impersonation hole if we silently accepted anyone).
+    // Identity resolution: a named-but-missing mcp user is fatal, since
+    // accepting any peer would defeat the uid check on mcp.sock.
     match config::resolve_uid(&cfg.mcp_user) {
         Ok(uid) => {
             cfg.mcp_peer_uid = Some(uid);

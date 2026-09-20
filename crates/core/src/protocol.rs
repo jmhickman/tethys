@@ -123,18 +123,17 @@ pub enum DenyReason {
     /// idempotent replay whose original grant is gone (expired/revoked) —
     /// the caller must re-request under a NEW id (R: re-delivery never re-popups).
     GrantExpired,
-    /// nft apply failed; prior kernel state kept (fail-closed).
+    /// The nftables install failed; the kernel keeps its prior state.
     InstallFailed,
-    /// replay of a request whose original is STILL awaiting its human decision:
-    /// fail-closed — pending is not a grant, and no second popup is created.
+    /// Replay of a request whose original is still awaiting a human decision:
+    /// pending is not a grant, and the replay does not create a second popup.
     AlreadyPending,
 }
 
-/// result of `access.request` — a SUM TYPE by design (design principle: make
-/// illegal states unrepresentable). "approved with no effective grant",
-/// "denied with no reason" etc. are not constructible; each variant carries
-/// exactly what it means. Wire shape stays internally tagged on `decision`
-/// so heterogeneous consumers keep matching `.decision`.
+/// Result of `access.request`, modeled as a sum type: "approved with no
+/// effective grant" or "denied with no reason" cannot be constructed, and each
+/// variant carries exactly the data that outcome has. The wire shape stays
+/// internally tagged on `decision` so consumers keep matching `.decision`.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 #[serde(tag = "decision", rename_all = "snake_case")]
 pub enum Verdict {
@@ -164,7 +163,7 @@ pub enum Verdict {
     },
 }
 
-/// server-push payload for `traffic.stat` (TUI view, decision R4).
+/// Server-push payload for `traffic.stat`.
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct GrantStat {
     pub grant_id: String,
@@ -199,7 +198,7 @@ mod tests {
     fn verdict_serde_shape() {
         // internally tagged on `decision`: consumers keep matching .decision,
         // but malformed combinations (denied + reason-less, approved - effective)
-        // are now UNCONSTRUCTIBLE, not merely discouraged.
+        // combinations like this are now impossible to construct.
         let d = Verdict::Denied {
             reason_code: DenyReason::ApproverOffline,
             grant_id: None,
@@ -222,7 +221,7 @@ mod tests {
         };
         let s = serde_json::to_string(&a).unwrap();
         assert!(s.contains("\"decision\":\"approved\""));
-        // round-trip must be exact (parse-don't-validate on both ends)
+        // the round-trip must be exact on both ends
         assert_eq!(serde_json::from_str::<Verdict>(&s).unwrap(), a);
 
         // an "approved" blob WITHOUT effective must fail to parse — the old

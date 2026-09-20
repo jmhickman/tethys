@@ -1,6 +1,5 @@
 [Unit]
-Description=Gatekeeper static egress baseline (default-deny + R7 carve-outs)
-Documentation=file:///root/gatekeeper/deploy/README.md
+Description=Gatekeeper static egress baseline (default-deny + carve-outs)
 # Baseline must exist before the gatekeeper installs grant elements into it.
 Before=gatekeeper.service
 After=network-pre.target
@@ -9,8 +8,8 @@ Wants=network-pre.target
 [Service]
 Type=oneshot
 RemainAfterExit=yes
-# NOTE (O3): reloading while grants are live aborts on `add set` EEXIST — see
-# the RELOAD CONTRACT comment inside the ruleset file.
+# Reloading while grants are live aborts on `add set` EEXIST — see the
+# RELOAD CONTRACT comment inside the ruleset file.
 ExecStart=/usr/sbin/nft -f /etc/gatekeeper/baseline.nft
 
 [Install]

@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/core", "crates/gatekeeper", "crates/scope-mcp", "crates/scopeadm"]
+members = ["crates/core", "crates/gatekeeper", "crates/gk-mcp", "crates/scopeadm", "crates/gk-tui"]
 
 [workspace.package]
 version = "0.1.0"
@@ -22,6 +22,9 @@ anyhow = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 rmcp = { version = "3.4", features = ["transport-io"] }
+ratatui = "0.29"
+crossterm = { version = "0.28", features = ["event-stream"] }
+unicode-width = "0.2"
 
 [profile.dev]
 debug = 0

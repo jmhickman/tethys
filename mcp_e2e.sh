@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# MCP stdio E2E: real JSON-RPC client -> scope-mcp -> gatekeeper -> live kernel.
+# MCP stdio E2E: real JSON-RPC client -> gk-mcp -> gatekeeper -> live kernel.
 set -u
 cd /root/gatekeeper
 pgrep -x gatekeeper | xargs -r kill 2>/dev/null
-pkill -f 'target/debug/scope-mcp' 2>/dev/null
+pkill -f 'target/debug/gk-mcp' 2>/dev/null
 rm -rf /tmp/gk-test && mkdir -p /tmp/gk-test
 # exercise the real config-file path (TOML parse + defaults + strict users)
 cat > /tmp/gk-test/config.toml <<'CFG'
@@ -40,7 +40,7 @@ def pump():
             if l.strip(): events.append(json.loads(l))
 threading.Thread(target=pump,daemon=True).start()
 
-p = subprocess.Popen(["./target/debug/scope-mcp","--gatekeeper-socket","/tmp/gk-test/mcp.sock"],
+p = subprocess.Popen(["./target/debug/gk-mcp","--gatekeeper-socket","/tmp/gk-test/mcp.sock"],
                      stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True, bufsize=1)
 
 def send(o): p.stdin.write(json.dumps(o)+"\n"); p.stdin.flush()
@@ -48,9 +48,9 @@ def send(o): p.stdin.write(json.dumps(o)+"\n"); p.stdin.flush()
 def recv(timeout=25):
     import select
     r,_,_ = select.select([p.stdout],[],[],timeout)
-    if not r: raise TimeoutError("no response from scope-mcp")
+    if not r: raise TimeoutError("no response from gk-mcp")
     l=p.stdout.readline()
-    if not l.strip(): raise EOFError("scope-mcp closed stdout")
+    if not l.strip(): raise EOFError("gk-mcp closed stdout")
     return json.loads(l)
 
 send({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"e2e","version":"0"}}})

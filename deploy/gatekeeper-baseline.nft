@@ -1,18 +1,19 @@
 #!/usr/sbin/nft -f
-# gatekeeper static egress baseline (decisions D9 / R6 / R7) — applied at boot
-# by gatekeeper-baseline.service BEFORE gatekeeper.service starts.
+# gatekeeper static egress baseline — applied at boot by
+# gatekeeper-baseline.service, before gatekeeper.service starts.
 #
 # Ownership contract: the gatekeeper NEVER edits this layer. It only adds or
-# removes ELEMENTS inside grants_v4/grants_v6 (per-element kernel TTL = D3).
+# removes ELEMENTS inside grants_v4/grants_v6 (expiry comes from each
+# element's kernel timeout; no cron/poller deletes them).
 # This file pre-creates those two sets EMPTY so the lookup rules below parse;
 # their definitions MUST stay byte-compatible with gk_core::nft ensure_base()
 # (crates/core/src/nft.rs) or gatekeeper startup fails.
 #
-# Grammar is the probe-verified nft 1.1.6 form (tool-planning/01-nftables-probe.md):
-# set keys are `ip daddr . meta l4proto . th dport` and rule concats match that
-# key order exactly; no `counter` flag on sets — named counter objects only.
+# Grammar is the verified nft 1.1.6 form: set keys are
+# `ip daddr . meta l4proto . th dport` and rule concats match that key order
+# exactly; no `counter` flag on sets — named counter objects only.
 #
-# RELOAD CONTRACT (open item O3): do not reload this file while grants are
+# RELOAD CONTRACT: do not reload this file while grants are
 # live (`add set` on an existing set aborts). Change sequence:
 #   systemctl stop gatekeeper \
 #     && nft delete table inet gatekeeper || true \
@@ -50,12 +51,12 @@ table inet gatekeeper {
 
     counter gk_drops { }
 
-    # Accounting chains (R4): declared EMPTY by the baseline, but CONTENTS are
-    # owned exclusively by gatekeeper (flush + rebuild from its ledger). Rules
-    # here only ever carry named counters — no verdict can live in these
+    # Accounting chains: declared EMPTY by the baseline, but their contents
+    # are owned exclusively by gatekeeper (flush + rebuild from its ledger).
+    # Rules here only ever carry named counters — no verdict can live in these
     # chains, so they cannot influence enforcement. Priority filter-10: they
     # observe every locally-generated packet BEFORE the egress verdict runs,
-    # and the input chain catches established replies (reply-tuple trick).
+    # and the input chain catches established replies.
     chain acct_out {
         type filter hook output priority -10; policy accept;
     }
@@ -69,8 +70,8 @@ table inet gatekeeper {
         oifname "lo" accept
         ct state established,related accept
 
-        # R7 v1 carve-outs: DHCP (v4 client/server, v6), DNS (D6: not blocked),
-        # ICMP + ICMPv6 to any host.
+        # Always-allowed base services: DHCP (v4 client/server, v6), DNS
+        # (resolution is never blocked), ICMP + ICMPv6 to any host.
         meta l4proto udp th dport { 67, 68, 546, 547 } accept
         meta l4proto udp th dport 53 accept
         meta l4proto tcp th dport 53 accept
@@ -89,8 +90,8 @@ table inet gatekeeper {
         ip6 daddr . meta l4proto . tcp dport @grants_v6 accept
         ip6 daddr . meta l4proto . udp dport @grants_v6 accept
 
-        # R8: the kill switch is `scopeadm stop` (grant removal), never this
-        # chain — baseline needs no off-switch; it is the safe-by-default state.
+        # The emergency stop removes grants, never anything in this chain:
+        # the baseline is the safe-by-default state and needs no off-switch.
         counter name gk_drops limit rate 20/second log prefix "GK-DROP: " drop
     }
 }

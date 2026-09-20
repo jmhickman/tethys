@@ -1,0 +1,19 @@
+[package]
+name = "gk-tui"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "gk-tui"
+path = "src/main.rs"
+
+[dependencies]
+gk-core.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+clap.workspace = true
+anyhow.workspace = true
+ratatui.workspace = true
+crossterm.workspace = true
+unicode-width.workspace = true

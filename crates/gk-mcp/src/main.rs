@@ -1,7 +1,7 @@
-//! scope-mcp: model-facing MCP server (stdio transport). Exactly ONE tool.
+//! gk-mcp: model-facing MCP server (stdio transport). Exactly ONE tool.
 //! It is a thin, stateless proxy: schema-validate → forward access.request to
 //! the gatekeeper over the unix socket → return the verdict string. It holds
-//! no approval power and no netfilter access (see docs §components).
+//! no approval power and no netfilter access.
 
 use std::path::PathBuf;
 
@@ -17,7 +17,7 @@ use tokio::net::UnixStream;
 use gk_core::protocol::{method, AccessRequestParams, RpcRequest, JsonRpcVersion};
 
 #[derive(Parser, Debug)]
-#[command(name = "scope-mcp")]
+#[command(name = "gk-mcp")]
 struct Args {
     #[arg(long, default_value = "/run/gatekeeper/mcp.sock")]
     gatekeeper_socket: PathBuf,
@@ -141,7 +141,7 @@ impl ScopeMcp {
 
 /// Human/LLM-readable one-liner, e.g.:
 /// "APPROVED: 203.0.113.7 tcp 443 granted for 15m (expires 2026-09-15T02:41:00Z)"
-/// Decode into the protocol SUM type (parse-don't-validate): a malformed or
+/// Decode into the protocol sum type: a malformed or
 /// unknown verdict is an error, never a silent default branch.
 fn render_verdict(r: &serde_json::Value) -> String {
     let v: gk_core::protocol::Verdict = match serde_json::from_value(r.clone()) {

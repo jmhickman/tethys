@@ -1,14 +1,15 @@
-//! rusqlite grant ledger (decision D8). Single writer task owns it; callers
-//! go through a spawned actor to keep tokio happy (rusqlite is sync).
+//! rusqlite grant ledger. A single writer task owns the connection; callers
+//! go through a spawned actor because rusqlite is synchronous.
 //!
-//! DESIGN: grant lifecycle is a state MACHINE, and the types here make illegal
-//! states unrepresentable rather than merely discouraged at runtime:
+//! Grant lifecycle is a state machine, and the types here make illegal states
+//! impossible rather than merely discouraged:
 //!   - `GrantState` / `Proto` / `DenyCode` are enums, never bare strings.
-//!   - A row cannot be *constructed* in a non-pending state (`NewGrant` has no
+//!   - A row cannot be constructed in a non-pending state (`NewGrant` has no
 //!     state field; `GrantRow` is only produced by the loader).
-//!   - Every mutation is a `Decide` variant that OWNS its legal origin states,
-//!     its target state, and exactly the payload that transition may carry —
-//!     so "approve with no expiry" or "deny with no reason" do not typecheck.
+//!   - Every mutation is a `Decide` variant that declares its legal origin
+//!     states, its target state, and exactly the payload that transition may
+//!     carry — so "approve with no expiry" or "deny with no reason" do not
+//!     typecheck.
 
 use std::path::Path;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -137,8 +138,9 @@ pub enum Decide {
     Revoke { at: f64, note: Option<String> },
     /// approved -> expired, mirrored from the kernel reaper (no human input)
     ExpireByKernel,
-    /// approved -> expired on boot: no live attributed element was found (R9).
-    /// Carries a note for audit honesty; distinct from the routine TTL reap.
+    /// approved -> expired at startup because reconcile_on_boot found no live
+    /// kernel element for it (grants do not survive a reboot). Distinct from
+    /// the routine TTL reap so the audit trail can tell them apart.
     ReapRestart { at: f64, note: Option<String> },
 }
 
@@ -206,8 +208,8 @@ pub struct Ledger {
 
 fn row_from(r: &rusqlite::Row) -> rusqlite::Result<GrantRow> {
     let state_raw: String = r.get(11)?;
-    // Parse-don't-validate: a row whose state isn't in the closed vocabulary is
-    // corrupt, not "some other state" — skip it loudly rather than model it.
+    // A row whose state is outside the known set is corrupt data, not an extra
+    // state: log and skip it rather than inventing a variant for it.
     let Some(state) = GrantState::parse(&state_raw) else {
         tracing::error!(id = ?r.get::<_, i64>(0).ok(), state = %state_raw,
             "ledger row with unknown state skipped");
@@ -287,7 +289,8 @@ impl Ledger {
             while let Some(cmd) = rx.recv().await {
                 match cmd {
                     LedgerCmd::Insert(g, reply) => {
-                        // human-paced volume: prepared-fresh per insert is fine.
+                        // Requests arrive at human speed; preparing per
+                        // statement instead of caching is cheap enough here.
                         let res = conn.execute(
                             "INSERT INTO grants(idem_key,target,dst_json,port_from,port_to,proto,\
                              reason,tool,ttl_secs,state,created_at) VALUES(?1,?2,'[]',?3,?4,?5,?6,?7,?8,'pending',?9)",
@@ -421,8 +424,8 @@ impl Ledger {
                         let _ = reply.send(out);
                     }
                     LedgerCmd::SetDst(id, dst_json, reply) => {
-                        // Persist post-resolution IPs (D-R3): revoke/cleanup use
-                        // THESE, never a re-resolve at delete time (DNS may drift).
+                        // Persist the resolved IPs: revoke/cleanup use these
+                        // values, never a fresh DNS lookup at delete time.
                         let n = conn
                             .execute(
                                 "UPDATE grants SET dst_json=?2 WHERE id=?1 AND state='approved'",
@@ -539,7 +542,7 @@ mod tests {
         let exp = now_secs() as f64 + 60.0;
         // pending -> approved
         assert!(ledger.decide(gid, Decide::Approve { expires_at: exp }).await);
-        // approving again is rejected (no ghost rows from racy double-decide)
+        // approving again is rejected (guards against a racy double decision)
         assert!(!ledger.decide(gid, Decide::Approve { expires_at: exp }).await);
         // approved -> denied is UNEXPRESSIBLE as a Decide variant at all; the
         // nearest legal-looking one (Revoke) then Expire both target Approved.

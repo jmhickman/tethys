@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
-# pin_e2e: real SO_PEERCRED enforcement via config-file-driven mcp_user.
-#  1) root connecting to mcp.sock must be REJECTED (no reply, daemon survives)
-#  2) a peer running as scopemcp on mcp.sock gets the full approve flow
-#     (admin/approve side stays root — admin.sock is 0600 root by design)
+# pin_e2e: real peer-uid enforcement via config-file-driven mcp_user.
+#  1) a peer that is NOT the configured mcp_user is REJECTED on mcp.sock
+#     (this harness runs as root; no reply, daemon survives)
+#  2) a peer running as gk-mcp-service on mcp.sock gets the full approve flow
+#     (approvals go over admin.sock, which is 0600 root-only)
 set -u
 cd /root/gatekeeper
 pgrep -x gatekeeper | xargs -r kill 2>/dev/null; sleep 0.3
@@ -15,7 +16,7 @@ db = "/tmp/gk-pin/ledger.db"
 max_ttl = "1h"
 approver_timeout_secs = 60
 agent_user = "hermes-agent"
-mcp_user   = "scopemcp"      # REAL pin: only this uid accepted on mcp.sock
+mcp_user   = "gk-mcp-service"      # peer check: only this uid is accepted on mcp.sock
 CFG
 
 ./target/debug/gatekeeper --config /tmp/gk-pin/config.toml > /tmp/gk-pin/gk.log 2>&1 &
@@ -23,7 +24,7 @@ GK=$!
 sleep 0.8
 grep -q "identities resolved" /tmp/gk-pin/gk.log || { echo "startup failed"; cat /tmp/gk-pin/gk.log; exit 1; }
 
-# --- negative: root (uid 0) is not scopemcp -> daemon must ignore the request.
+# --- negative: this shell's user is not gk-mcp-service -> request is ignored.
 python3 - <<'PY'
 import json, socket, sys
 s = socket.socket(socket.AF_UNIX); s.connect("/tmp/gk-pin/mcp.sock")
@@ -37,11 +38,12 @@ except Exception:
     data = b""
 if data:
     print("UNEXPECTED reply to pinned-out peer:", data[:120]); sys.exit(1)
-print("root peer on mcp.sock: correctly ignored (no reply)")
+print("non-mcp-user peer on mcp.sock: correctly ignored (no reply)")
 PY
 NEG=$?
 
-# --- positive: MCP connection AS scopemcp (connector helper), approvals as root.
+# --- positive: MCP connection as gk-mcp-service (connector helper); approvals
+#     come from the admin socket, which this harness opens as its own user.
 cat > /tmp/gk-pin/connector.py <<'PY'
 import json, socket, sys
 try:
@@ -49,20 +51,21 @@ try:
     a.sendall((json.dumps({"jsonrpc":"2.0","id":"pin-2","method":"access.request","params":{
      "dst_ip":"192.0.2.2","dst_port":{"from":80,"to":80},"proto":"tcp",
      "reason":"scoped peer test","tool":"t","ttl_requested":"60s"}})+"\n").encode())
-    a.settimeout(30)  # blocks until root approves on the other end
+    a.settimeout(30)  # blocks until the approval arrives on admin.sock
     rep = a.recv(65536).decode()
     assert '"approved"' in rep, rep[:200]
-    print("scopemcp verdict:", json.loads(rep)["result"]["decision"])
+    print("gk-mcp-service verdict:", json.loads(rep)["result"]["decision"])
 except Exception as e:
     print("connector FAIL:", type(e).__name__, str(e)[:120]); sys.exit(1)
 PY
-# harness runs this as scopemcp; root's umask (077) would make it unreadable there
+# the connector runs as gk-mcp-service; this shell's umask (077) would make
+# the script unreadable to that account, hence the chmod
 chmod 644 /tmp/gk-pin/connector.py
 
 python3 - <<'PY'
 import json, socket, subprocess, sys, threading, time
-adm = socket.socket(socket.AF_UNIX); adm.connect("/tmp/gk-pin/admin.sock")  # root: admin ok
-conn = subprocess.Popen(["runuser","-u","scopemcp","--","python3","/tmp/gk-pin/connector.py"],
+adm = socket.socket(socket.AF_UNIX); adm.connect("/tmp/gk-pin/admin.sock")  # daemon owner may connect
+conn = subprocess.Popen(["runuser","-u","gk-mcp-service","--","python3","/tmp/gk-pin/connector.py"],
                         stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
 adm.settimeout(25)
 t0=time.time(); gid=None
@@ -75,7 +78,7 @@ while time.time()-t0<20 and not gid:
         print("admin read:", e); break
     time.sleep(0.1)
 if not gid:
-    print("no popup for scopemcp request")
+    print("no popup for gk-mcp-service request")
     try:
         out,_ = conn.communicate(timeout=5)
         print("connector said:", out.strip()[:300])
@@ -96,5 +99,5 @@ kill -0 $GK 2>/dev/null || { echo "daemon died on rejected conn"; NEG=9; }
 kill $GK 2>/dev/null
 nft delete table inet gatekeeper 2>/dev/null
 
-echo "negative(root rejected)=$NEG positive(scopemcp ok)=$POSRC"
+echo "negative(non-mcp-user rejected)=$NEG positive(gk-mcp-service ok)=$POSRC"
 [ $NEG -eq 0 ] && [ $POSRC -eq 0 ] && echo "PIN E2E PASSED" || { echo PIN_FAIL; cat /tmp/gk-pin/gk.log; exit 1; }

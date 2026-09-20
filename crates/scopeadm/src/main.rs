@@ -1,6 +1,6 @@
 //! scopeadm: human admin CLI talking NDJSON JSON-RPC to the gatekeeper
-//! admin socket (the same protocol the TUI will use). Scaffold-grade:
-//! list / pending / approve / deny / revoke / watch.
+//! admin socket (the same protocol the TUI uses). Provides list / pending /
+//! approve / deny / revoke / history / stop, plus scripting-friendly output.
 
 use std::path::PathBuf;
 
@@ -47,7 +47,7 @@ enum Cmd {
         #[arg(long, default_value_t = 50)]
         limit: u32,
     },
-    /// R8 kill switch: remove ALL active grants (baseline rules untouched)
+    /// emergency stop: remove ALL active grants (baseline rules untouched)
     Stop,
 }
 

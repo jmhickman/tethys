@@ -45,7 +45,7 @@ impl fmt::Display for Proto {
     }
 }
 
-/// Wire form per decision R5: always an object; `{0,0}` means all ports.
+/// Wire form: always an object; `{0,0}` means all ports.
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PortSpec {
     pub from: u16,

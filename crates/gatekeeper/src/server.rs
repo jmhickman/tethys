@@ -1,10 +1,11 @@
 //! Gatekeeper runtime: two unix sockets, pending-request state machine,
 //! kernel-TTL-backed grants, periodic expiry reconciliation.
 //!
-//! Threat model (docs §trust): `mcp.sock` accepts requests but can NEVER
-//! approve; approvals only arrive on `admin.sock` (0600 root). Approver-absent
-//! rules per decision R2: no admin connected → immediate deny; admin silent
-//! past timeout → auto-deny.
+//! Threat model: `mcp.sock` accepts requests but can never approve;
+//! approvals only arrive on `admin.sock` (0600, so only the account that
+//! owns it). When no approver
+//! is connected a request is denied immediately; if the approver stays silent
+//! past the timeout it is auto-denied.
 
 use std::collections::HashMap;
 use std::os::unix::fs::PermissionsExt;
@@ -53,7 +54,8 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
         admins_online: AtomicUsize::new(0),
     });
 
-    // Base objects (idempotent adds; failure is fatal — fail-closed posture).
+    // Base nftables objects (idempotent adds; startup fails if these cannot
+    // be installed, so enforcement is never silently off).
     if !st.cfg.dry_run {
         let mut b = Batch::new();
         b.ensure_base();
@@ -73,8 +75,9 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
     let mcp = UnixListener::bind(&st.cfg.mcp_socket)?;
     let admin = UnixListener::bind(&st.cfg.admin_socket)?;
     std::fs::set_permissions(&st.cfg.admin_socket, std::fs::Permissions::from_mode(0o600))?;
-    // mcp.sock: reachable only by mcp_user's group (identity still enforced via
-    // SO_PEERCRED per connection); without a resolved gid stay root-only (dev).
+    // mcp.sock: reachable only by mcp_user's group (identity is still checked
+    // per connection via SO_PEERCRED); with no resolved gid the socket stays
+    // owner-only, which in dev means whoever started the daemon.
     if let Some(gid) = st.cfg.mcp_sock_gid {
         use std::os::unix::fs::{chown, PermissionsExt};
         chown(&st.cfg.mcp_socket, None, Some(gid))?;
@@ -119,10 +122,10 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
         });
     }
 
-    // Traffic stats poller (~2 s, decision R4): ledger supplies identity +
-    // countdown; named counter objects supply bytes. Deliberately polling —
-    // no payloads, no per-packet logging. Only runs when an admin is watching
-    // (the only consumer), which also keeps idle nft churn at zero.
+    // Traffic stats poller (~2 s): the ledger supplies identity and
+    // countdown; named counter objects supply byte totals. Polling avoids
+    // per-packet logging overhead. It runs only while an admin is connected
+    // (the sole consumer), which also keeps idle nftables churn at zero.
     if !st.cfg.dry_run {
         let st = st.clone();
         tokio::spawn(async move {
@@ -355,7 +358,7 @@ fn dispatch_access(
             return;
         }
 
-        // R2a: no approver connected -> immediate deny
+        // No approver connected: deny immediately rather than queueing.
         if st.admins_online.load(Ordering::SeqCst) == 0 {
             let resp = RpcResponse::ok(
                 &id,
@@ -430,8 +433,9 @@ fn dispatch_access(
                         if !st.ledger.decide(gid, Decide::Approve { expires_at: exp }).await {
                             tracing::error!(gid, "ledger failed to flip pending->approved");
                         }
-                        // Persist this exact resolution (R3): later revoke/expiry
-                        // cleanup deletes THESE elements — DNS may drift by then.
+                        // Persist this exact DNS resolution: later revoke/expiry
+                        // cleanup must delete these same elements, since DNS
+                        // may have changed by then.
                         let dst_json = serde_json::to_string(
                             &dsts.iter().map(|d| d.canonical()).collect::<Vec<_>>(),
                         )
@@ -461,7 +465,8 @@ fn dispatch_access(
                         }
                     }
                     Err(e) => {
-                        // fail-closed: apply error keeps prior kernel state; deny.
+                        // nft apply failed: the kernel keeps its prior state and
+                        // the request is denied rather than half-installed.
                         tracing::error!(gid, %e, "nft install failed — denying");
                         st.ledger
                             .decide(gid, Decide::Deny {
@@ -511,8 +516,9 @@ fn dispatch_access(
     });
 }
 
-/// Install kernel elements for a grant. Host targets resolved here (D-R3):
-/// the human approves name+IPs together; kernel gets IPs only.
+/// Install kernel elements for a grant. Host targets are resolved here: the
+/// human approves the hostname and its resolved IPs together; the kernel
+/// receives IPs only.
 /// Returns (effective view, all installed dsts) — dsts get persisted to
 /// dst_json so later deletes use THIS resolution, not a fresh DNS lookup.
 async fn install_grant(
@@ -564,10 +570,10 @@ async fn resolve_host(h: &str) -> Result<Vec<ElemDst>, String> {
     Ok(out)
 }
 
-/// Dsts for a ledger row: the PERSISTED resolution (dst_json) when present —
-/// never a fresh DNS lookup at delete time (R3: elements were approved for
-/// specific IPs; re-resolving could delete/keep the wrong ones). Legacy rows
-/// with empty dst_json fall back to resolving the target.
+/// Dsts for a ledger row: the persisted resolution (dst_json) when present —
+/// never a fresh DNS lookup at delete time, since the approved elements were
+/// installed for specific IPs and re-resolving could delete or keep the wrong
+/// ones. Rows with empty dst_json fall back to resolving the target.
 async fn row_elems(st: &Arc<State>, row: &GrantRow) -> Result<Vec<ElemDst>, String> {
     let stored: Vec<String> = serde_json::from_str(&row.dst_json).unwrap_or_default();
     if !stored.is_empty() {
@@ -581,7 +587,7 @@ async fn row_elems(st: &Arc<State>, row: &GrantRow) -> Result<Vec<ElemDst>, Stri
     target_elems(&parse_canonical_target(&row.target)?).await
 }
 
-/// Rebuild both accounting chains from the ledger's approved rows (R4).
+/// Rebuild both accounting chains from the ledger's approved rows.
 /// Count-only rules, no verdicts — enforcement never depends on this.
 async fn rebuild_acct(st: &Arc<State>) -> Result<(), String> {
     if st.cfg.dry_run {
@@ -855,7 +861,7 @@ async fn handle_admin_cmd(req: &RpcRequest, st: &Arc<State>) -> RpcResponse {
             RpcResponse::ok(&req.id, serde_json::to_value(rows).unwrap())
         }
         method::STOP_GRANTS => {
-            // R8 kill switch: terminate GRANTS only — baseline rules untouched.
+            // Emergency stop: terminate grants only; baseline rules are untouched.
             tracing::info!("stop.grants invoked");
             let mut n = 0usize;
             let rows = st.ledger.list(GrantState::Approved).await;
@@ -875,8 +881,8 @@ async fn handle_admin_cmd(req: &RpcRequest, st: &Arc<State>) -> RpcResponse {
             }
             if !st.cfg.dry_run && n > 0 {
                 if let Err(e) = st.nft.apply(&b).await {
-                    // atomic batch hit something stale (ghost element): retry per-grant,
-                    // tolerating ENOENT (already gone), then continue regardless.
+                    // The atomic batch hit a missing element: retry per grant,
+                    // tolerating ENOENT (already gone), then continue.
                     tracing::warn!(%e, "stop.grants batch failed; per-grant fallback");
                     let mut ok = 0usize;
                     for g in &rows {
@@ -1036,8 +1042,8 @@ fn replay_verdict(orig: &GrantRow) -> String {
     // here on purpose, forcing a deliberate answer for replays of that state.
     let d = match orig.state {
         GrantState::Pending => Verdict::Denied {
-            // Fail-closed (agreed design): a pending original is NOT a grant.
-            // No second popup, no implied "yes" — caller must not act on this.
+            // A pending original is not a grant: deny the replay rather than
+            // imply approval. No second popup; the caller must not act.
             reason_code: DenyReason::AlreadyPending,
             grant_id: Some(gid.clone()),
             note: Some(
@@ -1076,7 +1082,7 @@ fn replay_verdict(orig: &GrantRow) -> String {
     serde_json::to_string(&RpcResponse::ok(orig.idem_key.as_deref().unwrap_or(""), &d)).unwrap()
 }
 
-/// Strip control chars so free-text can't spoof TUI rows (docs §hardening).
+/// Strip control chars so free text can't spoof TUI rows.
 fn sanitize(s: &str) -> String {
     s.chars().filter(|c| !c.is_control()).take(280).collect()
 }
@@ -1199,7 +1205,7 @@ mod tests {
         // waiting MCP client would never match its own pending call.
         let v = parse(replay_verdict(&row(GrantState::Pending, None, None)));
         assert_eq!(v["id"], "req-abc");
-        // fail-closed: a pending original is NOT a grant; caller must not act
+        // a pending original is not a grant; the replay is denied
         assert_eq!(v["result"]["decision"], "denied");
         assert_eq!(v["result"]["reason_code"], "already_pending");
     }

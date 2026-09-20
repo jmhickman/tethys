@@ -103,7 +103,7 @@ GID2=$(python3 /tmp/gk-enf/appr.py 8878 10s) || { echo FAIL approve2; exit 1; }
 expect_allowed 8878
 echo "grant $GID2 live on tcp/8878"
 
-# 5b. traffic accounting (R4): admin subscriber must see bytes moving for this
+# 5b. traffic accounting: an admin subscriber must see bytes moving for this
 # grant via pushed traffic.stat events. The subscriber itself is what enables
 # the poller (admins_online gating) — so this asserts both halves.
 cat > /tmp/gk-enf/stats.py <<'PY'

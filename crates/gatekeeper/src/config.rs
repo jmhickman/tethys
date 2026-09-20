@@ -30,8 +30,9 @@ fn default_agent_user() -> String {
     "hermes-agent".into()
 }
 fn default_mcp_user() -> String {
-    // Dedicated service account running scope-mcp; SO_PEERCRED pinning target.
-    "scopemcp".into()
+    // Service account that runs gk-mcp; the daemon only accepts MCP
+    // connections from processes with this uid.
+    "gk-mcp-service".into()
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -71,9 +72,9 @@ impl Default for FileConfig {
     }
 }
 
-/// Resolve a unix user name to uid. Strict by design: naming an identity in
-/// config that doesn't exist on the box is a deployment error, not something
-/// to silently run around (a missing pin = impersonation hole).
+/// Resolve a unix user name to its uid. A username named in config that does
+/// not exist on the box is a deployment error: without the account, the peer
+/// check on mcp.sock cannot hold.
 pub fn resolve_gid(user: &str) -> anyhow::Result<u32> {
     match nix::unistd::User::from_name(user) {
         Ok(Some(u)) => Ok(u.gid.as_raw()),
@@ -100,7 +101,7 @@ mod tests {
         let f: FileConfig = toml::from_str("db = '/tmp/x.db'\n").unwrap();
         assert_eq!(f.db, PathBuf::from("/tmp/x.db"));
         assert_eq!(f.agent_user, "hermes-agent");
-        assert_eq!(f.mcp_user, "scopemcp");
+        assert_eq!(f.mcp_user, "gk-mcp-service");
         assert_eq!(f.approver_timeout_secs, 300);
         assert!(!f.dry_run);
     }
@@ -108,11 +109,11 @@ mod tests {
     #[test]
     fn unknown_keys_rejected() {
         let bad = toml::from_str::<FileConfig>("agent_userrr = 'x'\n");
-        assert!(bad.is_err(), "typos in config must be loud");
+        assert!(bad.is_err(), "unknown config keys must be rejected");
     }
 
     #[test]
-    fn root_resolves_and_ghost_fails() {
+    fn root_resolves_and_missing_user_fails() {
         assert_eq!(resolve_uid("root").unwrap(), 0);
         assert!(resolve_uid("definitely-not-a-user-xyz").is_err());
     }

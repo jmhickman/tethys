@@ -1,0 +1,24 @@
+[Unit]
+Description=gatekeeper MCP server (connection %i)
+# One instance per accepted connection (Accept=yes on gk-mcp.socket): systemd
+# connects the client stream to this process's stdin/stdout, so gk-mcp stays
+# a plain stdio MCP server with no socket-handling code of its own.
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/gk-mcp --gatekeeper-socket /run/gatekeeper/mcp.sock
+# The account whose uid the gatekeeper expects on mcp.sock (its mcp_user
+# config knob must name this user, or a deliberate substitute).
+User=gk-mcp-service
+Group=gk-mcp-service
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+RestrictAddressFamilies=AF_UNIX
+CapabilityBoundingSet=
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes

@@ -1,22 +1,28 @@
 # /etc/gatekeeper/config.toml — gatekeeper daemon configuration.
-# Unknown keys are rejected at startup (loud typos). CLI flags override these.
+# Unknown keys are rejected at startup. CLI flags override these values.
 
 # Sockets
-mcp_socket  = "/run/gatekeeper/mcp.sock"    # scope-mcp connects here (SO_PEERCRED-pinned)
-admin_socket = "/run/gatekeeper/admin.sock"  # scopeadm/TUI, 0600 root-only
+mcp_socket   = "/run/gatekeeper/mcp.sock"   # gk-mcp connects here
+admin_socket = "/run/gatekeeper/admin.sock" # approver clients (TUI); the
+                                             # socket is 0600, so only the
+                                             # account running gatekeeper can
+                                             # connect by default
 
 # Persistence
-db = "/var/lib/gatekeeper/ledger.db"         # rusqlite WAL ledger
+db = "/var/lib/gatekeeper/ledger.db"        # SQLite ledger (WAL mode)
 
-# Policy knobs
+# Policy
 max_ttl = "4h"              # ceiling on any grant, even human-approved
-approver_timeout_secs = 300 # pending request auto-deny after this silence
+approver_timeout_secs = 300 # a pending request is auto-denied after this much
+                            # time without an approver decision
 
-# Identities (names resolved to uids at startup)
-agent_user = "hermes-agent" # uid model-run tooling executes under; used by the
-                            # firewall baseline + future per-agent rules.
-mcp_user   = "scopemcp"     # runs scope-mcp; ONLY this uid is accepted on
-                            # mcp.sock. Missing user => startup error (deploy bug),
-                            # unless dev-only --allow-missing-users is passed.
+# Identities — these are usernames; the daemon resolves them to uids at startup.
+agent_user = "hermes-agent" # user that model-run tooling executes under; used
+                            # by the firewall baseline
+mcp_user   = "gk-mcp-service" # user that runs gk-mcp. The daemon accepts MCP
+                            # connections only from processes running as this
+                            # uid, so a compromised agent cannot approve its own
+                            # requests. A missing user stops startup (a deploy
+                            # error), unless dev-only --allow-missing-users is set.
 
-dry_run = false             # true: sockets+ledger only, never touch nftables
+dry_run = false             # true: sockets and ledger only; nftables untouched
