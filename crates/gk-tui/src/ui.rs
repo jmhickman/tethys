@@ -4,9 +4,15 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Cell, Clear, List, ListItem, Paragraph, Row, Table, TableState, Wrap},
+    widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap},
     Frame,
 };
+/// Display width in terminal cells (CJK-safe via per-char widths).
+fn dw(s: &str) -> usize {
+    s.chars()
+        .map(|c| unicode_width::UnicodeWidthChar::width(c).unwrap_or(0))
+        .sum()
+}
 
 use crate::app::{fmt_bytes, fmt_countdown, fmt_ttl_secs, App, Modal, COLS};
 use crate::conn::ConnStatus;
@@ -104,92 +110,251 @@ fn draw_header(f: &mut Frame, app: &App, st: ConnStatus, a: Rect) {
     f.render_widget(header, a);
 }
 
+// ---------------------------------------------------------------- table
+//
+// Hand-rolled instead of ratatui::Table so a row can span the full width on
+// its second line — Table clamps every cell to its column, which makes true
+// two-line rows impossible at narrow widths.
+//
+// Width policy (columns: 8 fixed facts + elastic `reason`). Fixed columns
+// NEVER clip on a single line — `reason` absorbs every pixel of shrinkage:
+//   1. roomy   — fixed cols at natural width (widest value/header); once
+//      reason has a comfortable slice, surplus grows the inter-column gap
+//      toward GAP_MAX ("ample padding" on big screens), then keeps feeding
+//      reason.
+//   2. tight   — reason gets the remainder and ellipsizes; facts complete.
+//   3. cramped — remainder < REASON_MIN: rows go two lines tall. Line 1 =
+//      fixed cols at natural width, packed greedily (rightmost drop first);
+//      line 2 = `↳ <reason>` across the full inner width.
+
+const GAP_MIN: u16 = 1;
+const GAP_MAX: u16 = 4;
+/// Smallest slice worth giving reason on a single line; below this, wrap.
+const REASON_MIN: u16 = 8;
+const HEADERS: [&str; 8] = ["id", "tool", "dst", "ports", "proto", "ttl", "left", "\u{2195}B"];
+
+fn truncate(s: &str, w: usize) -> String {
+    if dw(s) <= w {
+        return s.to_string();
+    }
+    if w == 0 {
+        return String::new();
+    }
+    if w == 1 {
+        return "…".into();
+    }
+    let mut out = String::new();
+    let mut width = 0;
+    for ch in s.chars() {
+        let cw = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
+        if width + cw > w - 1 {
+            break;
+        }
+        out.push(ch);
+        width += cw;
+    }
+    out.push('…');
+    out
+}
+
+/// Pad/truncate `s` to exactly display-width `w`, left-aligned.
+fn fit(s: &str, w: usize) -> String {
+    let t = truncate(s, w);
+    let pad = w.saturating_sub(dw(&t));
+    format!("{t}{}", " ".repeat(pad))
+}
+
+/// dst cell: first resolved address + count of the rest. The old
+/// `dst.join(",")` clipped mid-address at fixed width and the trailing
+/// comma read like part of the value ("104.26.10.242,104").
+fn fmt_dst(row: &crate::app::LiveRow) -> String {
+    let Some(first) = row.dst.first() else {
+        return "…".into(); // not polled yet
+    };
+    match row.dst.len() {
+        1 => first.clone(),
+        n => format!("{first} +{}", n - 1),
+    }
+}
+
+struct RowCells {
+    vals: [String; 8], // id, tool, dst, ports, proto, ttl, left, traffic
+    reason: String,
+    warn: Style,
+}
+
+fn cells_for(r: &crate::app::LiveRow) -> RowCells {
+    // urgency tint as the countdown runs out (kernel truth)
+    let warn = match r.left {
+        Some(s) if s <= 60 => Style::default().fg(Color::Yellow),
+        _ => Style::default(),
+    };
+    let up = r.bytes_up.unwrap_or(0);
+    let down = r.bytes_down.unwrap_or(0);
+    let traffic = format!(
+        "{}{}",
+        if up > 0 {
+            format!("↑{}", fmt_bytes(up))
+        } else {
+            String::new()
+        },
+        if down > 0 {
+            format!("↓{}", fmt_bytes(down))
+        } else if up == 0 {
+            "·".into()
+        } else {
+            String::new()
+        }
+    );
+    RowCells {
+        vals: [
+            r.id.to_string(),
+            r.tool.clone(),
+            fmt_dst(r),
+            r.ports.clone(),
+            r.proto.clone(),
+            fmt_ttl_secs(r.ttl_secs),
+            fmt_countdown(r.left),
+            traffic,
+        ],
+        reason: r.reason.clone(),
+        warn,
+    }
+}
+
+/// Fixed-column widths = max(content, header) across visible rows, capped so
+/// one pathological value can't starve `reason`; overflow ellipsizes.
+fn natural_widths(rows: &[RowCells]) -> [u16; 8] {
+    let mut w = HEADERS.map(|h| dw(h) as u16);
+    for c in rows {
+        for (i, v) in c.vals.iter().enumerate() {
+            w[i] = w[i].max(dw(v) as u16);
+        }
+    }
+    for i in 0..8 {
+        w[i] = w[i].clamp(dw(HEADERS[i]) as u16, 39);
+    }
+    w
+}
+
+/// Two-line plan: pack fixed columns at natural width left-to-right; the
+/// rightmost ones that don't fit are dropped entirely (bytes first, then
+/// left, ttl…). Returns (widths, count kept).
+fn pack_line1(rows: &[RowCells], w: u16) -> ([u16; 8], usize) {
+    let nat = natural_widths(rows);
+    let mut fw = [0u16; 8];
+    let mut used = 0u16;
+    let mut kept = 0;
+    for i in 0..8 {
+        let need = if kept == 0 { nat[i] } else { nat[i] + GAP_MIN };
+        if used + need > w {
+            break;
+        }
+        fw[i] = nat[i];
+        used += need;
+        kept += 1;
+    }
+    (fw, kept)
+}
+
 fn draw_table(f: &mut Frame, app: &App, a: Rect) {
     let dim = !app_conn_live(app);
-    let widths = [
-        Constraint::Length(4),  // id
-        Constraint::Length(8),  // tool
-        Constraint::Length(17), // dst
-        Constraint::Length(10), // ports
-        Constraint::Length(5),  // proto
-        Constraint::Length(5),  // ttl
-        Constraint::Length(6),  // left
-        Constraint::Length(9),  // bytes
-        Constraint::Min(8),     // reason — yields first, benefits last
-    ];
-    let header = Row::new(COLS.iter().map(|c| Cell::from(c.header()))).style(muted(dim));
+    let title = if dim { " LIVE (stale — no daemon) " } else { " LIVE " };
+    let inner = Block::default().borders(Borders::ALL).title(title).inner(a);
+    f.render_widget(Block::default().borders(Borders::ALL).title(title), a);
+    if inner.width < 8 || inner.height == 0 {
+        return;
+    }
 
-    let rows: Vec<Row> = app
-        .sorted_live()
-        .into_iter()
-        .enumerate()
-        .map(|(i, r)| {
-            let left = fmt_countdown(r.left);
-            // urgency tint as the countdown runs out (kernel truth)
-            let warn = match r.left {
-                Some(s) if s <= 60 => Style::default().fg(Color::Yellow),
-                _ => Style::default(),
-            };
-            let up = r.bytes_up.unwrap_or(0);
-            let down = r.bytes_down.unwrap_or(0);
-            let traffic = format!(
-                "{}{}",
-                if up > 0 { format!("↑{}", fmt_bytes(up)) } else { String::new() },
-                if down > 0 {
-                    format!("↓{}", fmt_bytes(down))
-                } else if up == 0 {
-                    "·".into()
-                } else {
-                    String::new()
-                }
-            );
-            let dst = r.dst.join(",");
-            let differs = !r.dst.is_empty()
-                && !r.target.starts_with("ip:")
-                && !r.target.starts_with("net:")
-                || (r.dst.len() > 1);
-            let dst_cell = if differs && r.target.contains(':') {
-                format!("{dst} ≠")
-            } else {
-                dst
-            };
-            Row::new(vec![
-                Cell::from(r.id.to_string()),
-                Cell::from(r.tool.clone()),
-                Cell::from(dst_cell),
-                Cell::from(r.ports.clone()),
-                Cell::from(r.proto.clone()),
-                Cell::from(fmt_ttl_secs(r.ttl_secs)),
-                Cell::from(left),
-                Cell::from(traffic),
-                Cell::from(r.reason.clone()),
-            ])
-            .style(if i == app.sel && !dim {
-                warn.patch(muted(dim)).add_modifier(Modifier::BOLD)
-            } else {
-                warn.patch(muted(dim))
-            })
-        })
-        .collect();
+    let rows: Vec<RowCells> = app.sorted_live().iter().map(|r| cells_for(r)).collect();
+    let sel_row = app.sel.min(app.live.len().saturating_sub(1));
 
-    let mut ts = TableState::default().with_selected(if app.live.is_empty() {
-        None
-    } else {
-        Some(app.sel.min(app.live.len().saturating_sub(1)))
-    });
-    let table = Table::new(rows, widths)
-        .header(header)
-        .row_highlight_style(
-            Style::default()
-                .bg(Color::DarkGray)
-                .add_modifier(Modifier::REVERSED),
-        )
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(if dim { " LIVE (stale — no daemon) " } else { " LIVE " }),
+    // ---- width plan ------------------------------------------------------
+    let mut fw = natural_widths(&rows);
+    let fixed_nat: u16 = fw.iter().sum();
+    // gaps widen only while every visible reason still fits whole; a reason
+    // that would clip pulls gaps back to GAP_MIN before it loses a character
+    let need_reason = rows
+        .iter()
+        .map(|c| dw(&c.reason) as u16)
+        .max()
+        .unwrap_or(6)
+        .max(6); // "reason" header
+    let surplus = inner.width.saturating_sub(fixed_nat + need_reason + GAP_MIN * 8);
+    let gap = (GAP_MIN + surplus / 8).clamp(GAP_MIN, GAP_MAX);
+    let reason_w = inner.width.saturating_sub(fixed_nat + gap * 8);
+
+    let wrap = reason_w < REASON_MIN;
+    let mut kept = 8usize;
+    if wrap {
+        let (fw3, kept3) = pack_line1(&rows, inner.width);
+        fw = fw3;
+        kept = kept3;
+    }
+
+    let line_h = if wrap { 2 } else { 1 };
+    let body_h = inner.height.saturating_sub(1); // header row
+    let visible = (body_h / line_h).max(1) as usize;
+    // keep the cursor inside the window (Table used to do this via state)
+    let start = sel_row.saturating_sub(visible.saturating_sub(1));
+
+    // ---- emit a padded cell row (fixed cols + optional reason) -----------
+    let gap_s = " ".repeat(gap_used(inner, gap, wrap) as usize);
+    let mk = |vals: &mut Vec<Span<'_>>, v: &[String; 8], style: Style| {
+        for (i, s) in v.iter().take(kept).enumerate() {
+            vals.push(Span::styled(
+                format!("{}{}", fit(s, fw[i] as usize), gap_s.as_str()),
+                style,
+            ));
+        }
+    };
+
+    // ---- header ----------------------------------------------------------
+    let mut hdr: Vec<Span> = Vec::with_capacity(9);
+    mk(&mut hdr, &HEADERS.map(|h| h.to_string()).clone(), muted(dim));
+    if !wrap {
+        hdr.push(Span::styled(truncate("reason", reason_w as usize), muted(dim)));
+    }
+    f.render_widget(Paragraph::new(Line::from(hdr)), inner);
+
+    // ---- body ------------------------------------------------------------
+    let body = Rect { y: inner.y + 1, height: body_h, ..inner };
+    let mut lines: Vec<Line> = Vec::with_capacity(visible * line_h as usize);
+    for (i, c) in rows.iter().skip(start).take(visible).enumerate() {
+        let base = c.warn.patch(muted(dim));
+        let style = if start + i == sel_row && !dim {
+            base.add_modifier(Modifier::REVERSED).bg(Color::DarkGray)
+        } else {
+            base
+        };
+        let mut spans: Vec<Span> = Vec::with_capacity(9);
+        mk(&mut spans, &c.vals, Style::default());
+        if !wrap {
+            spans.push(Span::raw(truncate(&c.reason, reason_w as usize)));
+        }
+        lines.push(Line::from(spans).style(style));
+        if wrap {
+            let cont = format!("  ↳ {}", c.reason);
+            lines.push(Line::from(Span::raw(truncate(&cont, inner.width as usize))).style(style));
+        }
+    }
+    f.render_widget(Paragraph::new(lines), body);
+
+    // honesty about clipping: rows hidden by vertical scroll
+    let hidden = rows.len().saturating_sub(start + visible);
+    if hidden > 0 && body_h > 1 {
+        let note = format!(" {} more ", hidden);
+        let nx = inner.x + inner.width.saturating_sub(note.len() as u16);
+        f.render_widget(
+            Paragraph::new(Line::from(Span::styled(note.clone(), muted(true)))),
+            Rect { x: nx, width: note.len() as u16, height: 1, ..inner },
         );
-    f.render_stateful_widget(table, a, &mut ts);
+    }
+}
+
+/// gap actually used between columns (two-line plan is always GAP_MIN)
+fn gap_used(_inner: Rect, gap: u16, wrap: bool) -> u16 {
+    if wrap { GAP_MIN } else { gap }
 }
 
 fn app_conn_live(_app: &App) -> bool {
@@ -474,5 +639,113 @@ fn primary_network() -> String {
 
 fn unhex_le(h: &str) -> u32 {
     u32::from_str_radix(h, 16).map(u32::from_be).unwrap_or(0)
+}
+
+// ------------------------------------------------------------------- tests
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::app::{App, LiveRow};
+    use ratatui::{backend::TestBackend, Terminal};
+
+    fn row(id: i64, tool: &str, dst: &[&str], reason: &str) -> LiveRow {
+        LiveRow {
+            id,
+            target: "host:mcp.jina.ai".into(),
+            dst: dst.iter().map(|s| s.to_string()).collect(),
+            ports: "443".into(),
+            proto: "tcp".into(),
+            ttl_secs: 3600,
+            reason: reason.into(),
+            tool: tool.into(),
+            left: Some(61),
+            bytes_up: Some(1234),
+            bytes_down: Some(98765),
+        }
+    }
+
+    fn sample_app() -> App {
+        let mut app = App::new();
+        app.live.insert(
+            1,
+            row(1, "hermes-agent", &["104.26.10.242", "104.26.11.242", "172.67.70.54"],
+                "restore jina MCP web tools (search/read) for agent session"),
+        );
+        app.live.insert(2, row(2, "curl", &["93.184.216.34"], "fetch payload for analysis"));
+        app.now = 1;
+        app
+    }
+
+    /// Render the whole UI at w×h and return the drawn frame lines.
+    fn render(w: u16, h: u16) -> Vec<String> {
+        let app = sample_app();
+        let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
+        let st = ConnStatus { up: true, synced: true };
+        terminal.draw(|f| draw(f, &app, st)).unwrap();
+        terminal
+            .backend()
+            .buffer()
+            .content()
+            .chunks(w as usize)
+            .map(|row| row.iter().map(|c| c.symbol()).collect::<String>())
+            .collect()
+    }
+
+    #[test]
+    fn wide_frame_has_no_clipped_facts_and_roomy_reason() {
+        let lines = render(140, 14);
+        let body = lines.join("\n");
+        // facts intact: full first IP, +N for the rest, no mid-address comma clip
+        assert!(body.contains("104.26.10.242 +2"), "dst summary missing:\n{body}");
+        assert!(body.contains("93.184.216.34"));
+        // reason fully visible at wide size
+        assert!(body.contains("restore jina MCP web tools (search/read) for agent session"));
+    }
+
+    #[test]
+    fn medium_yields_reason_first() {
+        let lines = render(90, 14);
+        let body = lines.join("\n");
+        // fixed facts still complete at this width
+        assert!(body.contains("104.26.10.242 +2"));
+        assert!(body.contains("93.184.216.34"));
+        assert!(body.contains("hermes-agent"));
+        // reason is ellipsized, not wrapped away
+        let rline = lines.iter().find(|l| l.contains("restore")).unwrap();
+        assert!(rline.contains('…'), "reason should ellipsize:\n{rline}");
+    }
+
+    #[test]
+    fn tiny_wraps_rows_to_two_lines() {
+        let lines = render(40, 14);
+        let body = lines.join("\n");
+        // fixed columns still readable
+        assert!(body.contains("93.184.216.34"), "facts must stay complete:\n{body}");
+        // reason appears as full-width continuation lines
+        assert!(body.contains("↳ fetch payload for analysis"), "missing wrap line:\n{body}");
+        assert!(body.contains("↳ restore jina MCP web tools"));
+    }
+
+    #[test]
+    fn dump_frames() {
+        if std::env::var("GK_DUMP").is_ok() {
+            for (w, h) in [(120u16, 10u16), (90, 10), (64, 12), (40, 12)] {
+                println!("===== {w}x{h} =====");
+                for l in render(w, h) {
+                    println!("|{l}|");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn never_panics_at_degenerate_sizes() {
+        for w in [8u16, 12, 20, 33, 47, 63, 100, 220] {
+            for h in [5u16, 7, 9, 13, 30] {
+                let _ = render(w, h);
+            }
+        }
+    }
 }
 
