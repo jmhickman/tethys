@@ -59,7 +59,10 @@ D1=$(DROPS); [ "$D1" -gt "$D0" ] && echo "gk_drops counter moved $D0->$D1 ✓" |
 
 # 2. daemon on top of the static table (cross-owner idempotency of ensure_base)
 rm -rf /tmp/gk-enf && mkdir -p /tmp/gk-enf && chmod 755 /tmp/gk-enf
-printf 'mcp_socket="/tmp/gk-enf/mcp.sock"\nadmin_socket="/tmp/gk-enf/admin.sock"\ndb="/tmp/gk-enf/ledger.db"\nmax_ttl="1h"\napprover_timeout_secs=60\nmcp_user="gk-e2e-absent"\n' > /tmp/gk-enf/config.toml
+# agent_user=root: this e2e drives curl as root inside the netns, so root IS
+# the policed uid here — every expect_blocked/expect_allowed below exercises
+# the enforcement path. (S10 proves the exempt path with a different uid.)
+printf 'mcp_socket="/tmp/gk-enf/mcp.sock"\nadmin_socket="/tmp/gk-enf/admin.sock"\ndb="/tmp/gk-enf/ledger.db"\nmax_ttl="1h"\napprover_timeout_secs=60\nmcp_user="gk-e2e-absent"\nagent_user="root"\n' > /tmp/gk-enf/config.toml
 $N env RUST_LOG=info ./target/debug/gatekeeper --config /tmp/gk-enf/config.toml --allow-missing-users >/tmp/gk-enf/gk.log 2>&1 &
 sleep 0.8
 grep -q "nft base table ready" /tmp/gk-enf/gk.log || { echo "FAIL: daemon vs static table"; cat /tmp/gk-enf/gk.log; exit 1; }
@@ -166,5 +169,18 @@ expect_blocked 8879                                 # baseline floor; grant NOT 
 ./target/debug/scopeadm --socket /tmp/gk-enf/admin.sock list | grep -q "\"id\": $GID3" && { echo FAIL: reboot revived grant in ledger; exit 1; } || true
 grep -q "reaped stale approved row" /tmp/gk-enf/gk.log || { echo "FAIL: no reap log after wipe"; exit 1; }
 echo "simulated reboot: grants ephemeral, ledger reaped to expired ✓"
+
+# 10. UID scoping (R11): agent_user=root is policed above; a DIFFERENT uid
+# must be exempt-accepted by the scope chain WITHOUT any grant — and that
+# exemption must not leak to the policed uid (re-check root stays blocked).
+E0=$($N nft --json list counter inet gatekeeper gk_exempt \
+     | python3 -c 'import json,sys;d=json.load(sys.stdin);print([c["counter"]["packets"] for c in d["nftables"] if "counter" in c][0])')
+$N runuser -u nobody -- curl -s -m 2 -o /dev/null http://10.99.0.2:8877/ \
+  || { echo "FAIL: unpoliced uid (nobody) not exempt"; exit 1; }
+E1=$($N nft --json list counter inet gatekeeper gk_exempt \
+     | python3 -c 'import json,sys;d=json.load(sys.stdin);print([c["counter"]["packets"] for c in d["nftables"] if "counter" in c][0])')
+[ "$E1" -gt "$E0" ] || { echo "FAIL: gk_exempt counter didn't move ($E0->$E1)"; exit 1; }
+expect_blocked 8877   # policed uid still policed with no grant live
+echo "uid scoping: unpoliced uid exempt (gk_exempt $E0->$E1), agent uid still policed ✓"
 
 echo "ENFORCEMENT E2E PASSED"

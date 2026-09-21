@@ -56,6 +56,16 @@ table inet gatekeeper {
 
     counter gk_drops { }
 
+    # Enforcement scope chain (UID scoping, R11): declared EMPTY here; the
+    # gatekeeper owns its contents (flush + rebuild from agent_user at every
+    # start). The `jump scope` in egress below is the ONLY way to exempt uids
+    # before the drop: a separate hooked chain cannot do it (each base chain
+    # on the same hook is an independent netfilter callback; accept in one
+    # does NOT skip the others — probe-verified on nft 1.1.6). Inside scope,
+    # policed uids RETURN (verdict falls through to the drop below) and
+    # everyone else ACCEPTs (short-circuits egress, counted by gk_exempt).
+    chain scope { }
+
     # Accounting chains: declared EMPTY by the baseline, but their contents
     # are owned exclusively by gatekeeper (flush + rebuild from its ledger).
     # Rules here only ever carry named counters — no verdict can live in these
@@ -74,6 +84,10 @@ table inet gatekeeper {
 
         oifname "lo" accept
         ct state established,related accept
+
+        # UID scoping: non-policed uids leave here (accept, counted gk_exempt);
+        # policed uids RETURN and continue down the policed path below.
+        jump scope
 
         # Always-allowed base services: DHCP (v4 client/server, v6), DNS
         # (resolution is never blocked), ICMP + ICMPv6 to any host.

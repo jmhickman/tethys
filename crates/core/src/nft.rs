@@ -30,6 +30,17 @@ pub const SET_CARVE_V6: &str = "carve_v6";
 /// never bypass egress enforcement even if they drift or outlive a grant.
 pub const CHAIN_ACCT_OUT: &str = "acct_out";
 pub const CHAIN_ACCT_IN: &str = "acct_in";
+/// Enforcement scope chain (declared empty by the baseline; contents owned by
+/// gatekeeper, same flush-and-rebuild contract as the acct chains). The
+/// baseline's egress chain `jump scope`s here before its drop rule — a base
+/// chain with its own hook CANNOT pre-exempt packets from a lower-priority
+/// base chain (each is an independent netfilter callback; only `drop`
+/// short-circuits traversal; probe-verified on nft 1.1.6). Inside scope:
+/// policed uids `return` (fall through to the caller's drop), everyone else
+/// `accept` (short-circuits the calling chain, probe-verified).
+pub const CHAIN_SCOPE: &str = "scope";
+/// Counts exempt (unpoliced) egress — visible honesty about who skipped.
+pub const COUNTER_EXEMPT: &str = "gk_exempt";
 /// Long default so per-element `expires` is the only thing that reaps grants.
 const SET_DEFAULT_TIMEOUT_SECS: u64 = 24 * 3600;
 
@@ -195,6 +206,44 @@ impl Batch {
                 "hook":hook,"type":"filter","prio":-10,"policy":"accept"
             }}}));
         }
+        // Scope chain + exempt counter: plain (unhooked) adds are idempotent
+        // on this nft build (verified), same reload-safety as above.
+        self.0.push(json!({"add":{"chain":{
+            "family":"inet","table":TABLE,"name":CHAIN_SCOPE
+        }}}));
+        self.add_counter(COUNTER_EXEMPT);
+    }
+
+    /// Rebuild the scope chain from scratch: policed uids `return` to the
+    /// caller (egress drop path continues), everything else is exempt-accepted
+    /// and counted. Empty policed list = host-wide enforcement (every packet
+    /// falls through to the caller's verdict) — the pre-scope behavior, kept
+    /// as the fail-safe when agent_user cannot be resolved.
+    pub fn rebuild_scope(&mut self, policed_uids: &[u32]) {
+        self.0.push(json!({"flush":{"chain":{
+            "family":"inet","table":TABLE,"name":CHAIN_SCOPE
+        }}}));
+        if policed_uids.is_empty() {
+            // No exempt rule at all: every packet returns immediately and
+            // faces the caller's verdict — host-wide enforcement, the
+            // fail-safe when agent_user is unresolved.
+            return;
+        }
+        for uid in policed_uids {
+            self.0.push(json!({"add":{"rule":{
+                "family":"inet","table":TABLE,"chain":CHAIN_SCOPE,
+                "expr":[
+                    {"match":{"op":"==",
+                              "left":{"meta":{"key":"skuid"}},
+                              "right":uid}},
+                    {"return":null}
+                ]
+            }}}));
+        }
+        self.0.push(json!({"add":{"rule":{
+            "family":"inet","table":TABLE,"chain":CHAIN_SCOPE,
+            "expr":[{"counter":COUNTER_EXEMPT},{"accept":null}]
+        }}}));
     }
 
     /// Install one grant element with a per-element kernel TTL, attributed to
@@ -679,6 +728,34 @@ mod tests {
         // plain concat, NO expires/comment wrapper (unlike grants)
         assert_eq!(e["elem"][0]["concat"][1], json!("tcp"));
         assert!(e["elem"][0]["concat"].is_array());
+    }
+
+    #[test]
+    fn scope_rules_encode_policed_return_then_exempt_accept() {
+        let mut b = Batch::new();
+        b.rebuild_scope(&[990]);
+        let cmds = &b.0;
+        assert_eq!(cmds[0]["flush"]["chain"]["name"], serde_json::json!(CHAIN_SCOPE));
+        let policed = &cmds[1]["add"]["rule"];
+        assert_eq!(policed["chain"], serde_json::json!(CHAIN_SCOPE));
+        let exprs = policed["expr"].as_array().unwrap();
+        assert_eq!(exprs[0]["match"]["left"], serde_json::json!({"meta":{"key":"skuid"}}));
+        assert_eq!(exprs[0]["match"]["op"], serde_json::json!("=="));
+        assert_eq!(exprs[0]["match"]["right"], serde_json::json!(990));
+        assert!(exprs[1].get("return").is_some(), "policed uids must RETURN");
+        let exempt = &cmds[2]["add"]["rule"];
+        let exprs = exempt["expr"].as_array().unwrap();
+        assert_eq!(exprs[0]["counter"], serde_json::json!(COUNTER_EXEMPT));
+        assert!(exprs[1].get("accept").is_some(), "everyone else ACCEPTs");
+    }
+
+    #[test]
+    fn scope_empty_list_means_no_exempt_rule() {
+        let mut b = Batch::new();
+        b.rebuild_scope(&[]);
+        // flush only — no accept rule, so all packets fall through to drop
+        assert_eq!(b.0.len(), 1);
+        assert!(b.0[0].get("flush").is_some());
     }
 
     #[test]

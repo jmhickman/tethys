@@ -14,9 +14,12 @@ Approval authority lives on `admin.sock`, which the daemon creates 0600 —
 only the account running gatekeeper (root here) can connect. Everything the
 agent side can do is *submit* a grant request over `mcp.sock`, which a human
 must approve. The agent user being unable to read/write `admin.sock` is the
-boundary. `mcp_user` (below) is NOT a security boundary against the agent —
-in the stdio topology below it is the same uid as the agent itself; treat it
-as deployment plumbing, not identity proofing.
+boundary. Enforcement is UID-SCOPED: the egress drop applies only to
+`agent_user`'s uid; everyone else on the box (human admins, system services)
+egresses freely — the sandbox is the agent's, not the host's. `mcp_user` is
+NOT a security boundary against the agent — in the stdio topology below it is
+the same uid as the agent itself; treat it as deployment plumbing, not
+identity proofing.
 
 ## Production topology (unprivileged harness)
 

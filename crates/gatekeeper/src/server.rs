@@ -65,6 +65,7 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
             .map_err(|e| anyhow::anyhow!("nft base install failed: {e}"))?;
         tracing::info!("nft base table ready");
         install_carves(&st).await?;
+        install_scope(&st).await?;
         reconcile_on_boot(&st).await;
     } else {
         tracing::warn!("--dry-run: nft objects NOT installed (dev mode)");
@@ -551,6 +552,30 @@ async fn install_grant(
 /// sets, resolve hostnames (fail startup if an entry cannot resolve), add
 /// elements. Wholesale reinstall means removed config entries actually go
 /// away on restart; kernel state always equals declared config.
+/// UID-scope the egress verdict (R11): only agent_user's uid is policed by
+/// the baseline drop; everyone else on the host is exempt-accepted in the
+/// scope chain. Unresolved agent_user => empty policed list => host-wide
+/// enforcement (fail-safe: stricter, never silently off).
+async fn install_scope(st: &Arc<State>) -> anyhow::Result<()> {
+    let mut b = Batch::new();
+    match st.cfg.agent_uid {
+        Some(uid) => {
+            b.rebuild_scope(&[uid]);
+            tracing::info!(uid, user = %st.cfg.agent_user, "egress enforcement scoped to agent uid");
+        }
+        None => {
+            b.rebuild_scope(&[]);
+            tracing::warn!(
+                user = %st.cfg.agent_user,
+                "agent_user unresolved — enforcing host-wide (all uids policed)"
+            );
+        }
+    }
+    st.nft.apply(&b)
+        .await
+        .map_err(|e| anyhow::anyhow!("scope install failed: {e}"))
+}
+
 async fn install_carves(st: &Arc<State>) -> anyhow::Result<()> {
     let mut b = Batch::new();
     b.ensure_carve_sets();

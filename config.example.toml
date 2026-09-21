@@ -17,8 +17,12 @@ approver_timeout_secs = 300 # a pending request is auto-denied after this much
                             # time without an approver decision
 
 # Identities — these are usernames; the daemon resolves them to uids at startup.
-agent_user = "hermes-agent" # user that model-run tooling executes under; used
-                            # by the firewall baseline
+agent_user = "hermes-agent" # THE POLICED UID: the baseline's egress drop
+                            # applies only to traffic from this uid (scope
+                            # chain, R11); every other uid on the host
+                            # egresses freely (counted by nft counter
+                            # gk_exempt). Unresolvable user => fail-safe:
+                            # enforcement covers ALL uids (host-wide).
 mcp_user   = "gk-mcp-service" # uid accepted on mcp.sock (SO_PEERCRED) and the
                             # group that owns it. In the standard stdio
                             # topology the agent harness spawns gk-mcp itself,
