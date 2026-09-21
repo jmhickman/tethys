@@ -23,6 +23,8 @@ struct Args {
 enum Cmd {
     /// list approved (active) grants
     List,
+    /// operator allow list as configured (what lives in the carve sets)
+    Allow,
     /// stream pending-approval events until a decision is made interactively
     Pending,
     /// snapshot of pending rows (with `waiting`: has a live decidable channel)
@@ -75,6 +77,14 @@ async fn main() -> anyhow::Result<()> {
             )
             .await?;
             // events may precede our response; match on id.
+            drain_until_id(&mut lines, "a1").await?;
+        }
+        Cmd::Allow => {
+            call(
+                &mut w,
+                &RpcRequest { jsonrpc: JsonRpcVersion::V2_0, id: "a1".into(), method: method::LIST_ALLOW.into(), params: None },
+            )
+            .await?;
             drain_until_id(&mut lines, "a1").await?;
         }
         Cmd::Approve { grant_id, ttl_secs } => {

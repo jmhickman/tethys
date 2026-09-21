@@ -78,6 +78,9 @@ pub mod method {
     pub const REVOKE: &str = "revoke";
     pub const LIST_GRANTS: &str = "list.grants";
     pub const LIST_PENDING: &str = "list.pending";
+    /// operator allow list as parsed from config/CLI (what is installed in
+    /// the baseline carve sets); read-only, no params
+    pub const LIST_ALLOW: &str = "list.allow";
     pub const LIST_HISTORY: &str = "list.history";
     pub const STOP_GRANTS: &str = "stop.grants";
     pub const SUBSCRIBE: &str = "subscribe";

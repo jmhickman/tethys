@@ -19,6 +19,12 @@ use crate::types::{PortSpec, Proto};
 pub const TABLE: &str = "gatekeeper";
 pub const SET_V4: &str = "grants_v4";
 pub const SET_V6: &str = "grants_v6";
+/// Operator-declared always-allowed tuples (config `allow` list). Owned by
+/// the gatekeeper at runtime (flush+reinstall from config), but they live in
+/// the baseline's carve sets so they survive grant churn and are never
+/// touched by stop.grants.
+pub const SET_CARVE_V4: &str = "carve_v4";
+pub const SET_CARVE_V6: &str = "carve_v6";
 /// Accounting chains (declared empty by the static baseline, contents owned by
 /// gatekeeper). Rules here carry COUNTERS ONLY — never a verdict — so they can
 /// never bypass egress enforcement even if they drift or outlive a grant.
@@ -120,6 +126,15 @@ impl GrantElem {
         }
     }
 
+    /// Carve-set counterpart (operator allow list): same key grammar, but the
+    /// carve sets carry no timeout flag, so elements persist until reinstalled.
+    pub fn carve_set_name(&self) -> &'static str {
+        match &self.dst {
+            ElemDst::Ip(IpAddr::V4(_)) | ElemDst::Net(IpNet::V4(_)) => SET_CARVE_V4,
+            _ => SET_CARVE_V6,
+        }
+    }
+
     /// concat value components — the verified-safe encoding.
     fn concat(&self) -> Value {
         let dst = match &self.dst {
@@ -134,13 +149,6 @@ impl GrantElem {
             json!({"range": [f, t]})
         };
         json!({"concat": [dst, self.proto.nft_key(), port]})
-    }
-
-    fn delete_cmd(&self) -> Value {
-        json!({"delete": {"element": {
-            "family": "inet", "table": TABLE, "name": self.set_name(),
-            "elem": [self.concat()]
-        }}})
     }
 }
 
@@ -202,7 +210,51 @@ impl Batch {
     }
 
     pub fn delete_grant(&mut self, e: &GrantElem) {
-        self.0.push(e.delete_cmd());
+        self.delete_in(e, e.set_name())
+    }
+
+    /// Operator allow-list element: same key grammar as a grant, but NO
+    /// timeout/comment — carve elements live until the next flush_carves.
+    /// Callers MUST flush_carves() first (delete-of-missing-element aborts
+    /// an nft batch, so we cannot delete-before-add defensively here).
+    pub fn add_carve(&mut self, e: &GrantElem) {
+        self.0.push(json!({"add":{"element":{
+            "family":"inet","table":TABLE,"name":e.carve_set_name(),
+            "elem":[e.concat()]
+        }}}));
+    }
+
+    /// Wipe both carve sets before reinstalling from config (keeps the kernel
+    /// exactly equal to the declared list — removed entries actually go away).
+    pub fn flush_carves(&mut self) {
+        for name in [SET_CARVE_V4, SET_CARVE_V6] {
+            self.0.push(json!({"flush":{"set":{
+                "family":"inet","table":TABLE,"name":name
+            }}}));
+        }
+    }
+
+    /// Ensure the carve sets exist (baseline declares them; this makes dev
+    /// runs without the drop-in work, mirroring ensure_base for grants).
+    pub fn ensure_carve_sets(&mut self) {
+        for (name, proto_field) in [(SET_CARVE_V4, "ip"), (SET_CARVE_V6, "ip6")] {
+            self.0.push(json!({"add":{"set":{
+                "family":"inet","table":TABLE,"name":name,
+                "type":{"typeof":{"concat":[
+                    {"payload":{"protocol":proto_field,"field":"daddr"}},
+                    {"meta":{"key":"l4proto"}},
+                    {"payload":{"protocol":"th","field":"dport"}}
+                ]}},
+                "flags":["interval"]
+            }}}));
+        }
+    }
+
+    fn delete_in(&mut self, e: &GrantElem, set: &str) {
+        self.0.push(json!({"delete": {"element": {
+            "family": "inet", "table": TABLE, "name": set,
+            "elem": [e.concat()]
+        }}}));
     }
 
     /// Delete a whole counter object (revoke cleanup).
@@ -600,6 +652,33 @@ mod tests {
         assert_eq!(e0["elem"]["expires"], 600);
         assert_eq!(e0["elem"]["val"]["concat"][0], "203.0.113.7");
         assert_eq!(e0["elem"]["comment"], "gk:g7"); // attribution marker (reconcile)
+    }
+
+    #[test]
+    fn carve_batch_shape() {
+        let mut b = Batch::new();
+        b.ensure_carve_sets();
+        b.flush_carves();
+        b.add_carve(&GrantElem {
+            dst: ElemDst::Ip("203.0.113.7".parse().unwrap()),
+            proto: Proto::Tcp,
+            port: PortSpec { from: 443, to: 443 },
+        });
+        let cmds = serde_json::from_str::<Value>(&b.to_json()).unwrap()["nftables"]
+            .as_array()
+            .unwrap()
+            .clone();
+        // sets ensured without timeout flag (carves persist until reinstall)
+        let s0 = &cmds[0]["add"]["set"];
+        assert_eq!(s0["name"], "carve_v4");
+        assert_eq!(s0["flags"], json!(["interval"]));
+        // flush both sets before adds: [0,1]=sets, [2,3]=flushes, [4]=elem
+        assert!(cmds[2]["flush"]["set"]["name"].as_str() == Some("carve_v4"));
+        let e = &cmds[4]["add"]["element"];
+        assert_eq!(e["name"], "carve_v4");
+        // plain concat, NO expires/comment wrapper (unlike grants)
+        assert_eq!(e["elem"][0]["concat"][1], json!("tcp"));
+        assert!(e["elem"][0]["concat"].is_array());
     }
 
     #[test]

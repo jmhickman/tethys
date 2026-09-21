@@ -30,6 +30,10 @@ pub struct Cli {
     /// user of the pentest agent workload (configurable name, default hermes-agent)
     #[arg(long)]
     pub agent_user: Option<String>,
+    /// operator allow-list entry (repeatable); same grammar as config `allow`
+    /// (e.g. --allow api.anthropic.com:443 --allow 192.168.10.165:1234)
+    #[arg(long = "allow")]
+    pub allow: Vec<String>,
     /// don't fail startup if configured users are missing (dev only)
     #[arg(long)]
     pub allow_missing_users: bool,
@@ -55,6 +59,9 @@ pub struct Config {
     /// group that may connect to mcp.sock (mcp_user's primary gid);
     /// None => owner-only socket (dev)
     pub mcp_sock_gid: Option<u32>,
+    /// operator allow list, parsed at startup (a bad entry aborts boot —
+    /// silently ignoring it would defeat the point of declaring it)
+    pub allow: Vec<(gk_core::types::Target, gk_core::types::PortSpec, gk_core::types::Proto)>,
     pub dry_run: bool,
 }
 
@@ -94,8 +101,19 @@ async fn main() -> anyhow::Result<()> {
         mcp_user: cli.mcp_user.unwrap_or(file.mcp_user),
         mcp_peer_uid: None,
         mcp_sock_gid: None,
+        allow: Vec::new(),
         dry_run: cli.dry_run || file.dry_run,
     };
+
+    // Allow list: CLI entries replace the file's (same precedence rule as
+    // every other knob). Parse eagerly — an unparseable entry is fatal.
+    let allow_src = if cli.allow.is_empty() { &file.allow } else { &cli.allow };
+    for entry in allow_src {
+        cfg.allow.push(
+            config::parse_allow(entry)
+                .map_err(|e| anyhow::anyhow!("config `allow`: {e}"))?,
+        );
+    }
 
     // Identity resolution: a named-but-missing mcp user is fatal, since
     // accepting any peer would defeat the uid check on mcp.sock.

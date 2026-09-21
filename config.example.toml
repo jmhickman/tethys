@@ -25,4 +25,25 @@ mcp_user   = "gk-mcp-service" # user that runs gk-mcp. The daemon accepts MCP
                             # requests. A missing user stops startup (a deploy
                             # error), unless dev-only --allow-missing-users is set.
 
+# Operator allow list — egress that is ALWAYS allowed, installed into the
+# baseline's carve sets at startup (kernel state == this list after every
+# restart; removed entries go away). Gatekeeper has no built-in notion of
+# "cloud provider": what is always-allowed is entirely the deployment's call.
+# Grammar: target[:port[-port]][/(tcp|udp)]; port omitted => all ports,
+# proto omitted => tcp. Targets are host, IP, or CIDR; hostnames are resolved
+# at startup (unresolvable entry = boot failure). CLI --allow (repeatable)
+# replaces this list entirely. Inspect the live list with `list.allow`.
+#
+# Examples — an LLM-harness deployment might declare its own backends:
+#   allow = [
+#     "192.168.10.165:1234",              # LAN LM Studio instance
+#     "api.anthropic.com:443",            # Anthropic API
+#     "api.openai.com:443",               # OpenAI API
+#     "api.x.ai:443",                     # xAI API
+#     "openrouter.ai:443",                # OpenRouter
+#     "151.101.0.0/16:80-443",            # some CDN CIDR, port range
+#     "time.example.net:123/udp",         # explicit udp
+#   ]
+allow = []
+
 dry_run = false             # true: sockets and ledger only; nftables untouched

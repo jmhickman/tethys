@@ -2,12 +2,17 @@
 # gatekeeper static egress baseline — applied at boot by
 # gatekeeper-baseline.service, before gatekeeper.service starts.
 #
-# Ownership contract: the gatekeeper NEVER edits this layer. It only adds or
-# removes ELEMENTS inside grants_v4/grants_v6 (expiry comes from each
-# element's kernel timeout; no cron/poller deletes them).
-# This file pre-creates those two sets EMPTY so the lookup rules below parse;
-# their definitions MUST stay byte-compatible with gk_core::nft ensure_base()
-# (crates/core/src/nft.rs) or gatekeeper startup fails.
+# Ownership contract: the gatekeeper NEVER edits rules or verdicts in this
+# layer. It adds/removes ELEMENTS inside grants_v4/grants_v6 (expiry comes
+# from each element's kernel timeout; no cron/poller deletes them), and it
+# OWNS the CONTENTS of carve_v4/carve_v6 wholesale: those sets are flushed
+# and reinstalled from the config `allow` list on every daemon start. To
+# change always-allowed egress, edit /etc/gatekeeper/config.toml (`allow`)
+# and restart gatekeeper — do NOT `nft add element` into carve_* by hand;
+# it will be wiped on the next restart.
+# This file pre-creates all four sets EMPTY so the lookup rules below parse;
+# the grant set definitions MUST stay byte-compatible with gk_core::nft
+# ensure_base() (crates/core/src/nft.rs) or gatekeeper startup fails.
 #
 # Grammar is the verified nft 1.1.6 form: set keys are
 # `ip daddr . meta l4proto . th dport` and rule concats match that key order
@@ -23,11 +28,11 @@
 # Proxmox host (never network-dependent), then `nft delete table inet gatekeeper`.
 
 table inet gatekeeper {
-    # ---- human-managed carve-outs -------------------------------------
-    # Same key grammar as the grant sets so one rule shape serves both.
-    # Populate with engagement-essential services (dnf/mirrors, admin ssh
-    # egress, ...). Example:
-    #   nft add element inet gatekeeper carve_v4 '{ 151.101.0.0/16 . tcp . 443 }'
+    # ---- operator-declared always-allowed tuples -----------------------
+    # CONTENTS owned by gatekeeper at runtime: flushed + reinstalled from
+    # config `allow` on every start. Same key grammar as the grant sets so
+    # one rule shape serves both; no timeout — entries persist until the
+    # next restart's reinstall.
     set carve_v4 {
         typeof ip daddr . meta l4proto . th dport
         flags interval

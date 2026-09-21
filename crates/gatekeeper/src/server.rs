@@ -64,6 +64,7 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
             .await
             .map_err(|e| anyhow::anyhow!("nft base install failed: {e}"))?;
         tracing::info!("nft base table ready");
+        install_carves(&st).await?;
         reconcile_on_boot(&st).await;
     } else {
         tracing::warn!("--dry-run: nft objects NOT installed (dev mode)");
@@ -546,6 +547,40 @@ async fn install_grant(
     Ok((EffectiveGrant { dst: eff_dst, dst_port: port, proto }, dsts))
 }
 
+/// Install the operator allow list into the baseline carve sets: wipe both
+/// sets, resolve hostnames (fail startup if an entry cannot resolve), add
+/// elements. Wholesale reinstall means removed config entries actually go
+/// away on restart; kernel state always equals declared config.
+async fn install_carves(st: &Arc<State>) -> anyhow::Result<()> {
+    let mut b = Batch::new();
+    b.ensure_carve_sets();
+    b.flush_carves();
+    let mut n = 0usize;
+    // add-of-existing-element aborts an nft batch: dedupe resolved tuples
+    let mut seen: std::collections::HashSet<(String, u8, u16, u16)> = Default::default();
+    for (target, port, proto) in &st.cfg.allow {
+        let dsts = target_elems(target)
+            .await
+            .map_err(|e| anyhow::anyhow!("allow {}: {e}", target.canonical()))?;
+        anyhow::ensure!(!dsts.is_empty(), "allow {}: resolved to zero addresses", target.canonical());
+        for d in &dsts {
+            let key = (d.canonical(), if *proto == Proto::Tcp { 0 } else { 1 }, port.from, port.to);
+            if !seen.insert(key) {
+                tracing::warn!(target = %target.canonical(), "allow: duplicate tuple skipped");
+                continue;
+            }
+            b.add_carve(&GrantElem { dst: d.clone(), proto: *proto, port: *port });
+            n += 1;
+        }
+        tracing::info!(target = %target.canonical(), %proto, ports = %format!("{}-{}", port.from, port.to), addrs = dsts.len(), "allow entry installed");
+    }
+    if !st.cfg.dry_run {
+        st.nft.apply(&b).await.map_err(|e| anyhow::anyhow!("carve install failed: {e}"))?;
+    }
+    tracing::info!(entries = st.cfg.allow.len(), elements = n, "operator allow list installed");
+    Ok(())
+}
+
 async fn target_elems(t: &Target) -> Result<Vec<ElemDst>, String> {
     match t {
         Target::Ip(ip) => Ok(vec![ElemDst::Ip(*ip)]),
@@ -820,6 +855,22 @@ async fn handle_admin_cmd(req: &RpcRequest, st: &Arc<State>) -> RpcResponse {
         method::LIST_GRANTS => {
             let rows = st.ledger.list(GrantState::Approved).await;
             RpcResponse::ok(&req.id, serde_json::to_value(rows).unwrap())
+        }
+        method::LIST_ALLOW => {
+            let out: Vec<serde_json::Value> = st
+                .cfg
+                .allow
+                .iter()
+                .map(|(t, p, proto)| {
+                    serde_json::json!({
+                        "target": t.canonical(),
+                        "port_from": p.from,
+                        "port_to": p.to,
+                        "proto": proto,
+                    })
+                })
+                .collect();
+            RpcResponse::ok(&req.id, serde_json::to_value(out).unwrap())
         }
         method::LIST_PENDING => {
             // Snapshot to re-hydrate the TUI's pending modal queue after a
