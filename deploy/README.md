@@ -56,7 +56,8 @@ gk-mcp beyond the binary.
    systemctl enable --now gatekeeper-baseline.service gatekeeper.service
    ```
 
-   Do NOT enable `gk-mcp.socket` / `gk-mcp@.service` — see Legacy below.
+   Earlier revisions shipped `gk-mcp.socket` / `gk-mcp@.service`; if you find
+   them on an old install, disable and remove them (see history note below).
 
 4. **Harness MCP config** (`mcp.json` in the Hermes Capabilities UI, or the
    equivalent in any MCP client):
