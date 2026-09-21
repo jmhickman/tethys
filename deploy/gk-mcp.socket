@@ -1,3 +1,7 @@
+# LEGACY (see deploy/README.md): socket-activated gk-mcp, for deployments
+# where a dedicated service user runs gk-mcp per connection. The standard
+# topology has the agent harness spawn gk-mcp as a stdio child instead —
+# do not enable this socket in that case.
 [Unit]
 Description=gatekeeper MCP server socket
 # gk-mcp is independent of the agent harness: the harness connects to this

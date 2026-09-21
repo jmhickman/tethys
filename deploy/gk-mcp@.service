@@ -1,3 +1,6 @@
+# LEGACY (see deploy/README.md): companion of gk-mcp.socket. The standard
+# topology has the agent harness spawn gk-mcp directly; leave both units
+# disabled there.
 [Unit]
 Description=gatekeeper MCP server (connection %i)
 # One instance per accepted connection (Accept=yes on gk-mcp.socket): systemd

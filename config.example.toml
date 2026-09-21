@@ -19,11 +19,16 @@ approver_timeout_secs = 300 # a pending request is auto-denied after this much
 # Identities — these are usernames; the daemon resolves them to uids at startup.
 agent_user = "hermes-agent" # user that model-run tooling executes under; used
                             # by the firewall baseline
-mcp_user   = "gk-mcp-service" # user that runs gk-mcp. The daemon accepts MCP
-                            # connections only from processes running as this
-                            # uid, so a compromised agent cannot approve its own
-                            # requests. A missing user stops startup (a deploy
-                            # error), unless dev-only --allow-missing-users is set.
+mcp_user   = "gk-mcp-service" # uid accepted on mcp.sock (SO_PEERCRED) and the
+                            # group that owns it. In the standard stdio
+                            # topology the agent harness spawns gk-mcp itself,
+                            # so set this to the HARNESS USER — a separate
+                            # service account only fits the legacy
+                            # socket-activated deployment (see deploy/README.md).
+                            # This is plumbing, not a security boundary:
+                            # approval authority is admin.sock's 0600. A
+                            # missing user stops startup (a deploy error),
+                            # unless dev-only --allow-missing-users is set.
 
 # Operator allow list — egress that is ALWAYS allowed, installed into the
 # baseline's carve sets at startup (kernel state == this list after every
