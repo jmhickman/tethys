@@ -75,44 +75,15 @@ gk-mcp beyond the binary.
 5. **Approver side.** Run `gk-tui` (or `scopeadm`) as root — or under sudo —
    on the machine. Nothing to configure; the admin socket path is the default.
 
-## Legacy: socket-activated gk-mcp (`gk-mcp.socket`, `gk-mcp@.service`)
+## A note on history: socket-activated gk-mcp (retired)
 
-These units implement an older topology: systemd accepts connections on a
-unix socket and spawns one gk-mcp per connection as a dedicated service user
-(`mcp_user` = separate account, e.g. `gk-mcp-service`). They are still used
-by the dev box in this repo (root harness there makes the stdio peer-cred
-story awkward; see below) but are **not** recommended for new deployments:
-
-- the connecting client must be able to reach `mcp-server.sock` (0660,
-  root:root unless you set `SocketUser`/`SocketGroup`), AND
-- the spawned gk-mcp must run as `mcp_user` for the peer-cred gate — which
-  only an accepting daemon like systemd can arrange.
-
-If you do use them: enable `gk-mcp.socket`, keep `mcp_user` = that service
-user, and make sure the harness connects to `/run/gatekeeper/mcp-server.sock`
-via a stdio bridge (e.g. `systemd-run --pipe ... gk-mcp` as root, or any
-unix-socket relay running as `mcp_user`).
-
-## Dev-box exception (this repo's host)
-
-The harness here runs as **root**, so the plain stdio topology would have
-gk-mcp connecting as uid 0 and failing the peer-cred gate. The dev box
-therefore keeps `mcp_user = "gk-mcp-service"` + socket activation, and gives
-the root harness a stdio→socket bridge in its mcp.json:
-
-```json
-{
-  "mcpServers": {
-    "gatekeeper": {
-      "command": "systemd-run",
-      "args": ["--pipe", "--quiet", "-p", "User=gk-mcp-service", "/usr/local/bin/gk-mcp"]
-    }
-  }
-}
-```
-
-`systemd-run --pipe` spawns gk-mcp as the service user with stdio wired to
-the harness, which is exactly what the peer-cred gate wants.
+Earlier revisions shipped `gk-mcp.socket` + `gk-mcp@.service`: systemd
+accepted a unix socket and spawned one gk-mcp per connection as a dedicated
+service user, with the harness bridged in via `systemd-run --pipe`. That
+topology existed because the dev harness ran as root and needed help matching
+the peer-cred uid. With the harness running unprivileged (the standard case)
+it buys nothing — the harness spawns gk-mcp directly — and a live socket is
+a footgun, so both units are retired (git history preserves them).
 
 ## Smoke test
 
