@@ -487,12 +487,16 @@ fn draw_detail_modal(f: &mut Frame, app: &App, id: i64) {
     ];
     lines.push(Line::from(""));
     f.render_widget(
-        Paragraph::new(lines).block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(format!(" GRANT {id} · {} ", r.tool))
-                .title_bottom(" e revoke · Esc back "),
-        ),
+        Paragraph::new(lines)
+            // long installed-address lists must not clip the "≠ resolved at
+            // approval time" annotation — let lines wrap instead
+            .wrap(Wrap { trim: false })
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(format!(" GRANT {id} · {} ", r.tool))
+                    .title_bottom(" e revoke · Esc back "),
+            ),
         area,
     );
 }
@@ -725,6 +729,27 @@ mod tests {
         // reason appears as full-width continuation lines
         assert!(body.contains("↳ fetch payload for analysis"), "missing wrap line:\n{body}");
         assert!(body.contains("↳ restore jina MCP web tools"));
+    }
+
+    #[test]
+    fn detail_modal_annotation_survives_narrow_width() {
+        let mut app = sample_app();
+        app.modal = Modal::Detail(1); // 6-dst-style row: target host, differs
+        app.live.get_mut(&1).unwrap().dst.push("2606:4700:20::681a:af2".into());
+        let mut terminal = Terminal::new(TestBackend::new(56, 16)).unwrap();
+        let st = ConnStatus { up: true, synced: true };
+        terminal.draw(|f| draw(f, &app, st)).unwrap();
+        let body: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(
+            body.contains("resolved at approval time"),
+            "annotation must wrap, not clip:\n{body}"
+        );
     }
 
     #[test]

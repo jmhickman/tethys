@@ -57,6 +57,23 @@ async fn run(
     let mut tick = tokio::time::interval(std::time::Duration::from_millis(500));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
+    // crossterm's event::read() blocks; shuttle keys into the select loop on
+    // a thread so input is handled the instant it arrives. (The previous
+    // in-select event::poll(80ms) blocked the loop up to 80ms per idle cycle
+    // and — worse — nothing drew until the 500ms tick, so every keypress
+    // looked lagged by up to half a second.)
+    let (key_tx, mut key_rx) = mpsc::unbounded_channel::<Event>();
+    std::thread::spawn(move || loop {
+        match event::read() {
+            Ok(ev) => {
+                if key_tx.send(ev).is_err() {
+                    break; // UI gone
+                }
+            }
+            Err(_) => break,
+        }
+    });
+
     // the conn-lost modal opens once per outage, not on every failed poll
     let mut lost_modal_shown = false;
 
@@ -93,20 +110,24 @@ async fn run(
                         let mut out = Vec::new();
                         app.on_line(&v, &mut out);
                         if !flush(&mut cmd_tx, out) { break; }
+                        // fresh daemon data renders now, not on the next tick
+                        let st = *status_rx.borrow();
+                        terminal.draw(|f| ui::draw(f, &app, st))?;
                     }
                     None => break, // conn task ended
                 }
             }
-            r = async { event::poll(std::time::Duration::from_millis(80)) } => {
-                if r.unwrap_or(false) {
-                    if let Ok(Event::Key(k)) = event::read() {
-                        if k.kind == KeyEventKind::Press {
-                            let mut out = Vec::new();
-                            let quit = handle_key(&mut app, k, &mut out);
-                            if !flush(&mut cmd_tx, out) || quit {
-                                break;
-                            }
+            Some(ev) = key_rx.recv() => {
+                if let Event::Key(k) = ev {
+                    if k.kind == KeyEventKind::Press {
+                        let mut out = Vec::new();
+                        let quit = handle_key(&mut app, k, &mut out);
+                        if !flush(&mut cmd_tx, out) || quit {
+                            break;
                         }
+                        // the whole point: state change -> frame, immediately
+                        let st = *status_rx.borrow();
+                        terminal.draw(|f| ui::draw(f, &app, st))?;
                     }
                 }
             }
