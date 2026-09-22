@@ -28,16 +28,11 @@ pub struct RpcResponse {
     pub error: Option<RpcError>,
 }
 
-#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum JsonRpcVersion {
+    #[default]
     #[serde(rename = "2.0")]
     V2_0,
-}
-
-impl Default for JsonRpcVersion {
-    fn default() -> Self {
-        JsonRpcVersion::V2_0
-    }
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]

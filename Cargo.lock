@@ -451,7 +451,6 @@ dependencies = [
  "rusqlite",
  "serde",
  "serde_json",
- "thiserror",
  "tokio",
  "toml",
  "tracing",
@@ -478,7 +477,6 @@ dependencies = [
  "serde_json",
  "thiserror",
  "tokio",
- "tracing",
 ]
 
 [[package]]
@@ -505,7 +503,6 @@ dependencies = [
  "crossterm",
  "gk-core",
  "ratatui",
- "serde",
  "serde_json",
  "tokio",
  "unicode-width 0.2.0",
@@ -1025,7 +1022,6 @@ dependencies = [
  "anyhow",
  "clap",
  "gk-core",
- "serde",
  "serde_json",
  "tokio",
 ]

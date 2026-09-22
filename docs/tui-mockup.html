@@ -22,7 +22,7 @@
 │ id  tool     dst              ports      proto  ttl    left  ↕B   reason        │
 │ <span class="warn">6   psql     198.51.100.9     5432       tcp    15m    0:47 ↓14k  migrate leg…</span> │
 │ 4   ssh      10.0.0.5         22         tcp    10m    3:12  ↑2k  deploy hotfi…│
-│ 5   python   203.0.113.7 ≠    443        tcp    15m    8:31  ↑1k  pull cert ch…│
+│ 5   python   203.0.113.7 +1   443        tcp    15m    8:31  ↑1k  pull cert ch…│
 │ 3   curl     172.16.4.0/22    8000-8100  tcp    20m   12:04   ↓0  health probe…│
 │                                                                              │
 │                                                                              │
@@ -32,7 +32,7 @@
 │ <span class="dim">j/k select · Enter details · e revoke · ! stop all · P pending · q quit</span>         │
 └──────────────────────────────────────────────────────────────────────────────┘</div>
 <p class="cap">Header line 1: hostname, network, live count, pending badge, connection state. Line 2: active sort + column legend.
-<code>≠</code> marks installed ≠ requested (host was resolved); details view (<code>Enter</code>) shows both, full reason, deny/expire history.
+<code>⚠ IP addresses resolved from hostname</code> appears in the details view (<code>Enter</code>) when installed ≠ requested (host was resolved at approval time); it shows both, full reason, deny/expire history.
 Reason truncated at column width with ellipsis. Row tint shifts warn/red as time runs low.
 Sort: number key selects column, same key again flips asc/desc (or <code>&lt;</code>/<code>&gt;</code> cycle).</p>
 
@@ -61,7 +61,7 @@ Esc dismisses without deciding — the request keeps waiting (approver-timeout c
 <h3>Row detail — <code>Enter</code> on a live grant</h3>
 <div class="term">┌─ GRANT 5 · python ── approved 19:11:02 ── expires 19:26:02 (8:31) ───────────┐
 │ requested   host:api.acme.io                                                 │
-│ installed   203.0.113.7, 203.0.113.8        <span class="warn">≠ resolved at approval time</span>      │
+│ installed   203.0.113.7, 203.0.113.8   <span class="warn">⚠ IP addresses resolved from hostname</span> │
 │ ports/proto 443/tcp        ttl granted 15m (requested 15m)                   │
 │ reason      "pull cert chain for TLS inspection of acme cert"                │
 │ traffic     ↑ 1,204 B   ↓ 88,331 B   last packet 4s ago                     │

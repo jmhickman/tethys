@@ -179,7 +179,9 @@ impl Batch {
     }
 
     fn push_grant_set(&mut self, name: &str, proto_field: &str) {
-        let addr_field = if proto_field == "ip" { "daddr" } else { "daddr" };
+        // grants always match on destination address (egress model); the old
+        // ip/ip6 branch here was a no-op (both arms "daddr") and is gone.
+        let addr_field = "daddr";
         self.0.push(json!({"add":{"set":{
             "family":"inet","table":TABLE,"name":name,
             "type":{"typeof":{"concat":[
@@ -385,12 +387,6 @@ impl Batch {
         self.0.push(json!({"delete":{"set":{
             "family":"inet","table":TABLE,"name":name
         }}}));
-    }
-
-    /// Full table wipe (test/recovery only — real enforcement relies on the
-    /// static base table + element expiry; see design doc).
-    pub fn wipe_table(&mut self) {
-        self.0.push(json!({"delete":{"table":{"family":"inet","name":TABLE}}}));
     }
 
     pub fn is_empty(&self) -> bool {

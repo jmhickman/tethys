@@ -488,8 +488,8 @@ fn draw_detail_modal(f: &mut Frame, app: &App, id: i64) {
     lines.push(Line::from(""));
     f.render_widget(
         Paragraph::new(lines)
-            // long installed-address lists must not clip the "≠ resolved at
-            // approval time" annotation — let lines wrap instead
+            // long installed-address lists must not clip the "⚠ IP addresses
+            // resolved from hostname" annotation — let lines wrap instead
             .wrap(Wrap { trim: false })
             .block(
                 Block::default()
