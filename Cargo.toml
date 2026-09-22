@@ -5,7 +5,7 @@ members = ["crates/core", "crates/gatekeeper", "crates/gk-mcp", "crates/gk-tui"]
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
-license = "MIT OR Apache-2.0"
+license = "Apache-2.0"
 
 [workspace.dependencies]
 gk-core = { path = "crates/core" }
