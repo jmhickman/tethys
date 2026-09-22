@@ -57,7 +57,7 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
     // Base nftables objects (idempotent adds; startup fails if these cannot
     // be installed, so enforcement is never silently off).
     if !st.cfg.dry_run {
-        let mut b = Batch::new();
+        let mut b = Batch::with_table(&st.cfg.nft_table);
         b.ensure_base();
         st.nft
             .apply(&b)
@@ -154,6 +154,7 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
                 let poll = gk_core::nft::parse_poll(
                     &serde_json::json!({ "nftables": [] }),
                     &counters_json,
+                    &st.cfg.nft_table,
                 );
                 let now = now_secs();
                 let mut stats: Vec<GrantStat> = Vec::new();
@@ -534,7 +535,7 @@ async fn install_grant(
     let port = PortSpec { from: port_spec.from, to: port_spec.to };
     let dsts = target_elems(target).await?;
 
-    let mut b = Batch::new();
+    let mut b = Batch::with_table(&st.cfg.nft_table);
     for d in &dsts {
         b.add_grant(&GrantElem { dst: d.clone(), proto, port }, ttl, gid);
     }
@@ -557,7 +558,7 @@ async fn install_grant(
 /// scope chain. Unresolved agent_user => empty policed list => host-wide
 /// enforcement (fail-safe: stricter, never silently off).
 async fn install_scope(st: &Arc<State>) -> anyhow::Result<()> {
-    let mut b = Batch::new();
+    let mut b = Batch::with_table(&st.cfg.nft_table);
     match st.cfg.agent_uid {
         Some(uid) => {
             b.rebuild_scope(&[uid]);
@@ -577,7 +578,7 @@ async fn install_scope(st: &Arc<State>) -> anyhow::Result<()> {
 }
 
 async fn install_carves(st: &Arc<State>) -> anyhow::Result<()> {
-    let mut b = Batch::new();
+    let mut b = Batch::with_table(&st.cfg.nft_table);
     b.ensure_carve_sets();
     b.flush_carves();
     let mut n = 0usize;
@@ -654,7 +655,7 @@ async fn rebuild_acct(st: &Arc<State>) -> Result<(), String> {
         return Ok(());
     }
     let rows = st.ledger.list(GrantState::Approved).await;
-    let mut b = Batch::new();
+    let mut b = Batch::with_table(&st.cfg.nft_table);
     b.flush_chain(CHAIN_ACCT_OUT);
     b.flush_chain(CHAIN_ACCT_IN);
     for g in &rows {
@@ -700,7 +701,7 @@ async fn sweep_grant_objs(st: &Arc<State>, gid: i64) {
         names.push((true, dir.counter(gid)));
     }
     for (is_counter, name) in names {
-        let mut b = Batch::new();
+        let mut b = Batch::with_table(&st.cfg.nft_table);
         if is_counter {
             b.delete_counter(&name);
         } else {
@@ -730,7 +731,7 @@ fn grant_gid_of_comment(c: &Option<String>) -> Option<i64> {
 
 /// Reconcile ledger against kernel truth at startup (see policy block above).
 async fn reconcile_on_boot(st: &Arc<State>) {
-    let elements = match st.nft.poll_live().await {
+    let elements = match st.nft.poll_live(&st.cfg.nft_table).await {
         Ok(p) => p.elements,
         Err(e) => {
             // Can't read kernel truth → assume none of our grants exist
@@ -941,7 +942,7 @@ async fn handle_admin_cmd(req: &RpcRequest, st: &Arc<State>) -> RpcResponse {
             tracing::info!("stop.grants invoked");
             let mut n = 0usize;
             let rows = st.ledger.list(GrantState::Approved).await;
-            let mut b = Batch::new();
+            let mut b = Batch::with_table(&st.cfg.nft_table);
             for g in &rows {
                 let proto = g.proto;
                 let port = PortSpec { from: g.port_from, to: g.port_to };
@@ -965,7 +966,7 @@ async fn handle_admin_cmd(req: &RpcRequest, st: &Arc<State>) -> RpcResponse {
                         let proto = g.proto;
                         let port = PortSpec { from: g.port_from, to: g.port_to };
                         if let Ok(dsts) = row_elems(st, g).await {
-                            let mut gb = Batch::new();
+                            let mut gb = Batch::with_table(&st.cfg.nft_table);
                             for d in dsts {
                                 gb.delete_grant(&GrantElem { dst: d, proto, port });
                             }
@@ -1033,7 +1034,7 @@ async fn revoke(st: &Arc<State>, gid: i64) {
         if !st.cfg.dry_run {
             match row_elems(st, g).await {
                 Ok(dsts) => {
-                    let mut b = Batch::new();
+                    let mut b = Batch::with_table(&st.cfg.nft_table);
                     for d in dsts {
                         b.delete_grant(&GrantElem { dst: d, proto, port });
                     }

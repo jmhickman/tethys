@@ -164,26 +164,44 @@ impl GrantElem {
 }
 
 /// Builder for the JSON command array shipped to `nft --json -f -`.
-#[derive(Default, Clone, Debug)]
-pub struct Batch(Vec<Value>);
+/// Carries the nftables table it operates on: one per deployment (config
+/// `nft_table`, default "gatekeeper"), a private one per test harness.
+#[derive(Clone, Debug)]
+pub struct Batch {
+    pub table: String,
+    cmds: Vec<Value>,
+}
+
+impl Default for Batch {
+    fn default() -> Self {
+        Self { table: TABLE.into(), cmds: Vec::new() }
+    }
+}
 
 impl Batch {
+    /// Batch against the default table ([`TABLE`]).
     pub fn new() -> Self {
         Self::default()
     }
 
+    /// Batch against a named table (config `nft_table`; tests use a private
+    /// table so they never touch production kernel state).
+    pub fn with_table(table: &str) -> Self {
+        Self { table: table.into(), cmds: Vec::new() }
+    }
+
     /// Ensure our table exists (idempotent — nft treats add-existing as OK).
     pub fn ensure_table(&mut self) {
-        self.0
-            .push(json!({"add":{"table":{"family":"inet","name":TABLE}}}));
+        self.cmds
+            .push(json!({"add":{"table":{"family":"inet","name":&self.table}}}));
     }
 
     fn push_grant_set(&mut self, name: &str, proto_field: &str) {
         // grants always match on destination address (egress model); the old
         // ip/ip6 branch here was a no-op (both arms "daddr") and is gone.
         let addr_field = "daddr";
-        self.0.push(json!({"add":{"set":{
-            "family":"inet","table":TABLE,"name":name,
+        self.cmds.push(json!({"add":{"set":{
+            "family":"inet","table":&self.table,"name":name,
             "type":{"typeof":{"concat":[
                 {"payload":{"protocol":proto_field,"field":addr_field}},
                 {"meta":{"key":"l4proto"}},
@@ -203,15 +221,15 @@ impl Batch {
         // Accounting chains: declared by the static baseline too (reload is
         // idempotent), but ensured here so dev runs without the drop-in work.
         for (chain, hook) in [(CHAIN_ACCT_OUT, "output"), (CHAIN_ACCT_IN, "input")] {
-            self.0.push(json!({"add":{"chain":{
-                "family":"inet","table":TABLE,"name":chain,
+            self.cmds.push(json!({"add":{"chain":{
+                "family":"inet","table":&self.table,"name":chain,
                 "hook":hook,"type":"filter","prio":-10,"policy":"accept"
             }}}));
         }
         // Scope chain + exempt counter: plain (unhooked) adds are idempotent
         // on this nft build (verified), same reload-safety as above.
-        self.0.push(json!({"add":{"chain":{
-            "family":"inet","table":TABLE,"name":CHAIN_SCOPE
+        self.cmds.push(json!({"add":{"chain":{
+            "family":"inet","table":&self.table,"name":CHAIN_SCOPE
         }}}));
         self.add_counter(COUNTER_EXEMPT);
     }
@@ -222,8 +240,8 @@ impl Batch {
     /// falls through to the caller's verdict) — the pre-scope behavior, kept
     /// as the fail-safe when agent_user cannot be resolved.
     pub fn rebuild_scope(&mut self, policed_uids: &[u32]) {
-        self.0.push(json!({"flush":{"chain":{
-            "family":"inet","table":TABLE,"name":CHAIN_SCOPE
+        self.cmds.push(json!({"flush":{"chain":{
+            "family":"inet","table":&self.table,"name":CHAIN_SCOPE
         }}}));
         if policed_uids.is_empty() {
             // No exempt rule at all: every packet returns immediately and
@@ -232,8 +250,8 @@ impl Batch {
             return;
         }
         for uid in policed_uids {
-            self.0.push(json!({"add":{"rule":{
-                "family":"inet","table":TABLE,"chain":CHAIN_SCOPE,
+            self.cmds.push(json!({"add":{"rule":{
+                "family":"inet","table":&self.table,"chain":CHAIN_SCOPE,
                 "expr":[
                     {"match":{"op":"==",
                               "left":{"meta":{"key":"skuid"}},
@@ -242,8 +260,8 @@ impl Batch {
                 ]
             }}}));
         }
-        self.0.push(json!({"add":{"rule":{
-            "family":"inet","table":TABLE,"chain":CHAIN_SCOPE,
+        self.cmds.push(json!({"add":{"rule":{
+            "family":"inet","table":&self.table,"chain":CHAIN_SCOPE,
             "expr":[{"counter":COUNTER_EXEMPT},{"accept":null}]
         }}}));
     }
@@ -253,8 +271,8 @@ impl Batch {
     /// the live dump AND plain-concat deletes still match commented elements —
     /// so attribution costs the revoke path nothing).
     pub fn add_grant(&mut self, e: &GrantElem, ttl: Duration, gid: i64) {
-        self.0.push(json!({"add":{"element":{
-            "family":"inet","table":TABLE,"name":e.set_name(),
+        self.cmds.push(json!({"add":{"element":{
+            "family":"inet","table":&self.table,"name":e.set_name(),
             "elem":[{"elem":{"val": e.concat(), "expires": ttl.as_secs(),
                               "comment": format!("gk:g{gid}")}}]
         }}}));
@@ -269,8 +287,8 @@ impl Batch {
     /// Callers MUST flush_carves() first (delete-of-missing-element aborts
     /// an nft batch, so we cannot delete-before-add defensively here).
     pub fn add_carve(&mut self, e: &GrantElem) {
-        self.0.push(json!({"add":{"element":{
-            "family":"inet","table":TABLE,"name":e.carve_set_name(),
+        self.cmds.push(json!({"add":{"element":{
+            "family":"inet","table":&self.table,"name":e.carve_set_name(),
             "elem":[e.concat()]
         }}}));
     }
@@ -279,8 +297,8 @@ impl Batch {
     /// exactly equal to the declared list — removed entries actually go away).
     pub fn flush_carves(&mut self) {
         for name in [SET_CARVE_V4, SET_CARVE_V6] {
-            self.0.push(json!({"flush":{"set":{
-                "family":"inet","table":TABLE,"name":name
+            self.cmds.push(json!({"flush":{"set":{
+                "family":"inet","table":&self.table,"name":name
             }}}));
         }
     }
@@ -289,8 +307,8 @@ impl Batch {
     /// runs without the drop-in work, mirroring ensure_base for grants).
     pub fn ensure_carve_sets(&mut self) {
         for (name, proto_field) in [(SET_CARVE_V4, "ip"), (SET_CARVE_V6, "ip6")] {
-            self.0.push(json!({"add":{"set":{
-                "family":"inet","table":TABLE,"name":name,
+            self.cmds.push(json!({"add":{"set":{
+                "family":"inet","table":&self.table,"name":name,
                 "type":{"typeof":{"concat":[
                     {"payload":{"protocol":proto_field,"field":"daddr"}},
                     {"meta":{"key":"l4proto"}},
@@ -302,7 +320,7 @@ impl Batch {
     }
 
     fn delete_in(&mut self, e: &GrantElem, set: &str) {
-        self.0.push(json!({"delete": {"element": {
+        self.cmds.push(json!({"delete": {"element": {
             "family": "inet", "table": TABLE, "name": set,
             "elem": [e.concat()]
         }}}));
@@ -310,8 +328,8 @@ impl Batch {
 
     /// Delete a whole counter object (revoke cleanup).
     pub fn delete_counter(&mut self, name: &str) {
-        self.0.push(json!({"delete":{"counter":{
-            "family":"inet","table":TABLE,"name":name
+        self.cmds.push(json!({"delete":{"counter":{
+            "family":"inet","table":&self.table,"name":name
         }}}));
     }
 
@@ -321,14 +339,14 @@ impl Batch {
     // rebuilt wholesale (flush + re-add from ledger): idempotent, handle-free.
 
     pub fn flush_chain(&mut self, chain: &str) {
-        self.0.push(json!({"flush":{"chain":{
-            "family":"inet","table":TABLE,"name":chain
+        self.cmds.push(json!({"flush":{"chain":{
+            "family":"inet","table":&self.table,"name":chain
         }}}));
     }
 
     pub fn add_counter(&mut self, name: &str) {
-        self.0.push(json!({"add":{"counter":{
-            "family":"inet","table":TABLE,"name":name
+        self.cmds.push(json!({"add":{"counter":{
+            "family":"inet","table":&self.table,"name":name
         }}}));
     }
 
@@ -341,8 +359,8 @@ impl Batch {
             Dir::Out => ("daddr", "dport"),
             Dir::In => ("saddr", "sport"),
         };
-        self.0.push(json!({"add":{"set":{
-            "family":"inet","table":TABLE,"name":acct_set(gid, dir, v6),
+        self.cmds.push(json!({"add":{"set":{
+            "family":"inet","table":&self.table,"name":acct_set(gid, dir, v6),
             "type":{"typeof":{"concat":[
                 {"payload":{"protocol":af,"field":addr_field}},
                 {"meta":{"key":"l4proto"}},
@@ -355,8 +373,8 @@ impl Batch {
     /// One element tuple (dst, proto, port) into a per-grant match set.
     pub fn add_acct_elem(&mut self, gid: i64, dir: Dir, e: &GrantElem) {
         let name = acct_set(gid, dir, e.dst.is_v6());
-        self.0.push(json!({"add":{"element":{
-            "family":"inet","table":TABLE,"name":name,
+        self.cmds.push(json!({"add":{"element":{
+            "family":"inet","table":&self.table,"name":name,
             "elem":[e.concat()]
         }}}));
     }
@@ -369,8 +387,8 @@ impl Batch {
             Dir::In => (CHAIN_ACCT_IN, "saddr", "sport", if v6 { "ip6" } else { "ip" }),
         };
         let counter = dir.counter(gid);
-        self.0.push(json!({"add":{"rule":{
-            "family":"inet","table":TABLE,"chain":chain,
+        self.cmds.push(json!({"add":{"rule":{
+            "family":"inet","table":&self.table,"chain":chain,
             "comment":format!("gk:g{gid}:{}", dir.slug()),
             "expr":[
                 {"match":{"op":"==","left":{"concat":[
@@ -384,17 +402,17 @@ impl Batch {
     }
 
     pub fn delete_set(&mut self, name: &str) {
-        self.0.push(json!({"delete":{"set":{
-            "family":"inet","table":TABLE,"name":name
+        self.cmds.push(json!({"delete":{"set":{
+            "family":"inet","table":&self.table,"name":name
         }}}));
     }
 
     pub fn is_empty(&self) -> bool {
-        self.0.is_empty()
+        self.cmds.is_empty()
     }
 
     pub fn to_json(&self) -> String {
-        json!({"nftables": &self.0}).to_string()
+        json!({"nftables": &self.cmds}).to_string()
     }
 }
 
@@ -470,12 +488,12 @@ impl NftCli {
         Ok(serde_json::from_str(&out)?)
     }
 
-    pub async fn poll_live(&self) -> Result<PollState, NftError> {
+    pub async fn poll_live(&self, table: &str) -> Result<PollState, NftError> {
         let t = self
-            .list_json("table", Some(json!({"family": "inet", "name": TABLE})))
+            .list_json("table", Some(json!({"family": "inet", "name": table})))
             .await?;
         let c = self.list_json("counters", None).await?;
-        Ok(parse_poll(&t, &c))
+        Ok(parse_poll(&t, &c, table))
     }
 }
 
@@ -536,9 +554,9 @@ async fn run_nft_json(
 }
 
 /// Parse `nft --json list table` + `list counters` output into PollState.
-pub fn parse_poll(table: &Value, counters: &Value) -> PollState {
+pub fn parse_poll(doc: &Value, counters: &Value, tname: &str) -> PollState {
     let mut elements = Vec::new();
-    if let Some(arr) = table.get("nftables").and_then(|v| v.as_array()) {
+    if let Some(arr) = doc.get("nftables").and_then(|v| v.as_array()) {
         for item in arr {
             let Some(set) = item.get("set") else { continue };
             let name = set.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string();
@@ -624,7 +642,7 @@ pub fn parse_poll(table: &Value, counters: &Value) -> PollState {
         for item in arr {
             if let Some(c) = item.get("counter") {
                 let name = c.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                if name.is_empty() || c.get("table").and_then(|v| v.as_str()) != Some(TABLE) {
+                if name.is_empty() || c.get("table").and_then(|v| v.as_str()) != Some(tname) {
                     continue;
                 }
                 cmap.insert(
@@ -730,7 +748,7 @@ mod tests {
     fn scope_rules_encode_policed_return_then_exempt_accept() {
         let mut b = Batch::new();
         b.rebuild_scope(&[990]);
-        let cmds = &b.0;
+        let cmds = &b.cmds;
         assert_eq!(cmds[0]["flush"]["chain"]["name"], serde_json::json!(CHAIN_SCOPE));
         let policed = &cmds[1]["add"]["rule"];
         assert_eq!(policed["chain"], serde_json::json!(CHAIN_SCOPE));
@@ -750,8 +768,8 @@ mod tests {
         let mut b = Batch::new();
         b.rebuild_scope(&[]);
         // flush only — no accept rule, so all packets fall through to drop
-        assert_eq!(b.0.len(), 1);
-        assert!(b.0[0].get("flush").is_some());
+        assert_eq!(b.cmds.len(), 1);
+        assert!(b.cmds[0].get("flush").is_some());
     }
 
     #[test]
@@ -824,7 +842,7 @@ mod tests {
             {"counter":{"name":"g7_out","table":TABLE,"packets":3,"bytes":120}},
             {"counter":{"name":"other","table":"elsewhere","packets":9,"bytes":9}}
         ]});
-        let st = parse_poll(&table, &counters);
+        let st = parse_poll(&table, &counters, TABLE);
         assert_eq!(st.elements.len(), 2);
         assert!((st.elements[0].expires_secs - 41.9).abs() < 0.01);
         assert_eq!(st.elements[1].dst, "10.0.0.0/8");

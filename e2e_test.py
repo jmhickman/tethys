@@ -2,10 +2,9 @@
 """E2E for gatekeeper over real unix sockets + live nftables.
 
 Run from workspace root as a privileged account (nftables changes + nft
-required); the harness starts its own daemon on /tmp/gk-test/*. NOTE: the
-test enforces into the real `inet gatekeeper` table by design (kernel-truth
-proof) — on a box also running a production gatekeeper, run this in a
-network namespace instead, or expect to restart the service afterwards.
+required); the harness starts its own daemon on /tmp/gk-test/* and points
+it at a private nftables table (GK_E2E_TABLE, default gk_e2e) — production
+kernel state is untouched.
 
 Scenarios (all must pass):
   S1 request -> admin event -> approve -> verdict + kernel element w/ expiry
@@ -21,11 +20,14 @@ DIR = "/tmp/gk-test"
 ADMIN = f"{DIR}/admin.sock"
 MCP = f"{DIR}/mcp.sock"
 GK_BIN = os.environ.get("GK_BIN", os.path.join(ROOT, "target/debug/gatekeeper"))
+# private table: the kernel is shared with any production gatekeeper, so the
+# harness owns its own table end-to-end (daemon flag + every verification query)
+TABLE = os.environ.get("GK_E2E_TABLE", "gk_e2e")
 
 
 def nft_grants():
     return subprocess.run(
-        ["nft", "--json", "-f", "-"], input='{"nftables":[{"list":{"set":{"family":"inet","table":"gatekeeper","name":"grants_v4"}}}]}',
+        ["nft", "--json", "-f", "-"], input=json.dumps({"nftables":[{"list":{"set":{"family":"inet","table":TABLE,"name":"grants_v4"}}}]}),
         capture_output=True, text=True).stdout
 
 
@@ -40,8 +42,11 @@ def main():
     subprocess.run(["pkill", "-f", "--", f"{GK_BIN} .*{DIR}/"])
     time.sleep(0.3)
     os.system(f"rm -rf {DIR} && mkdir -p {DIR}")
+    # start from a clean private table (idempotent; needs nft privileges)
+    subprocess.run(["nft", "delete", "table", "inet", TABLE], capture_output=True)
     gk = subprocess.Popen(
         [GK_BIN, "--db", f"{DIR}/ledger.db", "--mcp-socket", MCP, "--admin-socket", ADMIN,
+         "--nft-table", TABLE,
          "--approver-timeout-secs", "8",
          # dev mode: no peer pin (real pin behavior covered by pin_e2e.sh)
          "--mcp-user", "gk-e2e-absent", "--allow-missing-users"],
@@ -231,7 +236,7 @@ def main():
     except Exception:
         d_pend = {}
     out = nft_grants()
-    table_exists = subprocess.run(["nft", "list", "table", "inet", "gatekeeper"],
+    table_exists = subprocess.run(["nft", "list", "table", "inet", TABLE],
                                   capture_output=True, text=True).returncode == 0
     if ("192.0.2.10" in out or "192.0.2.11" in out) or not table_exists or "error" in r:
         fails.append(f"S6 stop.grants: leftover={out[:80]} table={table_exists} resp={r}")
@@ -354,6 +359,9 @@ def main():
     print("S9 tui-contract:", "ok" if "S9" not in str(fails) else fails[-1])
 
     gk.send_signal(signal.SIGTERM)
+    gk.wait(timeout=5)
+    # leave no kernel residue: the private table is ours, drop it whole
+    subprocess.run(["nft", "delete", "table", "inet", TABLE], capture_output=True)
     if fails:
         print("FAILURES:", *fails, sep="\n  ")
         sys.exit(1)

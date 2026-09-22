@@ -19,6 +19,9 @@ pub struct Cli {
     pub admin_socket: Option<PathBuf>,
     #[arg(long)]
     pub db: Option<PathBuf>,
+    /// nftables table to own (default: gatekeeper)
+    #[arg(long)]
+    pub nft_table: Option<String>,
     #[arg(long)]
     pub max_ttl: Option<String>,
     #[arg(long)]
@@ -48,6 +51,8 @@ pub struct Config {
     pub mcp_socket: PathBuf,
     pub admin_socket: PathBuf,
     pub db: PathBuf,
+    /// nftables table this daemon owns (config `nft_table`)
+    pub nft_table: String,
     pub max_ttl: String,
     pub approver_timeout_secs: u64,
     pub agent_user: String,
@@ -92,6 +97,7 @@ async fn main() -> anyhow::Result<()> {
         mcp_socket: cli.mcp_socket.unwrap_or(file.mcp_socket),
         admin_socket: cli.admin_socket.unwrap_or(file.admin_socket),
         db: cli.db.unwrap_or(file.db),
+        nft_table: cli.nft_table.unwrap_or(file.nft_table),
         max_ttl: cli.max_ttl.unwrap_or(file.max_ttl),
         approver_timeout_secs: cli
             .approver_timeout_secs

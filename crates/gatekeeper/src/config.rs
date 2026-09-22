@@ -17,6 +17,9 @@ fn default_admin_socket() -> PathBuf {
 fn default_db() -> PathBuf {
     "/var/lib/gatekeeper/ledger.db".into()
 }
+fn default_nft_table() -> String {
+    gk_core::nft::TABLE.into()
+}
 fn default_max_ttl() -> String {
     "4h".into()
 }
@@ -44,6 +47,10 @@ pub struct FileConfig {
     pub admin_socket: PathBuf,
     #[serde(default = "default_db")]
     pub db: PathBuf,
+    /// nftables table the daemon owns. One per deployment; tests point this
+    /// at a private table so they never touch production kernel state.
+    #[serde(default = "default_nft_table")]
+    pub nft_table: String,
     #[serde(default = "default_max_ttl")]
     pub max_ttl: String,
     #[serde(default = "default_approver_timeout")]
@@ -69,6 +76,7 @@ impl Default for FileConfig {
             mcp_socket: default_mcp_socket(),
             admin_socket: default_admin_socket(),
             db: default_db(),
+            nft_table: default_nft_table(),
             max_ttl: default_max_ttl(),
             approver_timeout_secs: default_approver_timeout(),
             agent_user: default_agent_user(),

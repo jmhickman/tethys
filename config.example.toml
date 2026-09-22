@@ -11,6 +11,10 @@ admin_socket = "/run/gatekeeper/admin.sock" # approver clients (TUI); the
 # Persistence
 db = "/var/lib/gatekeeper/ledger.db"        # SQLite ledger (WAL mode)
 
+# nftables table the daemon owns. One deployment = one table; only change it
+# to run a second, independent instance (e.g. tests) on the same kernel.
+nft_table = "gatekeeper"
+
 # Policy
 max_ttl = "4h"              # ceiling on any grant, even human-approved
 approver_timeout_secs = 300 # a pending request is auto-denied after this much
