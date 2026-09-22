@@ -10,7 +10,7 @@ use std::path::PathBuf;
 
 use clap::Parser;
 use crossterm::{
-    event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers},
+    event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -35,7 +35,10 @@ async fn main() -> anyhow::Result<()> {
 
     enable_raw_mode()?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
+    // NOTE: deliberately NO mouse capture. The event loop is keyboard-only
+    // (only Event::Key is matched); capturing the mouse would just steal
+    // terminal-native text selection from the approver's console.
+    execute!(stdout, EnterAlternateScreen)?;
     let backend = CrosstermBackend::new(io::stdout());
     let mut terminal = Terminal::new(backend)?;
 
@@ -43,7 +46,7 @@ async fn main() -> anyhow::Result<()> {
 
     // always restore the screen, even on error paths
     disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen, DisableMouseCapture)?;
+    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
     terminal.show_cursor()?;
     res
 }
