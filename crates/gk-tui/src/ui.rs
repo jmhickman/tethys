@@ -468,7 +468,7 @@ fn draw_detail_modal(f: &mut Frame, app: &App, id: i64) {
             Span::styled(" installed   ", muted(true)),
             Span::raw(r.dst.join(", ")),
             if differs {
-                Span::styled("   ≠ resolved at approval time", Style::default().fg(Color::Yellow))
+                Span::styled("   ⚠️ IP addresses resolved from hostname", Style::default().fg(Color::Yellow))
             } else {
                 Span::raw("")
             },
@@ -747,7 +747,7 @@ mod tests {
             .map(|c| c.symbol())
             .collect();
         assert!(
-            body.contains("resolved at approval time"),
+            body.contains("IP addresses resolved from hostname"),
             "annotation must wrap, not clip:\n{body}"
         );
     }
