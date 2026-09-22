@@ -196,7 +196,7 @@ async fn stop_grants(req: &RpcRequest, st: &Arc<State>) -> RpcResponse {
             from: g.port_from,
             to: g.port_to,
         };
-        match row_elems(st, g).await {
+        match row_elems(g).await {
             Ok(dsts) => {
                 for d in dsts {
                     b.delete_grant(&GrantElem {
@@ -221,7 +221,7 @@ async fn stop_grants(req: &RpcRequest, st: &Arc<State>) -> RpcResponse {
                     from: g.port_from,
                     to: g.port_to,
                 };
-                if let Ok(dsts) = row_elems(st, g).await {
+                if let Ok(dsts) = row_elems(g).await {
                     let mut gb = Batch::with_table(&st.cfg.nft_table);
                     for d in dsts {
                         gb.delete_grant(&GrantElem {
@@ -290,7 +290,7 @@ async fn revoke(st: &Arc<State>, gid: i64) {
             to: g.port_to,
         };
         if !st.cfg.dry_run {
-            match row_elems(st, g).await {
+            match row_elems(g).await {
                 Ok(dsts) => {
                     let mut b = Batch::with_table(&st.cfg.nft_table);
                     for d in dsts {

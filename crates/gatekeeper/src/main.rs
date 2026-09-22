@@ -8,7 +8,7 @@ mod server;
 use std::path::PathBuf;
 
 use clap::Parser;
-pub use config::FileConfig;
+use config::FileConfig;
 
 #[derive(Parser, Debug)]
 #[command(name = "gatekeeper", about = "pentest scope enforcement daemon")]

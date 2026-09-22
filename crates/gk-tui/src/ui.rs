@@ -28,7 +28,7 @@ pub fn draw(f: &mut Frame, app: &App, st: ConnStatus) {
         .split(f.area());
 
     draw_header(f, app, st, rows[0]);
-    draw_table(f, app, rows[1]);
+    draw_table(f, app, st, rows[1]);
     draw_keybar(f, app, rows[2]);
 
     match &app.modal {
@@ -59,7 +59,7 @@ fn draw_header(f: &mut Frame, app: &App, st: ConnStatus, a: Rect) {
         Span::styled(" ●conn", Style::default().fg(Color::Green))
     };
     let net = primary_network();
-    let l1 = Line::from(vec![
+    let mut l1_parts = vec![
         Span::styled(
             format!(" gatekeeper @ {host} ─ {net} ─ "),
             Style::default().add_modifier(Modifier::BOLD),
@@ -82,7 +82,12 @@ fn draw_header(f: &mut Frame, app: &App, st: ConnStatus, a: Rect) {
             }),
         ),
         conn,
-    ]);
+    ];
+    // subscribe ack carries the daemon version; rendered so TUI/daemon skew is visible
+    if let Some(v) = &app.daemon_version {
+        l1_parts.push(Span::styled(format!(" gk v{v}"), muted(true)));
+    }
+    let l1 = Line::from(l1_parts);
 
     let sort_span = Span::styled(
         format!(
@@ -265,8 +270,9 @@ fn pack_line1(rows: &[RowCells], w: u16) -> ([u16; 8], usize) {
     (fw, kept)
 }
 
-fn draw_table(f: &mut Frame, app: &App, a: Rect) {
-    let dim = !app_conn_live(app);
+fn draw_table(f: &mut Frame, app: &App, st: ConnStatus, a: Rect) {
+    // stale table: rows are real but frozen while the socket is down
+    let dim = !st.up;
     let title = if dim {
         " LIVE (stale — no daemon) "
     } else {
@@ -388,10 +394,6 @@ fn gap_used(_inner: Rect, gap: u16, wrap: bool) -> u16 {
     } else {
         gap
     }
-}
-
-fn app_conn_live(_app: &App) -> bool {
-    true
 }
 
 fn draw_keybar(f: &mut Frame, app: &App, a: Rect) {
@@ -870,18 +872,6 @@ mod tests {
             body.contains("IP addresses resolved from hostname"),
             "annotation must wrap, not clip:\n{body}"
         );
-    }
-
-    #[test]
-    fn dump_frames() {
-        if std::env::var("GK_DUMP").is_ok() {
-            for (w, h) in [(120u16, 10u16), (90, 10), (64, 12), (40, 12)] {
-                println!("===== {w}x{h} =====");
-                for l in render(w, h) {
-                    println!("|{l}|");
-                }
-            }
-        }
     }
 
     #[test]

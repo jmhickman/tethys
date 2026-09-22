@@ -156,7 +156,7 @@ async fn resolve_host(h: &str) -> Result<Vec<ElemDst>, String> {
 }
 
 /// Dsts for a ledger row: persisted dst_json when present, not a fresh lookup.
-pub(crate) async fn row_elems(st: &Arc<State>, row: &GrantRow) -> Result<Vec<ElemDst>, String> {
+pub(crate) async fn row_elems(row: &GrantRow) -> Result<Vec<ElemDst>, String> {
     let stored: Vec<String> = serde_json::from_str(&row.dst_json).unwrap_or_default();
     if !stored.is_empty() {
         let out: Vec<ElemDst> = stored
@@ -168,7 +168,6 @@ pub(crate) async fn row_elems(st: &Arc<State>, row: &GrantRow) -> Result<Vec<Ele
         }
         return Ok(out);
     }
-    let _ = st;
     target_elems(&parse_canonical_target(&row.target)?).await
 }
 
@@ -182,7 +181,7 @@ pub(crate) async fn rebuild_acct(st: &Arc<State>) -> Result<(), String> {
     b.flush_chain(CHAIN_ACCT_OUT);
     b.flush_chain(CHAIN_ACCT_IN);
     for g in &rows {
-        let dsts = match row_elems(st, g).await {
+        let dsts = match row_elems(g).await {
             Ok(d) => d,
             Err(e) => {
                 tracing::warn!(id = g.id, %e, "acct: dst resolution failed (stats only)");

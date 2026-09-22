@@ -235,8 +235,6 @@ pub struct GrantStat {
     pub dst_port: PortSpec,
     pub proto: Proto,
     pub seconds_remaining: u64,
-    /// seconds since this grant's counters last moved (poll granularity).
-    pub secs_since_last_packet: Option<u64>,
     pub bytes_sent: u64,
     pub bytes_received: u64,
 }

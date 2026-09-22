@@ -168,9 +168,6 @@ fn spawn_expiry_reconciler(st: Arc<State>) {
 /// bytes. Runs only while an admin is connected.
 fn spawn_stats_poller(st: Arc<State>) {
     tokio::spawn(async move {
-        use std::time::Instant;
-        // gid -> (last total bytes, when counters last advanced)
-        let mut seen: HashMap<i64, (u64, Instant)> = HashMap::new();
         loop {
             tokio::time::sleep(Duration::from_secs(2)).await;
             if st.admins_online.load(Ordering::SeqCst) == 0 {
@@ -178,7 +175,6 @@ fn spawn_stats_poller(st: Arc<State>) {
             }
             let rows = st.ledger.list(GrantState::Approved).await;
             if rows.is_empty() {
-                seen.clear();
                 continue;
             }
             let counters_json = match st.nft.list_json("counters", None).await {
@@ -206,22 +202,6 @@ fn spawn_stats_poller(st: Arc<State>) {
                     .get(&counter_in(g.id))
                     .map(|c| c.1)
                     .unwrap_or(0);
-                let total = b_out + b_in;
-                let since_moved = match seen.get(&g.id) {
-                    None => {
-                        // first sighting: baseline only
-                        seen.insert(g.id, (total, Instant::now()));
-                        None
-                    }
-                    Some((prev_total, last)) => {
-                        if total != *prev_total {
-                            seen.insert(g.id, (total, Instant::now()));
-                            Some(0)
-                        } else {
-                            Some(last.elapsed().as_secs())
-                        }
-                    }
-                };
                 let stat = GrantStat {
                     grant_id: g.id.to_string(),
                     name: g.target.clone(),
@@ -235,13 +215,11 @@ fn spawn_stats_poller(st: Arc<State>) {
                         .expires_at
                         .map(|e| (e as u64).saturating_sub(now))
                         .unwrap_or(0),
-                    secs_since_last_packet: since_moved,
                     bytes_sent: b_out,
                     bytes_received: b_in,
                 };
                 stats.push(stat);
             }
-            seen.retain(|gid, _| rows.iter().any(|g| g.id == *gid));
             emit(&st, method::EV_TRAFFIC, EvTraffic { grants: stats });
         }
     });
