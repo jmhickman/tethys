@@ -19,6 +19,7 @@ nix = { version = "0.29", features = ["user"] }
 toml = "0.8"
 thiserror = "2"
 anyhow = "1"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 rmcp = { version = "3.4", features = ["transport-io"] }

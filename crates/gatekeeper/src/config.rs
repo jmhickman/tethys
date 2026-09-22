@@ -1,8 +1,5 @@
 //! File-based configuration (TOML) with CLI overrides.
-//!
 //! Precedence: built-in defaults < config file < CLI flags.
-//! Everything operator-tunable lives here; nothing about deployment identity
-//! (user names, paths) is hard-coded in behavior beyond these defaults.
 
 use std::path::PathBuf;
 
@@ -59,10 +56,7 @@ pub struct FileConfig {
     pub agent_user: String,
     #[serde(default = "default_mcp_user")]
     pub mcp_user: String,
-    /// Operator-declared always-allowed egress tuples (see parse_allow).
-    /// Installed into the baseline carve sets at startup; reloaded wholesale
-    /// on restart. No cloud providers are baked into gatekeeper — what counts
-    /// as "always allowed" is the deployment's decision, spelled here.
+    /// Operator allow list (see parse_allow). Installed into carve sets at startup.
     #[serde(default)]
     pub allow: Vec<String>,
     /// dry-run: never touch nftables (state machine + sockets only)

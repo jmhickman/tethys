@@ -164,9 +164,7 @@ fn fit(s: &str, w: usize) -> String {
     format!("{t}{}", " ".repeat(pad))
 }
 
-/// dst cell: first resolved address + count of the rest. The old
-/// `dst.join(",")` clipped mid-address at fixed width and the trailing
-/// comma read like part of the value ("104.26.10.242,104").
+/// First resolved address, plus a count of the rest.
 fn fmt_dst(row: &crate::app::LiveRow) -> String {
     let Some(first) = row.dst.first() else {
         return "…".into(); // not polled yet
@@ -184,7 +182,6 @@ struct RowCells {
 }
 
 fn cells_for(r: &crate::app::LiveRow) -> RowCells {
-    // urgency tint as the countdown runs out (kernel truth)
     let warn = match r.left {
         Some(s) if s <= 60 => Style::default().fg(Color::Yellow),
         _ => Style::default(),
@@ -340,7 +337,6 @@ fn draw_table(f: &mut Frame, app: &App, a: Rect) {
     }
     f.render_widget(Paragraph::new(lines), body);
 
-    // honesty about clipping: rows hidden by vertical scroll
     let hidden = rows.len().saturating_sub(start + visible);
     if hidden > 0 && body_h > 1 {
         let note = format!(" {} more ", hidden);
@@ -358,7 +354,7 @@ fn gap_used(_inner: Rect, gap: u16, wrap: bool) -> u16 {
 }
 
 fn app_conn_live(_app: &App) -> bool {
-    true // placeholder; staleness handled via ConnStatus at draw entry
+    true
 }
 
 fn draw_keybar(f: &mut Frame, app: &App, a: Rect) {
@@ -611,8 +607,7 @@ fn hostname() -> String {
         .unwrap_or_else(|_| "?".into())
 }
 
-/// Best-effort "primary network": default-route interface + its subnet from
-/// /proc/net/route (destination/mask, hex LE). Never claims more than it read.
+/// Default-route interface and its subnet from /proc/net/route (hex LE).
 fn primary_network() -> String {
     // /proc/net/route columns: Iface Dst GW Flags RefCnt Use Metric Mask ...
     // The default route (Dst=0) carries mask 0 — useless. The interface's

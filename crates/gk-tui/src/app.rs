@@ -1,5 +1,4 @@
-//! Application state + reducer (events in, frame-worthy state out). Kept
-//! render-free; ui.rs only ever reads this.
+//! Application state. ui.rs reads this; it does not render.
 
 use std::collections::BTreeMap;
 
@@ -223,8 +222,6 @@ impl App {
                             },
                         );
                     }
-                    // auto-open immediately (design decision) unless a modal
-                    // the user is mid-edit in owns the screen
                     if matches!(self.modal, Modal::None | Modal::Detail(_)) {
                         self.modal = Modal::Pending(0);
                         self.deny_note = None;
@@ -236,7 +233,6 @@ impl App {
                 if let Some(gid) = p["grant_id"].as_str().and_then(|s| s.parse::<i64>().ok()) {
                     self.pending.remove(&gid);
                     self.live.remove(&gid);
-                    // authoritative refresh of both tables (requests arrive at human speed)
                     out.push(cmd("c-live", method::LIST_GRANTS, None));
                     out.push(cmd("c-pend", method::LIST_PENDING, None));
                     if self.modal == Modal::Pending(0) && self.pending.is_empty() {
@@ -340,8 +336,6 @@ impl App {
                 if matches!(self.modal, Modal::Pending(_)) && self.pending.is_empty() {
                     self.modal = Modal::None;
                 }
-                // TUI cold-started onto a blocked model: the snapshot IS the
-                // queue — surface it like a fresh arrival would.
                 if matches!(self.modal, Modal::None) && !self.pending.is_empty() {
                     self.modal = Modal::Pending(0);
                 }
@@ -466,18 +460,9 @@ fn fmt_ports_flat(from: &Value, to: &Value, proto: &Value) -> String {
     }
 }
 
-pub fn fmt_ttl_secs(s: u64) -> String {
-    if s == 0 {
-        return "-".into();
-    }
-    if s % 3600 == 0 {
-        format!("{}h", s / 3600)
-    } else if s % 60 == 0 {
-        format!("{}m", s / 60)
-    } else {
-        format!("{s}s")
-    }
-}
+// one canonical spelling, owned by gk-core (the daemon renders ttl text from
+// the same function — no drift between what is approved and what is shown)
+pub use gk_core::types::fmt_ttl_secs;
 
 pub fn fmt_countdown(s: Option<u64>) -> String {
     match s {

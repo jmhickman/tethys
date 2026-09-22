@@ -42,12 +42,19 @@ pub struct RpcError {
 }
 
 impl RpcResponse {
+    /// Success reply. A serialization failure degrades to a JSON-RPC internal
+    /// error (-32603) rather than panicking — the daemon outlives any one
+    /// unserializable result.
     pub fn ok(id: impl Into<String>, result: impl Serialize) -> Self {
-        Self {
-            jsonrpc: JsonRpcVersion::V2_0,
-            id: id.into(),
-            result: Some(serde_json::to_value(result).expect("serializable")),
-            error: None,
+        let id = id.into();
+        match serde_json::to_value(result) {
+            Ok(v) => Self {
+                jsonrpc: JsonRpcVersion::V2_0,
+                id,
+                result: Some(v),
+                error: None,
+            },
+            Err(e) => Self::err(id, -32603, format!("serialization failed: {e}")),
         }
     }
     pub fn err(id: impl Into<String>, code: i32, message: impl Into<String>) -> Self {
@@ -118,8 +125,8 @@ pub enum DenyReason {
     HumanDenied,
     ApproverOffline,
     ApproverTimeout,
-    /// idempotent replay whose original grant is gone (expired/revoked) —
-    /// the caller must re-request under a NEW id (R: re-delivery never re-popups).
+    /// Replay of a request whose original grant is gone (expired/revoked).
+    /// Caller must re-request under a new id.
     GrantExpired,
     /// The nftables install failed; the kernel keeps its prior state.
     InstallFailed,
@@ -128,14 +135,11 @@ pub enum DenyReason {
     AlreadyPending,
 }
 
-/// Result of `access.request`, modeled as a sum type: "approved with no
-/// effective grant" or "denied with no reason" cannot be constructed, and each
-/// variant carries exactly the data that outcome has. The wire shape stays
-/// internally tagged on `decision` so consumers keep matching `.decision`.
+/// Result of `access.request`. Internally tagged on `decision`.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 #[serde(tag = "decision", rename_all = "snake_case")]
 pub enum Verdict {
-    /// New grant installed in the kernel by this very request.
+    /// New grant installed by this request.
     Approved {
         grant_id: String,
         effective: EffectiveGrant,
@@ -143,8 +147,8 @@ pub enum Verdict {
         /// RFC3339 UTC expiry.
         expires_at: String,
     },
-    /// Covered by an existing request/grant — NO human round-trip happened.
-    /// `expires_at` absent only while the original is still pending.
+    /// Covered by an existing request/grant; no human round-trip.
+    /// `expires_at` is absent only while the original is still pending.
     AlreadyGranted {
         grant_id: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -194,9 +198,7 @@ mod tests {
 
     #[test]
     fn verdict_serde_shape() {
-        // internally tagged on `decision`: consumers keep matching .decision,
-        // but malformed combinations (denied + reason-less, approved - effective)
-        // combinations like this are now impossible to construct.
+        // internally tagged on `decision`
         let d = Verdict::Denied {
             reason_code: DenyReason::ApproverOffline,
             grant_id: None,
@@ -219,11 +221,9 @@ mod tests {
         };
         let s = serde_json::to_string(&a).unwrap();
         assert!(s.contains("\"decision\":\"approved\""));
-        // the round-trip must be exact on both ends
         assert_eq!(serde_json::from_str::<Verdict>(&s).unwrap(), a);
 
-        // an "approved" blob WITHOUT effective must fail to parse — the old
-        // flat struct silently accepted it.
+        // approved without effective must fail to parse
         let bad = r#"{"decision":"approved","grant_id":"7"}"#;
         assert!(serde_json::from_str::<Verdict>(bad).is_err());
     }

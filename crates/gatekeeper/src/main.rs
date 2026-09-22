@@ -45,7 +45,7 @@ pub struct Cli {
     pub dry_run: bool,
 }
 
-/// merged view: file + CLI overrides, with resolved uids where needed.
+/// File + CLI overrides, with resolved uids.
 #[derive(Debug, Clone)]
 pub struct Config {
     pub mcp_socket: PathBuf,
@@ -64,8 +64,7 @@ pub struct Config {
     /// group that may connect to mcp.sock (mcp_user's primary gid);
     /// None => owner-only socket (dev)
     pub mcp_sock_gid: Option<u32>,
-    /// operator allow list, parsed at startup (a bad entry aborts boot —
-    /// silently ignoring it would defeat the point of declaring it)
+    /// Operator allow list; a bad entry aborts boot.
     pub allow: Vec<(gk_core::types::Target, gk_core::types::PortSpec, gk_core::types::Proto)>,
     pub dry_run: bool,
 }
@@ -149,7 +148,8 @@ async fn main() -> anyhow::Result<()> {
     );
 
     if let Some(parent) = cfg.mcp_socket.parent() {
-        std::fs::create_dir_all(parent).ok();
+        std::fs::create_dir_all(parent)
+            .map_err(|e| anyhow::anyhow!("create {}: {e}", parent.display()))?;
     }
     server::run(cfg).await
 }

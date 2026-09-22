@@ -16,8 +16,12 @@ pub enum SpecError {
     BadIp(#[from] std::net::AddrParseError),
     #[error("invalid net: {0}")]
     BadNet(#[from] ipnet::PrefixLenError),
+    #[error("invalid cidr: {0}")]
+    BadNetStr(String),
     #[error("port spec: from ({from}) > to ({to})")]
     BadPortRange { from: u16, to: u16 },
+    #[error("invalid proto {0:?}: expected tcp or udp")]
+    BadProto(String),
     #[error("invalid ttl {0:?}: expected e.g. 30s / 15m / 2h")]
     BadTtl(String),
 }
@@ -42,6 +46,19 @@ impl Proto {
 impl fmt::Display for Proto {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(self.nft_key())
+    }
+}
+
+impl std::str::FromStr for Proto {
+    type Err = SpecError;
+    /// Inverse of [`Proto::nft_key`] — the single spelling shared by the wire,
+    /// the nft JSON, and the ledger column.
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "tcp" => Ok(Proto::Tcp),
+            "udp" => Ok(Proto::Udp),
+            other => Err(SpecError::BadProto(other.to_string())),
+        }
     }
 }
 
@@ -112,15 +129,23 @@ pub fn parse_ttl(s: &str) -> Result<Duration, SpecError> {
     Ok(Duration::from_secs(n * mult))
 }
 
-pub fn fmt_ttl(d: Duration) -> String {
-    let s = d.as_secs();
-    if s % 3600 == 0 {
+/// Canonical seconds spelling ("1h" / "15m" / "45s"); "-" for zero (the TUI's
+/// "not yet granted" column). fmt_ttl is the Duration-shaped view of this.
+pub fn fmt_ttl_secs(s: u64) -> String {
+    if s == 0 {
+        return "-".into();
+    }
+    if s.is_multiple_of(3600) {
         format!("{}h", s / 3600)
-    } else if s % 60 == 0 {
+    } else if s.is_multiple_of(60) {
         format!("{}m", s / 60)
     } else {
         format!("{s}s")
     }
+}
+
+pub fn fmt_ttl(d: Duration) -> String {
+    fmt_ttl_secs(d.as_secs())
 }
 
 #[cfg(test)]

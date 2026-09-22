@@ -53,8 +53,6 @@ pub struct ScopeMcp {
 #[tool_router]
 impl ScopeMcp {
     fn new(sock: PathBuf) -> Self {
-        // #[tool_handler] dispatches via the generated Self::tool_router();
-        // no stored router field needed.
         Self { sock }
     }
 
@@ -78,8 +76,6 @@ impl ScopeMcp {
             "tool": req.tool,
             "ttl_requested": req.ttl,
         });
-        // validate against the canonical params type before shipping (fail fast with
-        // a model-readable message rather than a gatekeeper error)
         let _typed: AccessRequestParams = serde_json::from_value(params.clone()).map_err(|e| {
             ErrorData::invalid_params(format!("bad request: {e}"), None)
         })?;
@@ -111,13 +107,12 @@ impl ScopeMcp {
 impl ScopeMcp {
     async fn ask(&self, rpc: &RpcRequest) -> Result<String, ErrorData> {
         tracing::debug!(id = %rpc.id, "connecting gatekeeper");
-        // One connection per request keeps the gatekeeper's dedup/idempotency model
-        // trivial and survives approver latency (gatekeeper holds the socket open
-        // on its side; we hold here).
         let mut stream = UnixStream::connect(&self.sock)
             .await
             .map_err(|e| ErrorData::internal_error(format!("gatekeeper unavailable: {e}"), None))?;
-        let payload = format!("{}\n", serde_json::to_string(rpc).unwrap());
+        let payload = serde_json::to_string(rpc)
+            .map(|s| format!("{s}\n"))
+            .map_err(|e| ErrorData::internal_error(format!("serialize request: {e}"), None))?;
         stream
             .write_all(payload.as_bytes())
             .await
@@ -139,10 +134,7 @@ impl ScopeMcp {
     }
 }
 
-/// Human/LLM-readable one-liner, e.g.:
-/// "APPROVED: 203.0.113.7 tcp 443 granted for 15m (expires 2026-09-15T02:41:00Z)"
-/// Decode into the protocol sum type: a malformed or
-/// unknown verdict is an error, never a silent default branch.
+/// One-liner, e.g. "APPROVED: 203.0.113.7 tcp 443 granted for 15m (expires …)".
 fn render_verdict(r: &serde_json::Value) -> String {
     let v: gk_core::protocol::Verdict = match serde_json::from_value(r.clone()) {
         Ok(v) => v,
@@ -193,7 +185,7 @@ fn next_id() -> String {
     format!("{nanos:x}{:x}", C.fetch_add(1, Ordering::Relaxed))
 }
 
-#[tool_handler] // wires ToolRouter dispatch (list_tools/call_tool) into the handler
+#[tool_handler]
 impl ServerHandler for ScopeMcp {
     fn get_info(&self) -> ServerConfig {
         ServerConfig::new(ServerCapabilities::builder().enable_tools().build()).with_instructions(
@@ -237,14 +229,11 @@ mod tests {
         let dn = serde_json::json!({"decision":"denied","reason_code":"human_denied","note":"out of scope"});
         assert!(render_verdict(&dn).contains("out of scope"));
 
-        // already_granted renders as approved-active, with grant id + expiry
         let ag = serde_json::json!({"decision":"already_granted","grant_id":"9",
             "expires_at":"2026-09-15T02:41:00Z"});
         let s = render_verdict(&ag);
         assert!(s.contains("already active") && s.contains("grant 9"), "{s}");
 
-        // malformed verdict (approved without effective) must NOT render as
-        // approved — the sum type rejects it, and we fail closed in the text.
         let bad = serde_json::json!({"decision":"approved","grant_id":"7"});
         assert!(render_verdict(&bad).starts_with("DENIED (malformed_verdict)"));
     }

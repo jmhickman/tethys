@@ -1,11 +1,9 @@
-//! Gatekeeper runtime: two unix sockets, pending-request state machine,
-//! kernel-TTL-backed grants, periodic expiry reconciliation.
+//! Gatekeeper runtime: unix sockets, pending-request state machine,
+//! kernel-TTL grants, periodic expiry reconciliation.
 //!
-//! Threat model: `mcp.sock` accepts requests but can never approve;
-//! approvals only arrive on `admin.sock` (0600, so only the account that
-//! owns it). When no approver
-//! is connected a request is denied immediately; if the approver stays silent
-//! past the timeout it is auto-denied.
+//! `mcp.sock` accepts requests but cannot approve; approvals arrive on
+//! `admin.sock` (0600). No approver connected → deny immediately; silent
+//! past timeout → auto-deny.
 
 use std::collections::HashMap;
 use std::os::unix::fs::PermissionsExt;
@@ -19,7 +17,7 @@ use tokio::sync::{broadcast, oneshot, Mutex};
 
 use gk_core::nft::{
     acct_set, counter_in, counter_out, Batch, CHAIN_ACCT_IN, CHAIN_ACCT_OUT, Dir, ElemDst,
-    GrantElem, NftBackend, NftCli,
+    GrantElem, NftCli,
 };
 use gk_core::protocol::*;
 use gk_core::types::{fmt_ttl, parse_ttl, PortSpec, Proto, SpecError, Target};
@@ -54,8 +52,7 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
         admins_online: AtomicUsize::new(0),
     });
 
-    // Base nftables objects (idempotent adds; startup fails if these cannot
-    // be installed, so enforcement is never silently off).
+    // Idempotent; fail startup if install fails so enforcement is never off.
     if !st.cfg.dry_run {
         let mut b = Batch::with_table(&st.cfg.nft_table);
         b.ensure_base();
@@ -68,7 +65,7 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
         install_scope(&st).await?;
         reconcile_on_boot(&st).await;
     } else {
-        tracing::warn!("--dry-run: nft objects NOT installed (dev mode)");
+        tracing::warn!("--dry-run: nft objects not installed (dev mode)");
     }
 
     for path in [&st.cfg.mcp_socket, &st.cfg.admin_socket] {
@@ -92,9 +89,7 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
         tokio::spawn(async move {
             loop {
                 tokio::time::sleep(Duration::from_secs(2)).await;
-                // NOTE: must be list(Approved), NOT active() — active() filters
-                // `expires_at > now` in SQL, which would hide exactly the expired
-                // rows this loop exists to flip (regression caught by enforcement E2E).
+                // list(Approved), not active(): active() hides expired rows this loop flips.
                 let approved = st.ledger.list(GrantState::Approved).await;
                 let now = now_secs() as f64;
                 let expired: Vec<i64> = approved
@@ -103,13 +98,9 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
                     .map(|g| g.id)
                     .collect();
                 if !expired.is_empty() {
-                    // same transition table as everything else (no second write path)
                     for id in &expired {
                         st.ledger.decide(*id, Decide::ExpireByKernel).await;
-                        let _ = st.events.send(json_line(&notification(
-                            method::EV_EXPIRED,
-                            serde_json::json!({"grant_id": id.to_string()}),
-                        )));
+                        emit(&st, method::EV_EXPIRED, serde_json::json!({"grant_id": id.to_string()}));
                     }
                     // kernel already reaped the elements (TTL); now mirror the
                     // ledger into accounting chains and drop dead objects.
@@ -124,10 +115,8 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
         });
     }
 
-    // Traffic stats poller (~2 s): the ledger supplies identity and
-    // countdown; named counter objects supply byte totals. Polling avoids
-    // per-packet logging overhead. It runs only while an admin is connected
-    // (the sole consumer), which also keeps idle nftables churn at zero.
+    // Stats poller (~2s). Ledger for identity/countdown; named counters for
+    // bytes. Runs only while an admin is connected.
     if !st.cfg.dry_run {
         let st = st.clone();
         tokio::spawn(async move {
@@ -164,7 +153,7 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
                     let total = b_out + b_in;
                     let since_moved = match seen.get(&g.id) {
                         None => {
-                            // first sighting: baseline only, don't claim motion
+                            // first sighting: baseline only
                             seen.insert(g.id, (total, Instant::now()));
                             None
                         }
@@ -180,8 +169,6 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
                     let stat = GrantStat {
                         grant_id: g.id.to_string(),
                         name: g.target.clone(),
-                        // installed dsts as a real array (parse the ledger's
-                        // JSON column once here, not in every consumer)
                         dst: serde_json::from_str(&g.dst_json).unwrap_or_default(),
                         dst_port: PortSpec { from: g.port_from, to: g.port_to },
                         proto: g.proto,
@@ -196,10 +183,7 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
                     stats.push(stat);
                 }
                 seen.retain(|gid, _| rows.iter().any(|g| g.id == *gid));
-                let _ = st.events.send(json_line(&notification(
-                    method::EV_TRAFFIC,
-                    serde_json::json!({ "grants": stats }),
-                )));
+                emit(&st, method::EV_TRAFFIC, serde_json::json!({ "grants": stats }));
             }
         });
     }
@@ -242,18 +226,21 @@ fn peer_cred(s: &UnixStream) -> Option<tokio::net::unix::UCred> {
 // ------------------------------------------------------------------ MCP side
 
 async fn handle_mcp(stream: UnixStream, st: Arc<State>) {
-    if let (Some(want), Some(cred)) = (st.cfg.mcp_peer_uid, peer_cred(&stream)) {
-        if cred.uid() != want {
-            tracing::warn!(uid = cred.uid(), "mcp peer rejected by SO_PEERCRED");
-            return;
+    // Fail CLOSED: with a pinned uid configured, an unreadable peer credential
+    // is grounds for rejection — never an anonymous pass.
+    if let Some(want) = st.cfg.mcp_peer_uid {
+        match peer_cred(&stream) {
+            Some(c) if c.uid() == want => {}
+            other => {
+                tracing::warn!(uid = ?other.map(|c| c.uid()), "mcp peer rejected by SO_PEERCRED");
+                return;
+            }
         }
     }
     let (r, mut w) = stream.into_split();
-    // responses from spawned request tasks arrive here and are the ONLY writer.
     let (resp_tx, mut resp_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
     let writer = tokio::spawn(async move {
         while let Some(line) = resp_rx.recv().await {
-            // NDJSON framing: readers use read_line; ALWAYS terminate with \n.
             if let Err(e) = w.write_all(format!("{line}\n").as_bytes()).await {
                 tracing::warn!(%e, "mcp writer died");
                 break;
@@ -261,8 +248,7 @@ async fn handle_mcp(stream: UnixStream, st: Arc<State>) {
         }
         tracing::debug!("mcp writer task exiting (channel closed)");
     });
-    // In-flight request counter: the connection (and writer!) must outlive every
-    // dispatched request, even after client EOF — approval can arrive minutes later.
+    // Connection must outlive in-flight requests; approval can arrive minutes later.
     let inflight = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let mut lines = BufReader::new(r).lines();
     while let Ok(Some(line)) = lines.next_line().await {
@@ -357,7 +343,7 @@ fn dispatch_access(
                     note: None,
                 },
             );
-            respond(serde_json::to_string(&resp).unwrap());
+            respond(resp_line(&resp));
             return;
         }
 
@@ -367,7 +353,7 @@ fn dispatch_access(
                 &id,
                 Verdict::Denied { reason_code: DenyReason::ApproverOffline, grant_id: None, note: None },
             );
-            respond(serde_json::to_string(&resp).unwrap());
+            respond(resp_line(&resp));
             return;
         }
 
@@ -390,11 +376,7 @@ fn dispatch_access(
         {
             Some(gid) => gid,
             None => {
-                // UNIQUE idem_key violation = REDELIVERY of a request we've seen.
-                // Spec: re-delivery must not re-popup — return the ORIGINAL row's
-                // verdict instead of an error. (Approver channels are per-process:
-                // a pending original from a previous boot was already denied by
-                // reconcile_on_boot, so 'pending' here means same-boot in flight.)
+                // UNIQUE idem_key = redelivery. Do not re-popup; return the original row.
                 match st.ledger.find_by_idem(&id).await {
                     Some(orig) => respond(replay_verdict(&orig)),
                     None => respond(rpc_err_str(&id, -32001, "duplicate request id")),
@@ -407,7 +389,8 @@ fn dispatch_access(
         let (tx, rx) = oneshot::channel::<HumanDecision>();
         st.pending.lock().await.insert(gid, tx);
         let popup_target = target.canonical();
-        let _ = st.events.send(json_line(&notification(
+        emit(
+            &st,
             method::EV_REQUEST_NEW,
             serde_json::json!({
                 "grant_id": gid.to_string(),
@@ -416,11 +399,11 @@ fn dispatch_access(
                 "proto": params.proto,
                 "reason": reason,
                 "tool": tool,
+                // created_at lets a reconnecting TUI render honest "waiting m:ss"
                 "ttl_requested": params.ttl_requested,
-                // lets a reconnecting TUI render honest "waiting m:ss"
                 "created_at": now_secs(),
             }),
-        )));
+        );
 
         let verdict = match tokio::time::timeout(
             Duration::from_secs(st.cfg.approver_timeout_secs),
@@ -436,9 +419,7 @@ fn dispatch_access(
                         if !st.ledger.decide(gid, Decide::Approve { expires_at: exp }).await {
                             tracing::error!(gid, "ledger failed to flip pending->approved");
                         }
-                        // Persist this exact DNS resolution: later revoke/expiry
-                        // cleanup must delete these same elements, since DNS
-                        // may have changed by then.
+                        // Persist this DNS resolution so later delete uses the same IPs.
                         let dst_json = serde_json::to_string(
                             &dsts.iter().map(|d| d.canonical()).collect::<Vec<_>>(),
                         )
@@ -446,20 +427,12 @@ fn dispatch_access(
                         if !st.ledger.set_dst(gid, dst_json).await {
                             tracing::warn!(gid, "set_dst: row not approved when persisting resolution");
                         }
-                        // Accounting is best-effort: stats never gate enforcement.
+                        // Accounting is best-effort; stats never gate enforcement.
                         if let Err(e) = rebuild_acct(&st).await {
                             tracing::warn!(gid, %e, "acct rebuild failed (stats degraded only)");
                         }
                         st.ledger.audit("approved", gid, format!("{eff:?}"));
-                        let _ = st.events.send(json_line(&notification(
-                            method::EV_DECIDED,
-                            serde_json::json!({
-                                "grant_id": gid.to_string(),
-                                "state": "approved",
-                                "ttl_granted": fmt_ttl(granted),
-                                "expires_at": fmt_unix(exp),
-                            }),
-                        )));
+                        emit(&st, method::EV_DECIDED, serde_json::json!({ "grant_id": gid.to_string(), "state": "approved", "ttl_granted": fmt_ttl(granted), "expires_at": fmt_unix(exp), }));
                         Verdict::Approved {
                             grant_id: gid.to_string(),
                             effective: eff,
@@ -468,8 +441,7 @@ fn dispatch_access(
                         }
                     }
                     Err(e) => {
-                        // nft apply failed: the kernel keeps its prior state and
-                        // the request is denied rather than half-installed.
+                        // nft apply failed: kernel keeps prior state; deny rather than half-install.
                         tracing::error!(gid, %e, "nft install failed — denying");
                         st.ledger
                             .decide(gid, Decide::Deny {
@@ -501,29 +473,16 @@ fn dispatch_access(
         };
 
         let resp = RpcResponse::ok(&id, &verdict);
-        // Every verdict with a row gets an event too: the TUI clears its
-        // pending modal / updates history live instead of polling. (Offline
-        // denies have no row and no connected admin — nothing to tell.)
+        // Notify TUI for every verdict that has a row. Offline denies have neither.
         if let Verdict::Denied { grant_id: Some(gid), reason_code, note } = &verdict {
-            let _ = st.events.send(json_line(&notification(
-                method::EV_DECIDED,
-                serde_json::json!({
-                    "grant_id": gid,
-                    "state": "denied",
-                    "reason_code": reason_code,
-                    "note": note,
-                }),
-            )));
+            emit(&st, method::EV_DECIDED, serde_json::json!({ "grant_id": gid, "state": "denied", "reason_code": reason_code, "note": note, }));
         }
-        respond(serde_json::to_string(&resp).unwrap());
+        respond(resp_line(&resp));
     });
 }
 
-/// Install kernel elements for a grant. Host targets are resolved here: the
-/// human approves the hostname and its resolved IPs together; the kernel
-/// receives IPs only.
-/// Returns (effective view, all installed dsts) — dsts get persisted to
-/// dst_json so later deletes use THIS resolution, not a fresh DNS lookup.
+/// Install kernel elements. Hosts are resolved here; the kernel gets IPs only.
+/// Returns (effective view, installed dsts) for dst_json.
 async fn install_grant(
     st: &Arc<State>,
     target: &Target,
@@ -549,14 +508,7 @@ async fn install_grant(
     Ok((EffectiveGrant { dst: eff_dst, dst_port: port, proto }, dsts))
 }
 
-/// Install the operator allow list into the baseline carve sets: wipe both
-/// sets, resolve hostnames (fail startup if an entry cannot resolve), add
-/// elements. Wholesale reinstall means removed config entries actually go
-/// away on restart; kernel state always equals declared config.
-/// UID-scope the egress verdict: only agent_user's uid is policed by
-/// the baseline drop; everyone else on the host is exempt-accepted in the
-/// scope chain. Unresolved agent_user => empty policed list => host-wide
-/// enforcement (fail-safe: stricter, never silently off).
+/// Scope egress to `agent_user`. Unresolved uid => empty list => host-wide.
 async fn install_scope(st: &Arc<State>) -> anyhow::Result<()> {
     let mut b = Batch::with_table(&st.cfg.nft_table);
     match st.cfg.agent_uid {
@@ -577,6 +529,7 @@ async fn install_scope(st: &Arc<State>) -> anyhow::Result<()> {
         .map_err(|e| anyhow::anyhow!("scope install failed: {e}"))
 }
 
+/// Flush carve sets, resolve hostnames, install the operator allow list.
 async fn install_carves(st: &Arc<State>) -> anyhow::Result<()> {
     let mut b = Batch::with_table(&st.cfg.nft_table);
     b.ensure_carve_sets();
@@ -631,10 +584,7 @@ async fn resolve_host(h: &str) -> Result<Vec<ElemDst>, String> {
     Ok(out)
 }
 
-/// Dsts for a ledger row: the persisted resolution (dst_json) when present —
-/// never a fresh DNS lookup at delete time, since the approved elements were
-/// installed for specific IPs and re-resolving could delete or keep the wrong
-/// ones. Rows with empty dst_json fall back to resolving the target.
+/// Dsts for a ledger row: persisted dst_json when present, not a fresh lookup.
 async fn row_elems(st: &Arc<State>, row: &GrantRow) -> Result<Vec<ElemDst>, String> {
     let stored: Vec<String> = serde_json::from_str(&row.dst_json).unwrap_or_default();
     if !stored.is_empty() {
@@ -648,8 +598,7 @@ async fn row_elems(st: &Arc<State>, row: &GrantRow) -> Result<Vec<ElemDst>, Stri
     target_elems(&parse_canonical_target(&row.target)?).await
 }
 
-/// Rebuild both accounting chains from the ledger's approved rows.
-/// Count-only rules, no verdicts — enforcement never depends on this.
+/// Rebuild accounting chains from approved rows. Count-only; no verdicts.
 async fn rebuild_acct(st: &Arc<State>) -> Result<(), String> {
     if st.cfg.dry_run {
         return Ok(());
@@ -686,9 +635,9 @@ async fn rebuild_acct(st: &Arc<State>) -> Result<(), String> {
     st.nft.apply(&b).await.map_err(|e| e.to_string())
 }
 
-/// Per-grant best-effort object sweep after a grant leaves the approved set.
-/// Runs AFTER rebuild_acct (which flushes all acct rules), so every object is
-/// unreferenced; one tiny batch per object since deletes are not idempotent.
+/// Sweep per-grant objects after a grant leaves approved.
+/// Run after rebuild_acct so objects are unreferenced. One batch per object
+/// (deletes are not idempotent).
 async fn sweep_grant_objs(st: &Arc<State>, gid: i64) {
     if st.cfg.dry_run {
         return;
@@ -707,8 +656,7 @@ async fn sweep_grant_objs(st: &Arc<State>, gid: i64) {
         } else {
             b.delete_set(&name);
         }
-        // ENOENT/EBUSY are tolerable: worst case a dead object lingers until
-        // the next full wipe; nothing here can affect enforcement.
+        // ENOENT/EBUSY: a dead object may linger until the next wipe.
         if let Err(e) = st.nft.apply(&b).await {
             tracing::debug!(gid, %e, obj = %name, "acct sweep delete (ignored)");
         }
@@ -717,12 +665,9 @@ async fn sweep_grant_objs(st: &Arc<State>, gid: i64) {
 
 // ---------------------------------------------------------------- reconciliation
 //
-// Boot policy (user decision 2026-09-17): grants are EPHEMERAL across reboots —
-// the kernel/netns teardown is the reaper, the gatekeeper never revives a grant.
-// Across crashes/restarts within one boot, live kernel elements (attributed via
-// their `gk:g<gid>` comments) are ADOPTED; the ledger follows the kernel, and
-// the gatekeeper takes NO corrective action on enforcement state — orphaned
-// elements are left for their kernel TTL to reap.
+// Boot: grants do not survive reboot (netns teardown is the reaper).
+// Across crashes in one boot, live kernel elements (`gk:g<gid>` comments)
+// are adopted; the ledger follows the kernel. Orphaned elements expire via TTL.
 
 /// Parse a `gk:g<gid>` attribution comment.
 fn grant_gid_of_comment(c: &Option<String>) -> Option<i64> {
@@ -734,8 +679,7 @@ async fn reconcile_on_boot(st: &Arc<State>) {
     let elements = match st.nft.poll_live(&st.cfg.nft_table).await {
         Ok(p) => p.elements,
         Err(e) => {
-            // Can't read kernel truth → assume none of our grants exist
-            // (reboot-like). Fails closed: stale 'approved' rows would lie.
+            // Can't read kernel: treat as no grants (fail closed).
             tracing::error!(%e, "reconcile: cannot read nft state; reaping all ledger rows");
             Vec::new()
         }
@@ -743,12 +687,11 @@ async fn reconcile_on_boot(st: &Arc<State>) {
     let live_gids: std::collections::HashSet<i64> =
         elements.iter().filter_map(|el| grant_gid_of_comment(&el.comment)).collect();
 
-    // Approved rows: adopt iff an element attributed to the row is live AND the
-    // ledger expiry hasn't passed. Everything else is reaped — no revival.
+    // Adopt approved rows iff a live attributed element exists and expiry has not passed.
     let now = now_secs() as f64;
     let mut adopted: std::collections::HashSet<i64> = std::collections::HashSet::new();
     for g in st.ledger.list(GrantState::Approved).await {
-        let adopt = live_gids.contains(&(g.id as i64))
+        let adopt = live_gids.contains(&g.id)
             && g.expires_at.map(|e| e > now).unwrap_or(false);
         if adopt {
             adopted.insert(g.id);
@@ -762,8 +705,7 @@ async fn reconcile_on_boot(st: &Arc<State>) {
         tracing::info!(gid = g.id, "reconcile: reaped stale approved row");
     }
 
-    // Pending rows cannot survive a restart: their oneshot channels lived in the
-    // dead process and the MCP client connection is gone.
+    // Pending cannot survive restart: oneshot channels died with the process.
     for g in st.ledger.list(GrantState::Pending).await {
         st.ledger
             .decide(g.id, Decide::Deny {
@@ -774,11 +716,8 @@ async fn reconcile_on_boot(st: &Arc<State>) {
         st.ledger.audit("reconcile", g.id, "pending row denied: orphaned by restart");
     }
 
-    // Orphaned live elements (attributed to a row we just reaped/denied — the
-    // crash window between nft apply and ledger flip): NOT deleted. Kernel TTL
-    // expires them normally. Unattributed elements (installed by hand)
-    // likewise: warn only. Accounting rebuild below simply won't
-    // cover them, which is honest — their ledger rows don't exist anymore.
+    // Orphaned live elements (crash between nft apply and ledger flip): leave
+    // for kernel TTL. Unattributed elements: warn only.
     for el in &elements {
         match grant_gid_of_comment(&el.comment) {
             Some(gid) if !adopted.contains(&gid) => {
@@ -827,7 +766,7 @@ async fn handle_admin(stream: UnixStream, st: Arc<State>) {
                     Err(_) => continue,
                 };
                 let resp = handle_admin_cmd(&req, &st).await;
-                if w.write_all(format!("{}\n", serde_json::to_string(&resp).unwrap()).as_bytes()).await.is_err() {
+                if w.write_all(format!("{}\n", resp_line(&resp)).as_bytes()).await.is_err() {
                     break;
                 }
             }
@@ -880,7 +819,7 @@ async fn handle_admin_cmd(req: &RpcRequest, st: &Arc<State>) -> RpcResponse {
         },
         method::LIST_GRANTS => {
             let rows = st.ledger.list(GrantState::Approved).await;
-            RpcResponse::ok(&req.id, serde_json::to_value(rows).unwrap())
+            RpcResponse::ok(&req.id, rows)
         }
         method::LIST_ALLOW => {
             let out: Vec<serde_json::Value> = st
@@ -896,32 +835,29 @@ async fn handle_admin_cmd(req: &RpcRequest, st: &Arc<State>) -> RpcResponse {
                     })
                 })
                 .collect();
-            RpcResponse::ok(&req.id, serde_json::to_value(out).unwrap())
+            RpcResponse::ok(&req.id, out)
         }
         method::LIST_PENDING => {
-            // Snapshot to re-hydrate the TUI's pending modal queue after a
-            // reconnect. Only rows with a LIVE decision channel are decidable;
-            // `waiting` tells the client which ones it can actually act on.
+            // Snapshot for TUI reconnect. Only rows with a live decision channel are decidable.
             let rows = st.ledger.list(GrantState::Pending).await;
             let live = st.pending.lock().await;
             let out: Vec<serde_json::Value> = rows
                 .into_iter()
-                .map(|r| {
-                    let mut v = serde_json::to_value(&r).unwrap();
-                    v["waiting"] = serde_json::json!(live.contains_key(&r.id));
-                    v
+                .filter_map(|r| {
+                    serde_json::to_value(&r).ok().map(|mut v| {
+                        v["waiting"] = serde_json::json!(live.contains_key(&r.id));
+                        v
+                    })
                 })
                 .collect();
             RpcResponse::ok(&req.id, out)
         }
         method::LIST_HISTORY => {
-            // Decided rows for the TUI history view. Optional params:
-            //   {"state": "denied|expired|revoked|approved", "limit": 100}
-            // Unknown state strings are a client error, never a silent empty.
+            // Decided rows. Unknown state is a client error, not a silent empty.
             let p = req.params.clone().unwrap_or(serde_json::Value::Null);
             let state = match p.get("state").and_then(|v| v.as_str()) {
                 Some(s) => match GrantState::parse(s) {
-                    // pending is not history; asking for it is a client bug
+                    // pending is not history
                     Some(GrantState::Pending) | None => {
                         return RpcResponse::err(&req.id, -32602, format!("bad history state {s:?}"))
                     }
@@ -935,10 +871,10 @@ async fn handle_admin_cmd(req: &RpcRequest, st: &Arc<State>) -> RpcResponse {
                 None => 100,
             };
             let rows = st.ledger.history(state, limit).await;
-            RpcResponse::ok(&req.id, serde_json::to_value(rows).unwrap())
+            RpcResponse::ok(&req.id, rows)
         }
         method::STOP_GRANTS => {
-            // Emergency stop: terminate grants only; baseline rules are untouched.
+            // Emergency stop: terminate grants; baseline rules untouched.
             tracing::info!("stop.grants invoked");
             let mut n = 0usize;
             let rows = st.ledger.list(GrantState::Approved).await;
@@ -958,8 +894,7 @@ async fn handle_admin_cmd(req: &RpcRequest, st: &Arc<State>) -> RpcResponse {
             }
             if !st.cfg.dry_run && n > 0 {
                 if let Err(e) = st.nft.apply(&b).await {
-                    // The atomic batch hit a missing element: retry per grant,
-                    // tolerating ENOENT (already gone), then continue.
+                    // Atomic batch hit a missing element: retry per grant, tolerate ENOENT.
                     tracing::warn!(%e, "stop.grants batch failed; per-grant fallback");
                     let mut ok = 0usize;
                     for g in &rows {
@@ -1000,10 +935,7 @@ async fn handle_admin_cmd(req: &RpcRequest, st: &Arc<State>) -> RpcResponse {
             for g in &rows {
                 sweep_grant_objs(st, g.id).await;
             }
-            let _ = st.events.send(json_line(&notification(
-                method::EV_DECIDED,
-                serde_json::json!({"state": "all_stopped", "grants_removed": n}),
-            )));
+            emit(st, method::EV_DECIDED, serde_json::json!({"state": "all_stopped", "grants_removed": n}));
             RpcResponse::ok(&req.id, serde_json::json!({"revoked": n}))
         }
         method::SUBSCRIBE => RpcResponse::ok(
@@ -1013,8 +945,7 @@ async fn handle_admin_cmd(req: &RpcRequest, st: &Arc<State>) -> RpcResponse {
                     method::EV_REQUEST_NEW, method::EV_DECIDED,
                     method::EV_EXPIRED, method::EV_TRAFFIC, method::EV_ERROR
                 ],
-                // TUI contract data: countdown-to-auto-deny needs the timeout;
-                // version lets the client detect daemon skew.
+                // TUI countdown needs the timeout; version detects daemon skew.
                 "approver_timeout_secs": st.cfg.approver_timeout_secs,
                 "version": env!("CARGO_PKG_VERSION"),
             }),
@@ -1057,10 +988,7 @@ async fn revoke(st: &Arc<State>, gid: i64) {
         tracing::warn!(gid, %e, "acct rebuild after revoke failed");
     }
     sweep_grant_objs(st, gid).await;
-    let _ = st.events.send(json_line(&notification(
-        method::EV_DECIDED,
-        serde_json::json!({"grant_id": gid.to_string(), "state": "revoked"}),
-    )));
+    emit(st, method::EV_DECIDED, serde_json::json!({"grant_id": gid.to_string(), "state": "revoked"}));
 }
 
 // ------------------------------------------------------------------- helpers
@@ -1088,7 +1016,7 @@ fn pick_target(p: &AccessRequestParams) -> Result<Target, SpecError> {
     if let Some(n) = &p.dst_net {
         let net: ipnet::IpNet = n
             .parse()
-            .map_err(|e| SpecError::BadHost(format!("bad cidr {n}: {e}")))?;
+            .map_err(|e| SpecError::BadNetStr(format!("{n}: {e}")))?;
         return Ok(Target::Net(net));
     }
     unreachable!()
@@ -1111,16 +1039,12 @@ fn cap_ttl(d: Duration, st: &State) -> Duration {
     d.min(max)
 }
 
-/// Verdict line for a REDELIVERED request id (spec: re-delivery must not
-/// re-popup; the caller gets the original row's outcome, never a fresh ask).
+/// Verdict for a redelivered request id. No second popup.
 fn replay_verdict(orig: &GrantRow) -> String {
     let gid = orig.id.to_string();
-    // Exhaustive match on GrantState — adding a state later breaks the build
-    // here on purpose, forcing a deliberate answer for replays of that state.
     let d = match orig.state {
         GrantState::Pending => Verdict::Denied {
-            // A pending original is not a grant: deny the replay rather than
-            // imply approval. No second popup; the caller must not act.
+            // Pending original is not a grant; deny the replay, no second popup.
             reason_code: DenyReason::AlreadyPending,
             grant_id: Some(gid.clone()),
             note: Some(
@@ -1149,14 +1073,13 @@ fn replay_verdict(orig: &GrantRow) -> String {
                 Some(DenyCode::ApproverOffline) => DenyReason::ApproverOffline,
                 Some(DenyCode::ApproverTimeout) => DenyReason::ApproverTimeout,
                 Some(DenyCode::InstallFailed) => DenyReason::InstallFailed,
-                _ => DenyReason::HumanDenied, // any other code reads as "a human said no"
+                _ => DenyReason::HumanDenied,
             },
             grant_id: Some(gid.clone()),
             note: orig.note.clone(),
         },
     };
-    // reply id = the replayed request id (== idem_key)
-    serde_json::to_string(&RpcResponse::ok(orig.idem_key.as_deref().unwrap_or(""), &d)).unwrap()
+    resp_line(&RpcResponse::ok(orig.idem_key.as_deref().unwrap_or(""), &d))
 }
 
 /// Strip control chars so free text can't spoof TUI rows.
@@ -1164,30 +1087,13 @@ fn sanitize(s: &str) -> String {
     s.chars().filter(|c| !c.is_control()).take(280).collect()
 }
 
-/// Minimal UTC RFC3339 (civil-from-days, Hinnant algorithm) — no chrono dep for scaffold.
+/// UTC RFC3339 from unix seconds (Hinnant civil-from-days).
 pub fn fmt_unix(secs: f64) -> String {
-    let secs = secs.max(0.0) as u64;
-    let days = (secs / 86_400) as i64;
-    let rem = secs % 86_400;
-    // http://howardhinnant.github.io/date_algorithms.html
-    let z = days + 719_468;
-    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
-    let doe = (z - era * 146_097) as u64;
-    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
-    let y = yoe as i64 + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = doy - (153 * mp + 2) / 5 + 1;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 };
-    let y = if m <= 2 { y + 1 } else { y };
-    format!(
-        "{y:04}-{m:02}-{d:02}T{:02}:{:02}:{:02}Z",
-        rem / 3600,
-        (rem % 3600) / 60,
-        rem % 60
-    )
+    use chrono::{DateTime, SecondsFormat};
+    DateTime::from_timestamp(secs.max(0.0) as i64, 0)
+        .map(|dt| dt.to_rfc3339_opts(SecondsFormat::Secs, true))
+        .unwrap_or_else(|| "-".into())
 }
-
 fn parse_id(req: &RpcRequest) -> Option<i64> {
     req.params.as_ref()?.get("grant_id")?.as_str()?.parse().ok()
 }
@@ -1198,28 +1104,45 @@ fn parse_id_ttl(req: &RpcRequest) -> Option<(i64, Option<u64>)> {
     Some((id, ttl))
 }
 
-fn notification(method: &str, params: serde_json::Value) -> RpcRequest {
-    RpcRequest {
+/// Broadcast one event to connected approvers. Serialization failure is
+/// logged and the event dropped — a daemon never panics on the wire.
+fn emit(st: &State, method: &str, params: serde_json::Value) {
+    let mut o = match serde_json::to_value(RpcRequest {
         jsonrpc: JsonRpcVersion::V2_0,
         id: String::new(),
         method: method.into(),
         params: Some(params),
+    }) {
+        Ok(o) => o,
+        Err(e) => {
+            tracing::error!(%e, method, "event serialization failed; dropped");
+            return;
+        }
+    };
+    if let Some(m) = o.as_object_mut() {
+        m.remove("id"); // notifications carry no id member
+    }
+    match serde_json::to_string(&o) {
+        Ok(mut s) => {
+            s.push('\n');
+            let _ = st.events.send(s);
+        }
+        Err(e) => tracing::error!(%e, method, "event serialization failed; dropped"),
     }
 }
 
-fn json_line(v: &RpcRequest) -> String {
-    // notifications per JSON-RPC 2.0: no id member
-    let mut o = serde_json::to_value(v).unwrap();
-    if let Some(m) = o.as_object_mut() {
-        m.remove("id");
-    }
-    let mut s = serde_json::to_string(&o).unwrap();
-    s.push('\n');
-    s
+/// Serialize a response to its wire line; failure degrades to a fixed
+/// internal-error reply rather than panicking the connection task.
+fn resp_line(resp: &RpcResponse) -> String {
+    serde_json::to_string(resp).unwrap_or_else(|e| {
+        tracing::error!(%e, "response serialization failed");
+        r#"{"jsonrpc":"2.0","id":null,"error":{"code":-32603,"message":"serialization failed"}}"#
+            .to_string()
+    })
 }
 
 fn rpc_err_str(id: &str, code: i32, msg: impl Into<String>) -> String {
-    serde_json::to_string(&RpcResponse::err(id, code, msg)).unwrap()
+    resp_line(&RpcResponse::err(id, code, msg))
 }
 
 #[cfg(test)]
@@ -1278,11 +1201,9 @@ mod tests {
         assert_eq!(v["result"]["reason_code"], "human_denied");
         assert_eq!(v["result"]["note"], "out of scope");
 
-        // reply id must equal the REPLAYED request id (the idem key), or the
-        // waiting MCP client would never match its own pending call.
+        // reply id must equal the replayed request id (idem key)
         let v = parse(replay_verdict(&row(GrantState::Pending, None, None)));
         assert_eq!(v["id"], "req-abc");
-        // a pending original is not a grant; the replay is denied
         assert_eq!(v["result"]["decision"], "denied");
         assert_eq!(v["result"]["reason_code"], "already_pending");
     }

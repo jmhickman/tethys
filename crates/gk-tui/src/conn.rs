@@ -52,9 +52,7 @@ pub fn spawn(
                     let (r, mut w) = stream.into_split();
                     let mut lines = BufReader::new(r).lines();
 
-                    // Fresh session: subscribe + full snapshots. The app
-                    // replaces its live/pending tables wholesale on the c-*
-                    // responses, so reconnects self-heal by construction.
+                    // Fresh session: subscribe + snapshots. App replaces tables on c-* replies.
                     let resync = [
                         cmd("c-sub", method::SUBSCRIBE, None),
                         cmd("c-live", method::LIST_GRANTS, None),

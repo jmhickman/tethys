@@ -1,15 +1,5 @@
 //! rusqlite grant ledger. A single writer task owns the connection; callers
-//! go through a spawned actor because rusqlite is synchronous.
-//!
-//! Grant lifecycle is a state machine, and the types here make illegal states
-//! impossible rather than merely discouraged:
-//!   - `GrantState` / `Proto` / `DenyCode` are enums, never bare strings.
-//!   - A row cannot be constructed in a non-pending state (`NewGrant` has no
-//!     state field; `GrantRow` is only produced by the loader).
-//!   - Every mutation is a `Decide` variant that declares its legal origin
-//!     states, its target state, and exactly the payload that transition may
-//!     carry — so "approve with no expiry" or "deny with no reason" do not
-//!     typecheck.
+//! go through an actor because rusqlite is synchronous.
 
 use std::path::Path;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -19,21 +9,22 @@ use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 
-/// Legal grant states. Wire/DB spelling is snake_case (admin `list` output and
-/// audit history depend on it).
+/// Grant states. Wire/DB spelling is snake_case.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum GrantState {
     Pending,
     Approved,
     Denied,
-    /// kernel TTL reaped the element; ledger mirrors reality.
+    /// Kernel TTL reaped the element.
     Expired,
-    /// operator kill (revoke / stop.grants).
+    /// Operator kill (revoke / stop.grants).
     Revoked,
 }
 
 impl GrantState {
+    /// The snake_case spelling is declared once (serde rename_all); these are
+    /// thin alloc-free views of it. A drift test pins both directions.
     pub(crate) fn as_str(self) -> &'static str {
         match self {
             GrantState::Pending => "pending",
@@ -44,19 +35,11 @@ impl GrantState {
         }
     }
     pub(crate) fn parse(s: &str) -> Option<Self> {
-        match s {
-            "pending" => Some(GrantState::Pending),
-            "approved" => Some(GrantState::Approved),
-            "denied" => Some(GrantState::Denied),
-            "expired" => Some(GrantState::Expired),
-            "revoked" => Some(GrantState::Revoked),
-            _ => None,
-        }
+        serde_json::from_value::<GrantState>(serde_json::Value::String(s.to_string())).ok()
     }
 }
 
-/// Why a grant was denied. The untagged catch-all keeps rows carrying an
-/// unrecognized code loadable (reported verbatim) instead of dropping them.
+/// Why a grant was denied. Unknown codes load as `Unknown` rather than dropping the row.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DenyCode {
@@ -65,29 +48,29 @@ pub enum DenyCode {
     ApproverTimeout,
     InstallFailed,
     RestartOrphan,
-    /// reconcile_on_boot found an approved row with no live attributed
-    /// element — the row is reaped, not revived.
+    /// Boot reconcile found an approved row with no live attributed element.
+    /// Alias keeps rows written by the pre-kebab spelling loadable.
+    #[serde(alias = "restart-reconcile")]
     RestartReconcile,
     #[serde(untagged)]
     Unknown(String),
 }
 
 impl DenyCode {
-    fn as_str(&self) -> &str {
+    /// Wire/DB spelling comes from serde alone (snake_case); Unknown carries
+    /// its original string through untouched.
+    fn as_str(&self) -> String {
         match self {
-            DenyCode::HumanDenied => "human_denied",
-            DenyCode::ApproverOffline => "approver_offline",
-            DenyCode::ApproverTimeout => "approver_timeout",
-            DenyCode::InstallFailed => "install_failed",
-            DenyCode::RestartOrphan => "restart_orphan",
-            DenyCode::RestartReconcile => "restart_reconcile",
-            DenyCode::Unknown(s) => s,
+            DenyCode::Unknown(s) => s.clone(),
+            known => serde_json::to_value(known)
+                .ok()
+                .and_then(|v| v.as_str().map(String::from))
+                .unwrap_or_else(|| "unknown".into()),
         }
     }
 }
 
-/// A request that has not been seen before: no state, no expiry, no verdict —
-/// those are facts the ledger adds over time, not caller-supplied fields.
+/// New request. State, expiry, and verdict are filled in later.
 #[derive(Clone, Debug)]
 pub struct NewGrant {
     pub idem_key: String,
@@ -102,8 +85,7 @@ pub struct NewGrant {
     pub created_at: u64,
 }
 
-/// A ledger row as it EXISTS (only the loader builds these — a row's state is
-/// data, never an argument).
+/// Loaded ledger row.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct GrantRow {
     pub id: i64,
@@ -125,21 +107,19 @@ pub struct GrantRow {
     pub note: Option<String>,
 }
 
-/// The ONLY way the state machine moves. Each variant hard-codes its legal
-/// origins and carries exactly (and only) what that transition may write.
+/// State transition. Origin and payload are enforced in SQL.
 #[derive(Clone, Debug)]
 pub enum Decide {
     /// pending -> approved
     Approve { expires_at: f64 },
-    /// pending -> denied (a denial without a reason is unconstructible)
+    /// pending -> denied
     Deny { code: DenyCode, note: Option<String> },
     /// approved -> revoked by operator action
     Revoke { at: f64, note: Option<String> },
     /// approved -> expired, mirrored from the kernel reaper (no human input)
     ExpireByKernel,
-    /// approved -> expired at startup because reconcile_on_boot found no live
-    /// kernel element for it (grants do not survive a reboot). Distinct from
-    /// the routine TTL reap so the audit trail can tell them apart.
+    /// approved -> expired at startup: no live kernel element (grants do not
+    /// survive reboot). Distinct from the routine TTL reap for the audit trail.
     ReapRestart { at: f64, note: Option<String> },
 }
 
@@ -152,7 +132,7 @@ impl Decide {
             Decide::ExpireByKernel | Decide::ReapRestart { .. } => GrantState::Expired,
         }
     }
-    /// Single source of truth for legality; enforced in SQL's WHERE clause.
+    /// Legal origin states; enforced in the UPDATE WHERE clause.
     fn legal_origins(&self) -> &'static [GrantState] {
         match self {
             Decide::Approve { .. } | Decide::Deny { .. } => &[GrantState::Pending],
@@ -207,18 +187,16 @@ pub struct Ledger {
 
 fn row_from(r: &rusqlite::Row) -> rusqlite::Result<GrantRow> {
     let state_raw: String = r.get(11)?;
-    // A row whose state is outside the known set is corrupt data, not an extra
-    // state: log and skip it rather than inventing a variant for it.
+    // Unknown state is corrupt; skip rather than inventing a variant.
     let Some(state) = GrantState::parse(&state_raw) else {
         tracing::error!(id = ?r.get::<_, i64>(0).ok(), state = %state_raw,
             "ledger row with unknown state skipped");
         return Err(rusqlite::Error::InvalidParameterName("unknown_state".into()));
     };
     let proto_raw: String = r.get(6)?;
-    let proto = match proto_raw.as_str() {
-        "tcp" => Proto::Tcp,
-        "udp" => Proto::Udp,
-        _ => {
+    let proto = match proto_raw.parse::<Proto>() {
+        Ok(p) => p,
+        Err(_) => {
             tracing::error!(id = ?r.get::<_, i64>(0).ok(), proto = %proto_raw,
                 "ledger row with unknown proto skipped");
             return Err(rusqlite::Error::InvalidParameterName("unknown_proto".into()));
@@ -239,17 +217,12 @@ fn row_from(r: &rusqlite::Row) -> rusqlite::Result<GrantRow> {
         state,
         created_at: r.get::<_, i64>(12)? as u64,
         expires_at: r.get(13)?,
+        // serde is the single parse path (alias covers the pre-kebab spelling;
+        // anything else loads as Unknown rather than dropping the row).
         deny_code: r
             .get::<_, Option<String>>(14)?
-            .map(|c| match c.as_str() {
-                "human_denied" => DenyCode::HumanDenied,
-                "approver_offline" => DenyCode::ApproverOffline,
-                "approver_timeout" => DenyCode::ApproverTimeout,
-                "install_failed" => DenyCode::InstallFailed,
-                "restart_orphan" => DenyCode::RestartOrphan,
-                "restart_reconcile" | "restart-reconcile" => DenyCode::RestartReconcile,
-                other => DenyCode::Unknown(other.to_string()),
-            }),
+            .map(|c| serde_json::from_value::<DenyCode>(serde_json::Value::String(c.clone()))
+                .unwrap_or(DenyCode::Unknown(c))),
         note: r.get(15)?,
     })
 }
@@ -260,7 +233,8 @@ const COLS: &str = "id,idem_key,target,dst_json,port_from,port_to,proto,reason,t
 impl Ledger {
     pub fn open(path: &Path) -> anyhow::Result<(Self, tokio::task::JoinHandle<()>)> {
         if let Some(p) = path.parent() {
-            std::fs::create_dir_all(p).ok();
+            std::fs::create_dir_all(p)
+                .map_err(|e| anyhow::anyhow!("create {}: {e}", p.display()))?;
         }
         let conn = Connection::open(path)?;
         conn.execute_batch(
@@ -288,17 +262,14 @@ impl Ledger {
             while let Some(cmd) = rx.recv().await {
                 match cmd {
                     LedgerCmd::Insert(g, reply) => {
-                        // Requests arrive at human speed; preparing per
-                        // statement instead of caching is cheap enough here.
                         let res = conn.execute(
                             "INSERT INTO grants(idem_key,target,dst_json,port_from,port_to,proto,\
                              reason,tool,ttl_secs,state,created_at) VALUES(?1,?2,'[]',?3,?4,?5,?6,?7,?8,'pending',?9)",
                             params![g.idem_key, g.target, g.port_from as i64, g.port_to as i64,
-                                    proto_name(g.proto), g.reason, g.tool, g.ttl_secs as i64, g.created_at as i64],
+                                    g.proto.to_string(), g.reason, g.tool, g.ttl_secs as i64, g.created_at as i64],
                         );
-                        // NOT last_insert_rowid alone: it retains the PREVIOUS rowid
-                        // when this INSERT fails (UNIQUE idem violation would alias
-                        // to a stale grant). changes()==1 proves THIS insert landed.
+                        // last_insert_rowid keeps the previous rowid on UNIQUE
+                        // failure; changes()==1 means this insert landed.
                         match res {
                             Ok(1) => {
                                 let id = conn.last_insert_rowid();
@@ -311,8 +282,6 @@ impl Ledger {
                         }
                     }
                     LedgerCmd::Decide(id, d, reply) => {
-                        // Legality is enforced HERE, in the WHERE clause: the row
-                        // only flips if it currently sits in a legal origin state.
                         let origins = d.legal_origins();
                         let placeholders: Vec<String> = (0..origins.len())
                             .map(|i| format!("?{}", 6 + i))
@@ -380,9 +349,7 @@ impl Ledger {
                         let _ = reply.send(out);
                     }
                     LedgerCmd::History(state, limit, reply) => {
-                        // Decided history for the TUI: every row that left the
-                        // pending state, newest first. Optional state filter;
-                        // `limit` is clamped by the caller (server).
+                        // Decided rows for the TUI, newest first. Optional state filter.
                         let q = match state {
                             Some(_) => format!(
                                 "SELECT {COLS} FROM grants WHERE state!=?1 AND state=?2 \
@@ -423,8 +390,7 @@ impl Ledger {
                         let _ = reply.send(out);
                     }
                     LedgerCmd::SetDst(id, dst_json, reply) => {
-                        // Persist the resolved IPs: revoke/cleanup use these
-                        // values, never a fresh DNS lookup at delete time.
+                        // Persist resolved IPs; revoke uses these, not a fresh lookup.
                         let n = conn
                             .execute(
                                 "UPDATE grants SET dst_json=?2 WHERE id=?1 AND state='approved'",
@@ -457,18 +423,16 @@ impl Ledger {
 
     async fn ask<T>(&self, f: impl FnOnce(tokio::sync::oneshot::Sender<T>) -> LedgerCmd) -> T {
         let (tx, rx) = tokio::sync::oneshot::channel();
-        // channel is unbounded + actor never blocks on us; send can't fail in practice
         self.tx.send(f(tx)).ok();
         rx.await.expect("ledger actor died")
     }
 
-    /// Returns None when the idempotency key already exists (a re-delivery).
+    /// None if the idempotency key already exists.
     pub async fn insert_pending(&self, g: NewGrant) -> Option<i64> {
         self.ask(move |reply| LedgerCmd::Insert(g, reply)).await
     }
 
-    /// Attempt a state transition; false = rejected (row not in a legal origin
-    /// state), which is the normal answer for racy/duplicate decisions.
+    /// False if the row is not in a legal origin state (racy/duplicate).
     pub async fn decide(&self, id: i64, d: Decide) -> bool {
         self.ask(|reply| LedgerCmd::Decide(id, d, reply)).await
     }
@@ -482,10 +446,9 @@ impl Ledger {
         self.ask(|reply| LedgerCmd::History(state, limit, reply)).await
     }
     pub async fn active(&self) -> Vec<GrantRow> {
-        self.ask(|reply| LedgerCmd::FindActive(reply)).await
+        self.ask(LedgerCmd::FindActive).await
     }
-    /// Persist resolved dst list for an APPROVED grant (returns false if the
-    /// row is not approved — stale flips can't corrupt it).
+    /// Persist resolved dst list for an approved grant. False if the row is not approved.
     pub async fn set_dst(&self, id: i64, dst_json: String) -> bool {
         self.ask(move |reply| LedgerCmd::SetDst(id, dst_json, reply)).await
     }
@@ -498,13 +461,6 @@ impl Ledger {
         self.tx
             .send(LedgerCmd::Audit(event.into(), detail.into(), grant_id))
             .ok();
-    }
-}
-
-fn proto_name(p: Proto) -> &'static str {
-    match p {
-        Proto::Tcp => "tcp",
-        Proto::Udp => "udp",
     }
 }
 
@@ -530,8 +486,7 @@ mod tests {
         }
     }
 
-    /// The transition table is enforced at the DB boundary: wrong-origin
-    /// decisions flip zero rows, right-origin ones flip exactly one.
+    /// Wrong-origin decisions flip zero rows; right-origin flips exactly one.
     #[tokio::test]
     async fn transitions_enforce_origin_state() {
         let dir = std::env::temp_dir().join(format!("gk-ledger-test-{}", now_secs()));
@@ -539,12 +494,8 @@ mod tests {
         let gid = ledger.insert_pending(newg("k1")).await.expect("insert");
 
         let exp = now_secs() as f64 + 60.0;
-        // pending -> approved
         assert!(ledger.decide(gid, Decide::Approve { expires_at: exp }).await);
-        // approving again is rejected (guards against a racy double decision)
         assert!(!ledger.decide(gid, Decide::Approve { expires_at: exp }).await);
-        // approved -> denied is UNEXPRESSIBLE as a Decide variant at all; the
-        // nearest legal-looking one (Revoke) then Expire both target Approved.
         assert!(ledger.decide(gid, Decide::Revoke { at: now_secs() as f64, note: None }).await);
         // terminal: revoked -> anything = false
         assert!(!ledger.decide(gid, Decide::ExpireByKernel).await);
@@ -585,8 +536,7 @@ mod tests {
             .decide(b, Decide::Deny { code: DenyCode::HumanDenied, note: Some("n".into()) })
             .await;
         let c = ledger.insert_pending(newg("h-c")).await.unwrap();
-        // Revoke legally originates from Approved; pending origin is rejected,
-        // so approve first — otherwise c stays pending and (correctly) absent.
+        // Revoke originates from Approved; pending origin is rejected.
         ledger.decide(c, Decide::Approve { expires_at: now_secs() as f64 + 60.0 }).await;
         ledger.decide(c, Decide::Revoke { at: now_secs() as f64, note: None }).await;
         // flip a approved row to expired via the kernel path
@@ -623,7 +573,7 @@ mod tests {
         assert!(ledger.insert_pending(newg("req-x")).await.is_none(), "UNIQUE must reject dup");
         let found = ledger.find_by_idem("req-x").await.expect("must find row by idem key");
         assert_eq!(found.id, gid);
-        assert_eq!(found.proto, Proto::Tcp); // typed proto survived the round-trip
+        assert_eq!(found.proto, Proto::Tcp);
         ledger.decide(gid, Decide::Approve { expires_at: now_secs() as f64 + 5.0 }).await;
         ledger.decide(gid, Decide::Revoke { at: now_secs() as f64, note: None }).await;
         let found = ledger.find_by_idem("req-x").await.expect("still found after revoke");

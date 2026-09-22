@@ -1,9 +1,8 @@
-//! nftables batch construction + execution.
+//! nftables JSON batch construction and execution.
 //!
-//! Every encoding here was verified empirically on nft 1.1.6 against this
-//! kernel. Notably: CIDR elements MUST be `{"prefix":{...}}` objects (an "a.b.c.d/nn"
-//! string is parsed as a hostname → DNS lookup), per-element TTL goes in the
-//! `{"elem":{"val":...,"expires":N}}` wrapper, and batches apply atomically.
+//! nft 1.1.6 encoding: CIDR elements must be `{"prefix":{...}}` objects (an
+//! "a.b.c.d/nn" string is parsed as a hostname), per-element TTL lives in
+//! `{"elem":{"val":...,"expires":N}}`, and batches apply atomically.
 
 use std::net::IpAddr;
 use std::process::Stdio;
@@ -19,27 +18,21 @@ use crate::types::{PortSpec, Proto};
 pub const TABLE: &str = "gatekeeper";
 pub const SET_V4: &str = "grants_v4";
 pub const SET_V6: &str = "grants_v6";
-/// Operator-declared always-allowed tuples (config `allow` list). Owned by
-/// the gatekeeper at runtime (flush+reinstall from config), but they live in
-/// the baseline's carve sets so they survive grant churn and are never
-/// touched by stop.grants.
+/// Operator allow-list tuples (`allow` in config). Flush+reinstall from
+/// config; live in the baseline carve sets so stop.grants does not touch them.
 pub const SET_CARVE_V4: &str = "carve_v4";
 pub const SET_CARVE_V6: &str = "carve_v6";
-/// Accounting chains (declared empty by the static baseline, contents owned by
-/// gatekeeper). Rules here carry COUNTERS ONLY — never a verdict — so they can
-/// never bypass egress enforcement even if they drift or outlive a grant.
+/// Accounting chains (empty in the static baseline; contents owned here).
+/// Rules carry counters only — no verdict — so they cannot bypass egress.
 pub const CHAIN_ACCT_OUT: &str = "acct_out";
 pub const CHAIN_ACCT_IN: &str = "acct_in";
-/// Enforcement scope chain (declared empty by the baseline; contents owned by
-/// gatekeeper, same flush-and-rebuild contract as the acct chains). The
-/// baseline's egress chain `jump scope`s here before its drop rule — a base
-/// chain with its own hook CANNOT pre-exempt packets from a lower-priority
-/// base chain (each is an independent netfilter callback; only `drop`
-/// short-circuits traversal; probe-verified on nft 1.1.6). Inside scope:
-/// policed uids `return` (fall through to the caller's drop), everyone else
-/// `accept` (short-circuits the calling chain, probe-verified).
+/// Enforcement scope chain (empty in the baseline; flush-and-rebuild like
+/// acct). The egress chain `jump`s here before drop. A hooked base chain
+/// cannot pre-exempt packets from a lower-priority base chain (independent
+/// netfilter callbacks; only `drop` short-circuits). Policed uids `return`
+/// (caller drop continues); everyone else `accept`s.
 pub const CHAIN_SCOPE: &str = "scope";
-/// Counts exempt (unpoliced) egress — visible honesty about who skipped.
+/// Counter for unpoliced (exempt) egress.
 pub const COUNTER_EXEMPT: &str = "gk_exempt";
 /// Long default so per-element `expires` is the only thing that reaps grants.
 const SET_DEFAULT_TIMEOUT_SECS: u64 = 24 * 3600;
@@ -61,6 +54,8 @@ pub fn acct_set(gid: i64, dir: Dir, v6: bool) -> String {
 pub enum NftError {
     #[error("nft spawn failed (path /usr/sbin/nft): {0}")]
     Spawn(std::io::Error),
+    #[error("nft stdin write failed (batch may NOT be applied): {0}")]
+    Io(#[from] std::io::Error),
     #[error("nft timed out after {0:?} — prior kernel state retained")]
     Timeout(Duration),
     #[error("nft exited with {}: {}", code.map(|c| c.to_string()).unwrap_or("signal".into()), stderr.trim())]
@@ -105,9 +100,9 @@ impl ElemDst {
     }
 }
 
-/// Accounting direction. Out = packets we send to a granted tuple;
-/// In = established replies whose SOURCE is the granted tuple (probe-verified
-/// reply-tuple trick — `ct original` concats don't parse on this nft build).
+/// Accounting direction. Out = packets to a granted tuple; In = established
+/// replies whose source is the granted tuple (`ct original` concats don't
+/// parse on this nft build).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Dir {
     Out,
@@ -146,11 +141,10 @@ impl GrantElem {
         }
     }
 
-    /// concat value components — the verified-safe encoding.
     fn concat(&self) -> Value {
         let dst = match &self.dst {
             ElemDst::Ip(ip) => json!(ip.to_string()),
-            // NEVER a "ip/len" string: nft parses it as a hostname.
+            // Slash strings are parsed as hostnames; use prefix objects.
             ElemDst::Net(n) => json!({"prefix": {"addr": n.network().to_string(), "len": n.prefix_len()}}),
         };
         let (f, t) = self.port.nft_range();
@@ -163,9 +157,8 @@ impl GrantElem {
     }
 }
 
-/// Builder for the JSON command array shipped to `nft --json -f -`.
-/// Carries the nftables table it operates on: one per deployment (config
-/// `nft_table`, default "gatekeeper"), a private one per test harness.
+/// JSON command array for `nft --json -f -`. `table` is per deployment
+/// (`nft_table`, default "gatekeeper"); tests use a private table.
 #[derive(Clone, Debug)]
 pub struct Batch {
     pub table: String,
@@ -197,8 +190,6 @@ impl Batch {
     }
 
     fn push_grant_set(&mut self, name: &str, proto_field: &str) {
-        // grants always match on destination address (egress model); the old
-        // ip/ip6 branch here was a no-op (both arms "daddr") and is gone.
         let addr_field = "daddr";
         self.cmds.push(json!({"add":{"set":{
             "family":"inet","table":&self.table,"name":name,
@@ -212,41 +203,33 @@ impl Batch {
         }}}));
     }
 
-    /// Base objects owned by the gatekeeper (decision: gatekeeper owns its own
-    /// table, separate from any static drop-in table). Idempotent adds.
+    /// Idempotent add of table, grant sets, acct chains, scope, exempt counter.
     pub fn ensure_base(&mut self) {
         self.ensure_table();
         self.push_grant_set(SET_V4, "ip");
         self.push_grant_set(SET_V6, "ip6");
-        // Accounting chains: declared by the static baseline too (reload is
-        // idempotent), but ensured here so dev runs without the drop-in work.
+        // Also declared by the static baseline; ensure here so dev runs work without it.
         for (chain, hook) in [(CHAIN_ACCT_OUT, "output"), (CHAIN_ACCT_IN, "input")] {
             self.cmds.push(json!({"add":{"chain":{
                 "family":"inet","table":&self.table,"name":chain,
                 "hook":hook,"type":"filter","prio":-10,"policy":"accept"
             }}}));
         }
-        // Scope chain + exempt counter: plain (unhooked) adds are idempotent
-        // on this nft build (verified), same reload-safety as above.
+        // Unhooked add is idempotent on this nft build.
         self.cmds.push(json!({"add":{"chain":{
             "family":"inet","table":&self.table,"name":CHAIN_SCOPE
         }}}));
         self.add_counter(COUNTER_EXEMPT);
     }
 
-    /// Rebuild the scope chain from scratch: policed uids `return` to the
-    /// caller (egress drop path continues), everything else is exempt-accepted
-    /// and counted. Empty policed list = host-wide enforcement (every packet
-    /// falls through to the caller's verdict) — the pre-scope behavior, kept
-    /// as the fail-safe when agent_user cannot be resolved.
+    /// Rebuild scope: policed uids `return` (egress drop continues); others
+    /// are counted and accepted. Empty list = host-wide (every packet faces
+    /// the caller's verdict) — used when `agent_user` cannot be resolved.
     pub fn rebuild_scope(&mut self, policed_uids: &[u32]) {
         self.cmds.push(json!({"flush":{"chain":{
             "family":"inet","table":&self.table,"name":CHAIN_SCOPE
         }}}));
         if policed_uids.is_empty() {
-            // No exempt rule at all: every packet returns immediately and
-            // faces the caller's verdict — host-wide enforcement, the
-            // fail-safe when agent_user is unresolved.
             return;
         }
         for uid in policed_uids {
@@ -266,10 +249,8 @@ impl Batch {
         }}}));
     }
 
-    /// Install one grant element with a per-element kernel TTL, attributed to
-    /// its ledger row via the `gk:g<gid>` comment (verified 1.1.6: persists in
-    /// the live dump AND plain-concat deletes still match commented elements —
-    /// so attribution costs the revoke path nothing).
+    /// Add a grant element with kernel TTL and `gk:g<gid>` comment.
+    /// Comment persists in the live dump; concat deletes still match.
     pub fn add_grant(&mut self, e: &GrantElem, ttl: Duration, gid: i64) {
         self.cmds.push(json!({"add":{"element":{
             "family":"inet","table":&self.table,"name":e.set_name(),
@@ -282,10 +263,9 @@ impl Batch {
         self.delete_in(e, e.set_name())
     }
 
-    /// Operator allow-list element: same key grammar as a grant, but NO
-    /// timeout/comment — carve elements live until the next flush_carves.
-    /// Callers MUST flush_carves() first (delete-of-missing-element aborts
-    /// an nft batch, so we cannot delete-before-add defensively here).
+    /// Allow-list element: same key as a grant, no timeout/comment.
+    /// Callers must `flush_carves()` first — deleting a missing element
+    /// aborts the whole nft batch.
     pub fn add_carve(&mut self, e: &GrantElem) {
         self.cmds.push(json!({"add":{"element":{
             "family":"inet","table":&self.table,"name":e.carve_set_name(),
@@ -293,8 +273,7 @@ impl Batch {
         }}}));
     }
 
-    /// Wipe both carve sets before reinstalling from config (keeps the kernel
-    /// exactly equal to the declared list — removed entries actually go away).
+    /// Flush both carve sets before reinstalling from config.
     pub fn flush_carves(&mut self) {
         for name in [SET_CARVE_V4, SET_CARVE_V6] {
             self.cmds.push(json!({"flush":{"set":{
@@ -303,8 +282,7 @@ impl Batch {
         }
     }
 
-    /// Ensure the carve sets exist (baseline declares them; this makes dev
-    /// runs without the drop-in work, mirroring ensure_base for grants).
+    /// Ensure carve sets exist (baseline also declares them).
     pub fn ensure_carve_sets(&mut self) {
         for (name, proto_field) in [(SET_CARVE_V4, "ip"), (SET_CARVE_V6, "ip6")] {
             self.cmds.push(json!({"add":{"set":{
@@ -333,10 +311,7 @@ impl Batch {
         }}}));
     }
 
-    // ------------------------------------------------ accounting
-    // Rules in acct chains carry a named counter and NOTHING ELSE — no
-    // verdict, so they cannot grant reachability even if stale. Chains are
-    // rebuilt wholesale (flush + re-add from ledger): idempotent, handle-free.
+    // Accounting: named counter, no verdict. Chains are flush + re-add.
 
     pub fn flush_chain(&mut self, chain: &str) {
         self.cmds.push(json!({"flush":{"chain":{
@@ -350,9 +325,8 @@ impl Batch {
         }}}));
     }
 
-    /// Per-grant match set; key order mirrors the enforcement sets but the
-    /// address/port fields flip per direction (reply packets carry the granted
-    /// host as *source*, probe-verified reply-tuple trick).
+    /// Per-grant match set. Address/port fields flip per direction (replies
+    /// carry the granted host as source).
     pub fn add_acct_set(&mut self, gid: i64, dir: Dir, v6: bool) {
         let af = if v6 { "ip6" } else { "ip" };
         let (addr_field, port_field) = match dir {
@@ -383,7 +357,7 @@ impl Batch {
     pub fn add_acct_rule(&mut self, gid: i64, dir: Dir, proto: Proto, v6: bool) {
         let (chain, addr_field, port_field, af) = match dir {
             Dir::Out => (CHAIN_ACCT_OUT, "daddr", "dport", if v6 { "ip6" } else { "ip" }),
-            // replies: granted host is the SOURCE of ingress packets
+            // replies: granted host is the source of ingress packets
             Dir::In => (CHAIN_ACCT_IN, "saddr", "sport", if v6 { "ip6" } else { "ip" }),
         };
         let counter = dir.counter(gid);
@@ -425,9 +399,7 @@ pub struct LiveElement {
     pub port_from: u16,
     pub port_to: u16,
     pub expires_secs: f64,
-    /// Attribution marker written by add_grant ("gk:g<gid>"), if present.
-    /// Provenance only (attribution), never authentication — the security
-    /// boundary is capability separation, not this string.
+    /// Attribution from add_grant (`gk:g<gid>`), if present. Not a security check.
     pub comment: Option<String>,
 }
 
@@ -438,17 +410,7 @@ pub struct PollState {
     pub counters: std::collections::HashMap<String, (u64, u64)>,
 }
 
-/// Execution backend (generic dispatch — no dyn needed; AFIT via edition 2021).
-/// Kept as a trait so the netlink path stays possible later.
-pub trait NftBackend {
-    fn apply<'a>(
-        &'a self,
-        batch: &'a Batch,
-    ) -> impl std::future::Future<Output = Result<(), NftError>> + Send;
-}
-
-/// The `nft` CLI backend — argv-pinned, env-cleared, JSON over stdin only
-/// (hardening rules from 01-nft-access-surface.md §6).
+/// `nft` CLI backend: argv-pinned, env-cleared, JSON on stdin.
 pub struct NftCli {
     pub bin: std::path::PathBuf,
     pub timeout: Duration,
@@ -463,8 +425,9 @@ impl Default for NftCli {
     }
 }
 
-impl NftBackend for NftCli {
-    async fn apply(&self, batch: &Batch) -> Result<(), NftError> {
+impl NftCli {
+    /// Apply a JSON batch atomically (nft processes a batch as one transact).
+    pub async fn apply(&self, batch: &Batch) -> Result<(), NftError> {
         if batch.is_empty() {
             return Ok(());
         }
@@ -472,11 +435,8 @@ impl NftBackend for NftCli {
         run_nft_json(&self.bin, &payload, self.timeout).await?;
         Ok(())
     }
-}
 
-impl NftCli {
-    /// JSON-mode list runs MUST be JSON command batches (`--json` makes -f expect
-    /// JSON, not CLI text). Wraps a `list <what>` op into the batch envelope.
+    /// `nft --json -f` expects a JSON batch, not CLI text. Wraps `list <what>`.
     pub async fn list_json(&self, what: &str, arg: Option<serde_json::Value>) -> Result<Value, NftError> {
         let mut cmd = serde_json::Map::new();
         match arg {
@@ -504,16 +464,20 @@ async fn run_nft_json(
 ) -> Result<String, NftError> {
     let mut cmd = Command::new(bin);
     cmd.env_clear();
-    // --json MUST precede -f on nft 1.1.6 (verified).
+    // nft 1.1.6: --json must precede -f.
     cmd.args(["--json", "-f", "-"]);
     cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
 
     let mut child = cmd.spawn().map_err(NftError::Spawn)?;
     {
         use tokio::io::AsyncWriteExt;
-        let mut si = child.stdin.take().unwrap();
-        si.write_all(payload.as_bytes()).await.ok();
-        si.flush().await.ok();
+        // A failed write means nft never saw the batch: surface it instead of
+        // letting the child fail/hang on an empty stdin (apply miss).
+        let mut si = child.stdin.take().ok_or_else(|| {
+            NftError::Io(std::io::Error::other("stdin pipe unavailable"))
+        })?;
+        si.write_all(payload.as_bytes()).await.map_err(NftError::Io)?;
+        si.flush().await.map_err(NftError::Io)?;
         drop(si);
     }
     // take handles so the timeout path can still kill the child by &mut
@@ -539,6 +503,13 @@ async fn run_nft_json(
         Ok(s) => s.map_err(NftError::Spawn)?,
         Err(_) => {
             let _ = child.start_kill();
+            // Reap the readers too: kill closes the pipes so they should EOF
+            // promptly, but never leave them detached on our own timeout.
+            let _ = tokio::time::timeout(timeout, async {
+                let _ = read_out.await;
+                let _ = read_err.await;
+            })
+            .await;
             return Err(NftError::Timeout(timeout));
         }
     };
@@ -678,7 +649,7 @@ mod tests {
         };
         let v = e.concat();
         let s = v.to_string();
-        assert!(!s.contains("10.0.0.0/8"), "slash string would trigger DNS!");
+        assert!(!s.contains("10.0.0.0/8"), "slash string would trigger DNS");
         assert!(s.contains("\"prefix\""));
         assert_eq!(e.set_name(), SET_V4);
     }
@@ -708,13 +679,13 @@ mod tests {
             7,
         );
         let j: serde_json::Value = serde_json::from_str(&b.to_json()).unwrap();
-        // structural check (serde_json sorts keys, so no substring assumptions):
+        // serde_json sorts keys; check structure, not substrings
         let cmds = j["nftables"].as_array().unwrap();
         assert_eq!(cmds[0]["add"]["element"]["name"], "grants_v4");
         let e0 = &cmds[0]["add"]["element"]["elem"][0];
         assert_eq!(e0["elem"]["expires"], 600);
         assert_eq!(e0["elem"]["val"]["concat"][0], "203.0.113.7");
-        assert_eq!(e0["elem"]["comment"], "gk:g7"); // attribution marker (reconcile)
+        assert_eq!(e0["elem"]["comment"], "gk:g7");
     }
 
     #[test]
@@ -731,15 +702,15 @@ mod tests {
             .as_array()
             .unwrap()
             .clone();
-        // sets ensured without timeout flag (carves persist until reinstall)
+        // carve sets have no timeout flag
         let s0 = &cmds[0]["add"]["set"];
         assert_eq!(s0["name"], "carve_v4");
         assert_eq!(s0["flags"], json!(["interval"]));
-        // flush both sets before adds: [0,1]=sets, [2,3]=flushes, [4]=elem
+        // [0,1]=sets, [2,3]=flushes, [4]=elem
         assert!(cmds[2]["flush"]["set"]["name"].as_str() == Some("carve_v4"));
         let e = &cmds[4]["add"]["element"];
         assert_eq!(e["name"], "carve_v4");
-        // plain concat, NO expires/comment wrapper (unlike grants)
+        // plain concat, no expires/comment wrapper
         assert_eq!(e["elem"][0]["concat"][1], json!("tcp"));
         assert!(e["elem"][0]["concat"].is_array());
     }
@@ -767,15 +738,14 @@ mod tests {
     fn scope_empty_list_means_no_exempt_rule() {
         let mut b = Batch::new();
         b.rebuild_scope(&[]);
-        // flush only — no accept rule, so all packets fall through to drop
+        // flush only: no accept rule, all packets fall through to drop
         assert_eq!(b.cmds.len(), 1);
         assert!(b.cmds[0].get("flush").is_some());
     }
 
-    /// Every object a batch touches must live in the batch's table — a single
-    /// missed `self.table` substitution silently deletes from the wrong table
-    /// (kernel: ENOENT) and once bit the whole revoke/stop path under
-    /// non-default nft_table. This test walks every command builder.
+    /// Every command must target the batch's table. A missed substitution
+    /// deletes from the wrong table (ENOENT) and used to break revoke/stop
+    /// under a non-default nft_table.
     #[test]
     fn every_command_targets_the_batches_table() {
         let mut b = Batch::with_table("gk_alt");
@@ -908,7 +878,7 @@ mod tests {
         assert!((st.elements[0].expires_secs - 41.9).abs() < 0.01);
         assert_eq!(st.elements[1].dst, "10.0.0.0/8");
         assert_eq!((st.elements[1].port_from, st.elements[1].port_to), (8000, 8100));
-        assert_eq!(st.elements[0].comment, None); // unattributed tolerated
+        assert_eq!(st.elements[0].comment, None);
         assert_eq!(st.elements[1].comment.as_deref(), Some("gk:g7"));
         assert_eq!(st.counters.get("g7_out"), Some(&(3u64, 120u64)));
         assert!(!st.counters.contains_key("other"));

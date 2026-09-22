@@ -35,16 +35,13 @@ async fn main() -> anyhow::Result<()> {
 
     enable_raw_mode()?;
     let mut stdout = io::stdout();
-    // NOTE: deliberately NO mouse capture. The event loop is keyboard-only
-    // (only Event::Key is matched); capturing the mouse would just steal
-    // terminal-native text selection from the approver's console.
+    // Keyboard only: mouse capture would steal terminal text selection.
     execute!(stdout, EnterAlternateScreen)?;
     let backend = CrosstermBackend::new(io::stdout());
     let mut terminal = Terminal::new(backend)?;
 
     let res = run(&mut terminal, args.socket).await;
 
-    // always restore the screen, even on error paths
     disable_raw_mode()?;
     execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
     terminal.show_cursor()?;
@@ -60,20 +57,13 @@ async fn run(
     let mut tick = tokio::time::interval(std::time::Duration::from_millis(500));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
-    // crossterm's event::read() blocks; shuttle keys into the select loop on
-    // a thread so input is handled the instant it arrives. (The previous
-    // in-select event::poll(80ms) blocked the loop up to 80ms per idle cycle
-    // and — worse — nothing drew until the 500ms tick, so every keypress
-    // looked lagged by up to half a second.)
+    // event::read() blocks; shuttle keys on a thread so the select loop stays live.
     let (key_tx, mut key_rx) = mpsc::unbounded_channel::<Event>();
-    std::thread::spawn(move || loop {
-        match event::read() {
-            Ok(ev) => {
-                if key_tx.send(ev).is_err() {
-                    break; // UI gone
-                }
+    std::thread::spawn(move || {
+        while let Ok(ev) = event::read() {
+            if key_tx.send(ev).is_err() {
+                break; // UI gone
             }
-            Err(_) => break,
         }
     });
 
@@ -94,7 +84,6 @@ async fn run(
                 }
                 let st = *status_rx.borrow_and_update();
                 if !st.up && !lost_modal_shown {
-                    // keep last-known table (dimmed) UNDER the modal (design)
                     app.modal = Modal::ConnLost;
                     lost_modal_shown = true;
                 }
@@ -113,7 +102,6 @@ async fn run(
                         let mut out = Vec::new();
                         app.on_line(&v, &mut out);
                         if !flush(&mut cmd_tx, out) { break; }
-                        // fresh daemon data renders now, not on the next tick
                         let st = *status_rx.borrow();
                         terminal.draw(|f| ui::draw(f, &app, st))?;
                     }
@@ -128,7 +116,6 @@ async fn run(
                         if !flush(&mut cmd_tx, out) || quit {
                             break;
                         }
-                        // the whole point: state change -> frame, immediately
                         let st = *status_rx.borrow();
                         terminal.draw(|f| ui::draw(f, &app, st))?;
                     }
@@ -149,9 +136,8 @@ fn flush(tx: &mut Tx, cmds: Vec<conn::Cmd>) -> bool {
     true
 }
 
-/// Returns true to exit. Keys follow the approved design: vim-ish, modal-first.
+/// Returns true to exit.
 fn handle_key(app: &mut App, k: event::KeyEvent, out: &mut Vec<conn::Cmd>) -> bool {
-    // Ctrl-C works from anywhere.
     if k.modifiers.contains(KeyModifiers::CONTROL) && matches!(k.code, KeyCode::Char('c')) {
         return true;
     }
