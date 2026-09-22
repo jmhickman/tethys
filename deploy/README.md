@@ -5,7 +5,7 @@ Three binaries, one daemon:
 | binary        | runs as            | role                                        |
 |---------------|--------------------|---------------------------------------------|
 | `gatekeeper`  | root (systemd)     | grant ledger + nftables enforcer            |
-| `gk-tui`, `scopeadm` | root / sudo | human approver — needs `admin.sock` (0600) |
+| `gk-tui`      | root / sudo        | human approver — needs `admin.sock` (0600)  |
 | `gk-mcp`      | harness user       | MCP server, spawned by the agent harness    |
 
 ## Threat model in one paragraph
@@ -70,12 +70,12 @@ gk-mcp beyond the binary.
    Optional: `--gatekeeper-socket /run/gatekeeper/mcp.sock` is already the
    default; pass it only for non-default socket paths.
 
-5. **Approver side.** Run `gk-tui` (or `scopeadm`) as root — or under sudo —
-   on the machine. Nothing to configure; the admin socket path is the default.
+5. **Approver side.** Run `gk-tui` as root — or under sudo — on the machine.
+   Nothing to configure; the admin socket path is the default.
 
 ## Smoke test
 
-After deploying: `scopeadm pendings` should print an empty result; a
+After deploying: `gk-tui` should open with an empty live table; a
 `tools/call request_traffic_grant` from the harness should surface a pending
 row in `gk-tui`, and approving it should show the target in
 `nft list set inet gatekeeper grants_v4` with an expiry.

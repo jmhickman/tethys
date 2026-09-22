@@ -74,9 +74,23 @@ def main():
         a.sendall((json.dumps({"jsonrpc": "2.0", "id": rid, "method": "access.request", "params": params}) + "\n").encode())
         return a
 
-    def scopeadm(*args):
-        return subprocess.run([os.path.join(ROOT, "target/debug/scopeadm"), "--socket", ADMIN, *args],
-                              capture_output=True, text=True)
+    def admin_rpc(method, params=None):
+        """One-shot JSON-RPC call over admin.sock (the approver surface)."""
+        s = socket.socket(socket.AF_UNIX); s.connect(ADMIN)
+        s.settimeout(5)
+        req = {"jsonrpc": "2.0", "id": "cli", "method": method}
+        if params is not None:
+            req["params"] = params
+        s.sendall((json.dumps(req) + "\n").encode())
+        buf = b""
+        while b"\n" not in buf:
+            d = s.recv(65536)
+            if not d:
+                break
+            buf += d
+        s.close()
+        line = buf.split(b"\n", 1)[0]
+        return json.loads(line) if line.strip() else {}
 
     fails = []
 
@@ -92,7 +106,7 @@ def main():
         time.sleep(0.1)
     if not gid:
         fails.append("S1 no popup event")
-    scopeadm("approve", gid)
+    admin_rpc("approve", {"grant_id": str(gid)})
     a1.settimeout(5)
     d1 = json.loads(a1.recv(65536).decode())["result"]
     if d1.get("decision") != "approved" or "192.0.2.77" not in nft_grants():
@@ -119,7 +133,7 @@ def main():
         if g:
             gid3 = g[-1]; break
         time.sleep(0.1)
-    scopeadm("deny", gid3, "--note", "out of scope")
+    admin_rpc("deny", {"grant_id": str(gid3), "note": "out of scope"})
     a3.settimeout(5)
     d3 = json.loads(a3.recv(65536).decode())["result"]
     if d3.get("decision") != "denied" or d3.get("note") != "out of scope":
@@ -161,7 +175,7 @@ def main():
 
     threading.Thread(target=pump2, daemon=True).start()
     time.sleep(0.3)
-    scopeadm("revoke", gid)
+    admin_rpc("revoke", {"grant_id": str(gid)})
     if "192.0.2.77" in nft_grants():
         fails.append("S5 element still present after revoke")
     print("S5 revoke:", "ok" if "S5" not in str(fails) else fails[-1])
@@ -200,14 +214,14 @@ def main():
                                  "reason": "batch", "tool": "t", "ttl_requested": "300s"})
         g = new_gid()
         if g:
-            scopeadm("approve", g)
+            admin_rpc("approve", {"grant_id": str(g)})
             if wait_decided(g):
                 approved_gids.append(g)
     # one pending left undecided — stop must deny it too
     a_pend = request("r6-pending", {"dst_ip": "192.0.2.12", "dst_port": {"from": 80, "to": 80},
                                     "proto": "tcp", "reason": "left pending", "tool": "t", "ttl_requested": "300s"})
     g = new_gid()
-    r = scopeadm("stop")
+    r = admin_rpc("stop.grants")
     try:
         d_pend = json.loads(a_pend.recv(65536).decode())["result"]
     except Exception:
@@ -215,8 +229,8 @@ def main():
     out = nft_grants()
     table_exists = subprocess.run(["nft", "list", "table", "inet", "gatekeeper"],
                                   capture_output=True, text=True).returncode == 0
-    if ("192.0.2.10" in out or "192.0.2.11" in out) or not table_exists or r.returncode != 0:
-        fails.append(f"S6 stop.grants: leftover={out[:80]} table={table_exists} rc={r.returncode}")
+    if ("192.0.2.10" in out or "192.0.2.11" in out) or not table_exists or "error" in r:
+        fails.append(f"S6 stop.grants: leftover={out[:80]} table={table_exists} resp={r}")
     if len(approved_gids) != 2:
         fails.append(f"S6 only {len(approved_gids)} grants confirmed approved before stop")
     if d_pend.get("reason_code") != "human_denied" or "stopped" not in (d_pend.get("note") or ""):
@@ -229,7 +243,7 @@ def main():
     a7 = request("r7", {"dst_ip": "192.0.2.33", "dst_port": {"from": 443, "to": 443}, "proto": "tcp",
                         "reason": "idempotency", "tool": "t", "ttl_requested": "300s"})
     g7 = new_gid()
-    scopeadm("approve", g7)
+    admin_rpc("approve", {"grant_id": str(g7)})
     a7.settimeout(5)
     d7 = json.loads(a7.recv(65536).decode())["result"]
 
@@ -245,7 +259,7 @@ def main():
         fails.append(f"S7 replay-active: {r7b} pops={pops7 - base7}")
 
     # revoke, then replay -> denied/grant_expired with guidance to use a new id
-    scopeadm("revoke", d7["grant_id"])
+    admin_rpc("revoke", {"grant_id": str(d7["grant_id"])})
     time.sleep(0.3)
     a7c = request("r7", {"dst_ip": "192.0.2.33", "dst_port": {"from": 443, "to": 443}, "proto": "tcp",
                          "reason": "retry after revoke", "tool": "t", "ttl_requested": "300s"})
@@ -263,11 +277,7 @@ def main():
 
     # S8: list.history — decided rows only, newest first; state filter + limit
     # + client-error validation all ride the admin socket.
-    import re
-    def rpc_out(proc):
-        m = re.search(r"\{.*\}", proc.stdout, re.S)
-        return json.loads(m.group(0)) if m else {}
-    hist = rpc_out(scopeadm("history", "--limit", "100"))
+    hist = admin_rpc("list.history", {"limit": 100})
     rows = hist.get("result") or []
     states = [x["state"] for x in rows]
     ids = [int(x["id"]) for x in rows]
@@ -281,10 +291,10 @@ def main():
     # at least the deny+revoke terminals must be represented
     if "denied" not in states or "revoked" not in states:
         fails.append(f"S8 missing terminal states: {sorted(set(states))}")
-    rows2 = rpc_out(scopeadm("history", "--state", "denied")).get("result") or []
+    rows2 = admin_rpc("list.history", {"state": "denied"}).get("result") or []
     if not rows2 or any(x["state"] != "denied" for x in rows2):
         fails.append(f"S8 state filter broken: {[x.get('state') for x in rows2]}")
-    rows3 = rpc_out(scopeadm("history", "--limit", "1")).get("result") or []
+    rows3 = admin_rpc("list.history", {"limit": 1}).get("result") or []
     if len(rows3) != 1 or int(rows3[0]["id"]) != ids[0]:
         fails.append(f"S8 limit keeps wrong end: {rows3}")
     print("S8 history:", "ok" if "S8" not in str(fails) else fails[-1])
@@ -317,12 +327,12 @@ def main():
     if not g9:
         fails.append("S9 popup missing created_at (or no popup)")
 
-    pends = rpc_out(scopeadm("pendings")).get("result") or []
+    pends = admin_rpc("list.pending").get("result") or []
     mine = [p for p in pends if p["id"] == int(g9)] if g9 else []
     if len(mine) != 1 or mine[0].get("waiting") is not True:
         fails.append(f"S9 list.pending snapshot wrong: {mine}")
 
-    scopeadm("deny", g9, "--note", "contract test")
+    admin_rpc("deny", {"grant_id": str(g9), "note": "contract test"})
     try:
         a9.settimeout(5); a9.recv(65536)
     except Exception:
