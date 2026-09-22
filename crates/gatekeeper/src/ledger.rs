@@ -6,69 +6,12 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use gk_core::types::Proto;
 use rusqlite::{params, Connection};
-use serde::{Deserialize, Serialize};
+
 use tokio::sync::mpsc;
 
-/// Grant states. Wire/DB spelling is snake_case.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum GrantState {
-    Pending,
-    Approved,
-    Denied,
-    /// Kernel TTL reaped the element.
-    Expired,
-    /// Operator kill (revoke / stop.grants).
-    Revoked,
-}
-
-impl GrantState {
-    /// The snake_case spelling is declared once (serde rename_all); these are
-    /// thin alloc-free views of it. A drift test pins both directions.
-    pub(crate) fn as_str(self) -> &'static str {
-        match self {
-            GrantState::Pending => "pending",
-            GrantState::Approved => "approved",
-            GrantState::Denied => "denied",
-            GrantState::Expired => "expired",
-            GrantState::Revoked => "revoked",
-        }
-    }
-    pub(crate) fn parse(s: &str) -> Option<Self> {
-        serde_json::from_value::<GrantState>(serde_json::Value::String(s.to_string())).ok()
-    }
-}
-
-/// Why a grant was denied. Unknown codes load as `Unknown` rather than dropping the row.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum DenyCode {
-    HumanDenied,
-    ApproverOffline,
-    ApproverTimeout,
-    InstallFailed,
-    RestartOrphan,
-    /// Boot reconcile found an approved row with no live attributed element.
-    /// Alias keeps rows written by the pre-kebab spelling loadable.
-    #[serde(alias = "restart-reconcile")]
-    RestartReconcile,
-    #[serde(untagged)]
-    Unknown(String),
-}
-
-impl DenyCode {
-    /// Wire/DB spelling comes from serde alone (snake_case); Unknown carries
-    /// its original string through untouched.
-    fn as_str(&self) -> String {
-        match self {
-            DenyCode::Unknown(s) => s.clone(),
-            known => serde_json::to_value(known)
-                .ok()
-                .and_then(|v| v.as_str().map(String::from))
-                .unwrap_or_else(|| "unknown".into()),
-        }
-    }
-}
+/// Ledger/wire vocabulary types live in gk-core (shared verbatim with gk-tui
+/// over admin.sock); re-exported so daemon code says `crate::ledger::…`.
+pub use gk_core::wire::{DenyCode, GrantRow, GrantState};
 
 /// New request. State, expiry, and verdict are filled in later.
 #[derive(Clone, Debug)]
@@ -83,28 +26,6 @@ pub struct NewGrant {
     pub tool: String,
     pub ttl_secs: u64,
     pub created_at: u64,
-}
-
-/// Loaded ledger row.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct GrantRow {
-    pub id: i64,
-    pub idem_key: Option<String>,
-    pub target: String,
-    /// installed destinations (post-resolution), as JSON array of strings
-    pub dst_json: String,
-    pub port_from: u16,
-    pub port_to: u16,
-    pub proto: Proto,
-    pub reason: String,
-    pub tool: String,
-    pub ttl_secs: u64,
-    pub granted_ttl_secs: Option<u64>,
-    pub state: GrantState,
-    pub created_at: u64,
-    pub expires_at: Option<f64>, // unix seconds
-    pub deny_code: Option<DenyCode>,
-    pub note: Option<String>,
 }
 
 /// State transition. Origin and payload are enforced in SQL.

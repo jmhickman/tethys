@@ -181,6 +181,69 @@ pub struct GrantStat {
     pub bytes_received: u64,
 }
 
+// ------------------------------------------------------- admin event payloads
+// One struct per broadcast so producer (daemon emit()) and consumer (gk-tui)
+// share a compile-checked contract instead of agreeing on string keys.
+
+/// `grant.request.new` — a request awaits human decision.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct EvRequestNew {
+    pub grant_id: String,
+    pub target: String,
+    pub dst_port: PortSpec,
+    pub proto: Proto,
+    pub reason: String,
+    pub tool: String,
+    pub ttl_requested: String,
+    /// lets a reconnecting TUI render honest "waiting m:ss"
+    pub created_at: u64,
+}
+
+/// `grant.decided` — a row left pending/approved. grant_id absent on the
+/// stop.grants broadcast (state == "all_stopped").
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct EvDecided {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grant_id: Option<String>,
+    pub state: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason_code: Option<DenyReason>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<Option<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ttl_granted: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grants_removed: Option<usize>,
+}
+
+/// `grant.expired` — kernel TTL reaped the element.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct EvExpired {
+    pub grant_id: String,
+}
+
+/// `traffic.stat` batch.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct EvTraffic {
+    pub grants: Vec<GrantStat>,
+}
+
+/// `gk.error`.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct EvError {
+    pub message: String,
+}
+
+/// `subscribe` ack.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct SubscribeAck {
+    pub events: Vec<String>,
+    pub approver_timeout_secs: u64,
+    pub version: String,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

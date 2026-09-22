@@ -513,24 +513,24 @@ fn draw_history_modal(f: &mut Frame, app: &App) {
         .iter()
         .enumerate()
         .map(|(i, g)| {
-            let state = g["state"].as_str().unwrap_or("?");
-            let color = match state {
-                "denied" => Color::Red,
-                "revoked" => Color::LightMagenta,
-                "expired" => Color::DarkGray,
+            use gk_core::wire::GrantState;
+            let state = g.state.as_str();
+            let color = match g.state {
+                GrantState::Denied => Color::Red,
+                GrantState::Revoked => Color::LightMagenta,
+                GrantState::Expired => Color::DarkGray,
                 _ => Color::Green,
             };
-            let id = g["id"].as_i64().unwrap_or(0);
-            let extra = match state {
-                "denied" => format!(
+            let extra = match g.state {
+                GrantState::Denied => format!(
                     "{} {}",
-                    g["deny_code"].as_str().unwrap_or(""),
-                    g["note"].as_str().unwrap_or("")
+                    g.deny_code.as_ref().map(|c| c.as_str()).unwrap_or_default(),
+                    g.note.clone().unwrap_or_default()
                 ),
-                _ => g["target"].as_str().unwrap_or("").to_string(),
+                _ => g.target.clone(),
             };
             let line = Line::from(vec![
-                Span::styled(format!("{id:>4} "), muted(true)),
+                Span::styled(format!("{:>4} ", g.id), muted(true)),
                 Span::styled(format!("{state:<8}"), Style::default().fg(color)),
                 Span::raw(extra),
             ]);

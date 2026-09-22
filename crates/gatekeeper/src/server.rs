@@ -20,6 +20,8 @@ use gk_core::nft::{
     GrantElem, NftCli,
 };
 use gk_core::protocol::*;
+use gk_core::wire::PendingRowWire;
+use serde::Serialize;
 use gk_core::types::{fmt_ttl, parse_ttl, PortSpec, Proto, SpecError, Target};
 
 use crate::ledger::{now_secs, ttl_expires, Decide, DenyCode, GrantRow, GrantState, Ledger, NewGrant};
@@ -100,7 +102,7 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
                 if !expired.is_empty() {
                     for id in &expired {
                         st.ledger.decide(*id, Decide::ExpireByKernel).await;
-                        emit(&st, method::EV_EXPIRED, serde_json::json!({"grant_id": id.to_string()}));
+                        emit(&st, method::EV_EXPIRED, EvExpired { grant_id: id.to_string() });
                     }
                     // kernel already reaped the elements (TTL); now mirror the
                     // ledger into accounting chains and drop dead objects.
@@ -183,7 +185,7 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
                     stats.push(stat);
                 }
                 seen.retain(|gid, _| rows.iter().any(|g| g.id == *gid));
-                emit(&st, method::EV_TRAFFIC, serde_json::json!({ "grants": stats }));
+                emit(&st, method::EV_TRAFFIC, EvTraffic { grants: stats });
             }
         });
     }
@@ -392,17 +394,17 @@ fn dispatch_access(
         emit(
             &st,
             method::EV_REQUEST_NEW,
-            serde_json::json!({
-                "grant_id": gid.to_string(),
-                "target": popup_target,
-                "dst_port": params.dst_port,
-                "proto": params.proto,
-                "reason": reason,
-                "tool": tool,
-                // created_at lets a reconnecting TUI render honest "waiting m:ss"
-                "ttl_requested": params.ttl_requested,
-                "created_at": now_secs(),
-            }),
+            // created_at lets a reconnecting TUI render honest "waiting m:ss"
+            EvRequestNew {
+                grant_id: gid.to_string(),
+                target: popup_target,
+                dst_port: params.dst_port,
+                proto: params.proto,
+                reason,
+                tool,
+                ttl_requested: params.ttl_requested,
+                created_at: now_secs(),
+            },
         );
 
         let verdict = match tokio::time::timeout(
@@ -432,7 +434,19 @@ fn dispatch_access(
                             tracing::warn!(gid, %e, "acct rebuild failed (stats degraded only)");
                         }
                         st.ledger.audit("approved", gid, format!("{eff:?}"));
-                        emit(&st, method::EV_DECIDED, serde_json::json!({ "grant_id": gid.to_string(), "state": "approved", "ttl_granted": fmt_ttl(granted), "expires_at": fmt_unix(exp), }));
+                        emit(
+                            &st,
+                            method::EV_DECIDED,
+                            EvDecided {
+                                grant_id: Some(gid.to_string()),
+                                state: "approved".into(),
+                                reason_code: None,
+                                note: None,
+                                ttl_granted: Some(fmt_ttl(granted)),
+                                expires_at: Some(fmt_unix(exp)),
+                                grants_removed: None,
+                            },
+                        );
                         Verdict::Approved {
                             grant_id: gid.to_string(),
                             effective: eff,
@@ -475,7 +489,19 @@ fn dispatch_access(
         let resp = RpcResponse::ok(&id, &verdict);
         // Notify TUI for every verdict that has a row. Offline denies have neither.
         if let Verdict::Denied { grant_id: Some(gid), reason_code, note } = &verdict {
-            emit(&st, method::EV_DECIDED, serde_json::json!({ "grant_id": gid, "state": "denied", "reason_code": reason_code, "note": note, }));
+            emit(
+                &st,
+                method::EV_DECIDED,
+                EvDecided {
+                    grant_id: Some(gid.clone()),
+                    state: "denied".into(),
+                    reason_code: Some(*reason_code),
+                    note: Some(note.clone()),
+                    ttl_granted: None,
+                    expires_at: None,
+                    grants_removed: None,
+                },
+            );
         }
         respond(resp_line(&resp));
     });
@@ -841,13 +867,11 @@ async fn handle_admin_cmd(req: &RpcRequest, st: &Arc<State>) -> RpcResponse {
             // Snapshot for TUI reconnect. Only rows with a live decision channel are decidable.
             let rows = st.ledger.list(GrantState::Pending).await;
             let live = st.pending.lock().await;
-            let out: Vec<serde_json::Value> = rows
+            let out: Vec<PendingRowWire> = rows
                 .into_iter()
-                .filter_map(|r| {
-                    serde_json::to_value(&r).ok().map(|mut v| {
-                        v["waiting"] = serde_json::json!(live.contains_key(&r.id));
-                        v
-                    })
+                .map(|r| {
+                    let waiting = live.contains_key(&r.id);
+                    PendingRowWire { row: r, waiting }
                 })
                 .collect();
             RpcResponse::ok(&req.id, out)
@@ -935,20 +959,34 @@ async fn handle_admin_cmd(req: &RpcRequest, st: &Arc<State>) -> RpcResponse {
             for g in &rows {
                 sweep_grant_objs(st, g.id).await;
             }
-            emit(st, method::EV_DECIDED, serde_json::json!({"state": "all_stopped", "grants_removed": n}));
+            emit(
+                st,
+                method::EV_DECIDED,
+                EvDecided {
+                    grant_id: None,
+                    state: "all_stopped".into(),
+                    reason_code: None,
+                    note: None,
+                    ttl_granted: None,
+                    expires_at: None,
+                    grants_removed: Some(n),
+                },
+            );
             RpcResponse::ok(&req.id, serde_json::json!({"revoked": n}))
         }
         method::SUBSCRIBE => RpcResponse::ok(
             &req.id,
-            serde_json::json!({
-                "events": [
+            SubscribeAck {
+                events: [
                     method::EV_REQUEST_NEW, method::EV_DECIDED,
                     method::EV_EXPIRED, method::EV_TRAFFIC, method::EV_ERROR
-                ],
+                ]
+                .map(String::from)
+                .to_vec(),
                 // TUI countdown needs the timeout; version detects daemon skew.
-                "approver_timeout_secs": st.cfg.approver_timeout_secs,
-                "version": env!("CARGO_PKG_VERSION"),
-            }),
+                approver_timeout_secs: st.cfg.approver_timeout_secs,
+                version: env!("CARGO_PKG_VERSION").into(),
+            },
         ),
         _ => RpcResponse::err(&req.id, -32601, "unknown method"),
     }
@@ -988,7 +1026,19 @@ async fn revoke(st: &Arc<State>, gid: i64) {
         tracing::warn!(gid, %e, "acct rebuild after revoke failed");
     }
     sweep_grant_objs(st, gid).await;
-    emit(st, method::EV_DECIDED, serde_json::json!({"grant_id": gid.to_string(), "state": "revoked"}));
+    emit(
+        st,
+        method::EV_DECIDED,
+        EvDecided {
+            grant_id: Some(gid.to_string()),
+            state: "revoked".into(),
+            reason_code: None,
+            note: None,
+            ttl_granted: None,
+            expires_at: None,
+            grants_removed: None,
+        },
+    );
 }
 
 // ------------------------------------------------------------------- helpers
@@ -1106,7 +1156,14 @@ fn parse_id_ttl(req: &RpcRequest) -> Option<(i64, Option<u64>)> {
 
 /// Broadcast one event to connected approvers. Serialization failure is
 /// logged and the event dropped — a daemon never panics on the wire.
-fn emit(st: &State, method: &str, params: serde_json::Value) {
+fn emit(st: &State, method: &str, params: impl Serialize) {
+    let params = match serde_json::to_value(params) {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::error!(%e, method, "event serialization failed; dropped");
+            return;
+        }
+    };
     let mut o = match serde_json::to_value(RpcRequest {
         jsonrpc: JsonRpcVersion::V2_0,
         id: String::new(),

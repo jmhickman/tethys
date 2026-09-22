@@ -4,7 +4,9 @@ use std::collections::BTreeMap;
 
 use serde_json::Value;
 
-use gk_core::protocol::method;
+use gk_core::protocol::{method, EvDecided, EvError, EvExpired, EvRequestNew, EvTraffic, SubscribeAck};
+use gk_core::types::PortSpec;
+use gk_core::wire::{GrantRow, PendingRowWire};
 
 use crate::conn::{cmd, Cmd};
 
@@ -93,7 +95,7 @@ pub enum Modal {
 pub struct App {
     pub live: BTreeMap<i64, LiveRow>,
     pub pending: BTreeMap<i64, PendingRow>,
-    pub history: Vec<Value>,
+    pub history: Vec<GrantRow>,
     pub history_err: Option<String>,
 
     pub modal: Modal,
@@ -205,151 +207,169 @@ impl App {
     }
 
     fn on_event(&mut self, m: &str, p: Value, out: &mut Vec<Cmd>) {
+        // One typed deserialize per event; a payload that fails to parse is a
+        // contract violation and gets flashed, not silently half-applied.
+        let bad = |e: serde_json::Error| format!("daemon sent bad {m} payload: {e}");
         match m {
-            method::EV_REQUEST_NEW => {
-                let id = p["grant_id"].as_str().and_then(|s| s.parse().ok());
-                if let Some(id) = id {
-                    if !self.pending.contains_key(&id) {
-                        self.pending.insert(
-                            id,
-                            PendingRow {
-                                target: p["target"].as_str().unwrap_or("?").into(),
-                                ports: fmt_ports(&p["dst_port"], &p["proto"]),
-                                reason: p["reason"].as_str().unwrap_or("").into(),
-                                tool: p["tool"].as_str().unwrap_or("").into(),
-                                ttl_requested: p["ttl_requested"].as_str().unwrap_or("").into(),
-                                created_at: p["created_at"].as_u64().unwrap_or(self.now),
-                            },
-                        );
-                    }
+            method::EV_REQUEST_NEW => match serde_json::from_value::<EvRequestNew>(p) {
+                Ok(ev) => {
+                    let Ok(id) = ev.grant_id.parse::<i64>() else { return };
+                    self.pending.entry(id).or_insert_with(|| PendingRow {
+                        target: ev.target,
+                        ports: fmt_ports(&ev.dst_port, ev.proto),
+                        reason: ev.reason,
+                        tool: ev.tool,
+                        ttl_requested: ev.ttl_requested,
+                        created_at: ev.created_at,
+                    });
                     if matches!(self.modal, Modal::None | Modal::Detail(_)) {
                         self.modal = Modal::Pending(0);
                         self.deny_note = None;
                         self.ttl_edit = None;
                     }
                 }
-            }
-            method::EV_DECIDED => {
-                if let Some(gid) = p["grant_id"].as_str().and_then(|s| s.parse::<i64>().ok()) {
-                    self.pending.remove(&gid);
-                    self.live.remove(&gid);
-                    out.push(cmd("c-live", method::LIST_GRANTS, None));
-                    out.push(cmd("c-pend", method::LIST_PENDING, None));
-                    if self.modal == Modal::Pending(0) && self.pending.is_empty() {
+                Err(e) => self.set_flash(bad(e)),
+            },
+            method::EV_DECIDED => match serde_json::from_value::<EvDecided>(p) {
+                Ok(ev) => {
+                    if let Some(gid) =
+                        ev.grant_id.as_deref().and_then(|s| s.parse::<i64>().ok())
+                    {
+                        self.pending.remove(&gid);
+                        self.live.remove(&gid);
+                        out.push(cmd("c-live", method::LIST_GRANTS, None));
+                        out.push(cmd("c-pend", method::LIST_PENDING, None));
+                        if self.modal == Modal::Pending(0) && self.pending.is_empty() {
+                            self.modal = Modal::None;
+                        }
+                    }
+                    // stop.grants broadcast: no grant_id
+                    if ev.state == "all_stopped" {
+                        self.live.clear();
+                        self.pending.clear();
                         self.modal = Modal::None;
+                        let n = ev.grants_removed.unwrap_or(0);
+                        self.set_flash(format!("stop.grants: {n} grants removed"));
                     }
                 }
-                // stop.grants broadcast: no grant_id
-                if p["state"].as_str() == Some("all_stopped") {
-                    self.live.clear();
-                    self.pending.clear();
-                    self.modal = Modal::None;
-                    let n = p["grants_removed"].as_u64().unwrap_or(0);
-                    self.set_flash(format!("stop.grants: {n} grants removed"));
-                }
-            }
-            method::EV_EXPIRED => {
-                if let Some(gid) = p["grant_id"].as_str().and_then(|s| s.parse::<i64>().ok()) {
-                    self.live.remove(&gid);
-                }
-            }
-            method::EV_TRAFFIC => {
-                for g in p["grants"].as_array().into_iter().flatten() {
-                    let Some(id) = g["grant_id"].as_str().and_then(|s| s.parse::<i64>().ok())
-                    else {
-                        continue;
-                    };
-                    if let Some(row) = self.live.get_mut(&id) {
-                        row.left = g["seconds_remaining"].as_u64();
-                        row.bytes_up = g["bytes_sent"].as_u64();
-                        row.bytes_down = g["bytes_received"].as_u64();
+                Err(e) => self.set_flash(bad(e)),
+            },
+            method::EV_EXPIRED => match serde_json::from_value::<EvExpired>(p) {
+                Ok(ev) => {
+                    if let Ok(gid) = ev.grant_id.parse::<i64>() {
+                        self.live.remove(&gid);
                     }
                 }
-            }
-            method::EV_ERROR => {
-                self.set_flash(format!("daemon: {}", p["message"].as_str().unwrap_or("?")));
-            }
+                Err(e) => self.set_flash(bad(e)),
+            },
+            method::EV_TRAFFIC => match serde_json::from_value::<EvTraffic>(p) {
+                Ok(ev) => {
+                    for g in ev.grants {
+                        let Ok(id) = g.grant_id.parse::<i64>() else { continue };
+                        if let Some(row) = self.live.get_mut(&id) {
+                            row.left = Some(g.seconds_remaining);
+                            row.bytes_up = Some(g.bytes_sent);
+                            row.bytes_down = Some(g.bytes_received);
+                        }
+                    }
+                }
+                Err(e) => self.set_flash(bad(e)),
+            },
+            method::EV_ERROR => match serde_json::from_value::<EvError>(p) {
+                Ok(ev) => self.set_flash(format!("daemon: {}", ev.message)),
+                Err(e) => self.set_flash(bad(e)),
+            },
             _ => {}
         }
     }
 
     fn on_response(&mut self, v: &Value, _out: &mut Vec<Cmd>) {
+        // typed deserialize per response id; errors flash rather than silently
+        // leaving stale state rendered as fresh
+        let err_msg = |d: &Value| d["error"]["message"].as_str().unwrap_or("daemon error").to_string();
         match v.get("id").and_then(|i| i.as_str()).unwrap_or("") {
-            "c-sub" => {
-                let r = &v["result"];
-                self.timeout_secs = r["approver_timeout_secs"].as_u64();
-                self.daemon_version = r["version"].as_str().map(String::from);
-            }
+            "c-sub" => match serde_json::from_value::<SubscribeAck>(v["result"].clone()) {
+                Ok(ack) => {
+                    self.timeout_secs = Some(ack.approver_timeout_secs);
+                    self.daemon_version = Some(ack.version);
+                }
+                Err(e) => self.set_flash(format!("bad subscribe ack: {e}")),
+            },
             "c-live" => {
                 if v.get("error").is_some() {
                     return;
                 }
-                let mut fresh = BTreeMap::new();
-                for g in v["result"].as_array().into_iter().flatten() {
-                    if let Some(row) = live_from_row(g) {
-                        // preserve kernel stats we already have for this id
-                        fresh.insert(
-                            row.id,
-                            match self.live.get(&row.id) {
-                                Some(old) => LiveRow {
-                                    left: old.left,
-                                    bytes_up: old.bytes_up,
-                                    bytes_down: old.bytes_down,
-                                    ..row
+                match serde_json::from_value::<Vec<GrantRow>>(v["result"].clone()) {
+                    Ok(rows) => {
+                        let mut fresh = BTreeMap::new();
+                        for row in rows.iter().filter_map(live_from_row) {
+                            // preserve kernel stats we already have for this id
+                            fresh.insert(
+                                row.id,
+                                match self.live.get(&row.id) {
+                                    Some(old) => LiveRow {
+                                        left: old.left,
+                                        bytes_up: old.bytes_up,
+                                        bytes_down: old.bytes_down,
+                                        ..row.clone()
+                                    },
+                                    None => row,
                                 },
-                                None => row,
-                            },
-                        );
+                            );
+                        }
+                        self.live = fresh;
+                        self.clamp_sel();
                     }
+                    Err(e) => self.set_flash(format!("bad list.grants payload: {e}")),
                 }
-                self.live = fresh;
-                self.clamp_sel();
             }
             "c-pend" => {
                 if v.get("error").is_some() {
                     return;
                 }
-                let mut fresh = BTreeMap::new();
-                for g in v["result"].as_array().into_iter().flatten() {
-                    // only rows with a live decision channel are actionable
-                    if g["waiting"].as_bool() != Some(true) {
-                        continue;
+                match serde_json::from_value::<Vec<PendingRowWire>>(v["result"].clone()) {
+                    Ok(rows) => {
+                        let mut fresh = BTreeMap::new();
+                        for pr in rows {
+                            // only rows with a live decision channel are actionable
+                            if !pr.waiting {
+                                continue;
+                            }
+                            fresh.insert(
+                                pr.row.id,
+                                PendingRow {
+                                    target: pr.row.target,
+                                    ports: fmt_ports(
+                                        &PortSpec { from: pr.row.port_from, to: pr.row.port_to },
+                                        pr.row.proto,
+                                    ),
+                                    reason: pr.row.reason,
+                                    tool: pr.row.tool,
+                                    ttl_requested: fmt_ttl_secs(pr.row.ttl_secs),
+                                    created_at: pr.row.created_at,
+                                },
+                            );
+                        }
+                        self.pending = fresh;
+                        // resync landing while the queue is empty should close a stale modal
+                        if matches!(self.modal, Modal::Pending(_)) && self.pending.is_empty() {
+                            self.modal = Modal::None;
+                        }
+                        if matches!(self.modal, Modal::None) && !self.pending.is_empty() {
+                            self.modal = Modal::Pending(0);
+                        }
                     }
-                    let id = match g["id"].as_i64() {
-                        Some(i) => i,
-                        None => continue,
-                    };
-                    fresh.insert(
-                        id,
-                        PendingRow {
-                            target: g["target"].as_str().unwrap_or("?").into(),
-                            ports: fmt_ports_flat(&g["port_from"], &g["port_to"], &g["proto"]),
-                            reason: g["reason"].as_str().unwrap_or("").into(),
-                            tool: g["tool"].as_str().unwrap_or("").into(),
-                            ttl_requested: fmt_ttl_secs(g["ttl_secs"].as_u64().unwrap_or(0)),
-                            created_at: g["created_at"].as_u64().unwrap_or(self.now),
-                        },
-                    );
-                }
-                self.pending = fresh;
-                // resync landing while the queue is empty should close a stale modal
-                if matches!(self.modal, Modal::Pending(_)) && self.pending.is_empty() {
-                    self.modal = Modal::None;
-                }
-                if matches!(self.modal, Modal::None) && !self.pending.is_empty() {
-                    self.modal = Modal::Pending(0);
+                    Err(e) => self.set_flash(format!("bad list.pending payload: {e}")),
                 }
             }
             "c-hist" => {
-                match v.get("result").and_then(|r| r.as_array()) {
-                    Some(rows) => {
-                        self.history = rows.clone();
+                match serde_json::from_value::<Vec<GrantRow>>(v["result"].clone()) {
+                    Ok(rows) if v.get("error").is_none() => {
+                        self.history = rows;
                         self.history_err = None;
                     }
-                    None => {
-                        self.history_err = Some(
-                            v["error"]["message"].as_str().unwrap_or("history failed").to_string(),
-                        );
+                    _ => {
+                        self.history_err = Some(err_msg(v));
                     }
                 }
             }
@@ -434,29 +454,21 @@ impl App {
 
 // ------------------------------------------------------------------ format
 
-fn fmt_ports(spec: &Value, proto: &Value) -> String {
-    let p = proto.as_str().unwrap_or("tcp");
-    if let (Some(f), Some(t)) = (spec["from"].as_u64(), spec["to"].as_u64()) {
-        if f == 0 && t == 0 {
-            format!("* /{p}")
-        } else if f == t {
-            format!("{f}/{p}")
-        } else {
-            format!("{f}-{t}/{p}")
-        }
+pub fn port_text(from: u16, to: u16) -> String {
+    if from == 0 && to == 0 {
+        "*".into()
+    } else if from == to {
+        from.to_string()
     } else {
-        format!("?/{p}")
+        format!("{from}-{to}")
     }
 }
 
-/// list.pending rows carry flat port_from/port_to instead of a dst_port object.
-fn fmt_ports_flat(from: &Value, to: &Value, proto: &Value) -> String {
-    let p = proto.as_str().unwrap_or("tcp");
-    match (from.as_u64(), to.as_u64()) {
-        (Some(f), Some(t)) if f == 0 && t == 0 => format!("* /{p}"),
-        (Some(f), Some(t)) if f == t => format!("{f}/{p}"),
-        (Some(f), Some(t)) => format!("{f}-{t}/{p}"),
-        _ => format!("?/{p}"),
+fn fmt_ports(spec: &PortSpec, proto: gk_core::types::Proto) -> String {
+    if spec.from == 0 && spec.to == 0 {
+        format!("* /{proto}")
+    } else {
+        format!("{}/{}", port_text(spec.from, spec.to), proto)
     }
 }
 
@@ -483,36 +495,18 @@ pub fn fmt_bytes(b: u64) -> String {
     }
 }
 
-/// list.grants row -> table row. dst_json is a JSON-array string in ledger
-/// rows (traffic.stat sends a real array; both shapes are accepted here).
-fn live_from_row(g: &Value) -> Option<LiveRow> {
-    let id = g["id"].as_i64()?;
-    let dst: Vec<String> = match &g["dst_json"] {
-        Value::String(s) => serde_json::from_str(s).unwrap_or_default(),
-        Value::Array(a) => a.iter().filter_map(|x| x.as_str().map(String::from)).collect(),
-        _ => Vec::new(),
-    };
-    let from = g["port_from"].as_u64()? as u16;
-    let to = g["port_to"].as_u64()? as u16;
-    let proto = g["proto"].as_str().unwrap_or("tcp").to_string();
+/// The wire row minus kernel stats (those arrive via traffic.stat).
+fn live_from_row(g: &GrantRow) -> Option<LiveRow> {
+    let dst: Vec<String> = serde_json::from_str(&g.dst_json).unwrap_or_default();
     Some(LiveRow {
-        id,
-        target: g["target"].as_str().unwrap_or("?").into(),
+        id: g.id,
+        target: g.target.clone(),
         dst,
-        ports: if from == 0 && to == 0 {
-            "*".into()
-        } else if from == to {
-            from.to_string()
-        } else {
-            format!("{from}-{to}")
-        },
-        proto,
-        ttl_secs: g["granted_ttl_secs"]
-            .as_u64()
-            .or_else(|| g["ttl_secs"].as_u64())
-            .unwrap_or(0),
-        reason: g["reason"].as_str().unwrap_or("").into(),
-        tool: g["tool"].as_str().unwrap_or("").into(),
+        ports: port_text(g.port_from, g.port_to),
+        proto: g.proto.to_string(),
+        ttl_secs: g.granted_ttl_secs.unwrap_or(g.ttl_secs),
+        reason: g.reason.clone(),
+        tool: g.tool.clone(),
         left: None,
         bytes_up: None,
         bytes_down: None,
