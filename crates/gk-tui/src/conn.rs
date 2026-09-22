@@ -21,7 +21,11 @@ pub struct Cmd {
 }
 
 pub fn cmd(id: impl Into<String>, method: &'static str, params: Option<Value>) -> Cmd {
-    Cmd { id: id.into(), method, params }
+    Cmd {
+        id: id.into(),
+        method,
+        params,
+    }
 }
 
 /// Liveness as seen by the UI. `up` flips false on any socket error; the
@@ -43,7 +47,10 @@ pub fn spawn(
 ) {
     let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel::<Cmd>();
     let (ev_tx, ev_rx) = mpsc::unbounded_channel::<Value>();
-    let (st_tx, st_rx) = watch::channel(ConnStatus { up: false, synced: false });
+    let (st_tx, st_rx) = watch::channel(ConnStatus {
+        up: false,
+        synced: false,
+    });
 
     tokio::spawn(async move {
         loop {
@@ -63,7 +70,12 @@ pub fn spawn(
                             break;
                         }
                     }
-                    st_tx.send(ConnStatus { up: true, synced: false }).ok();
+                    st_tx
+                        .send(ConnStatus {
+                            up: true,
+                            synced: false,
+                        })
+                        .ok();
 
                     loop {
                         tokio::select! {
@@ -100,7 +112,12 @@ pub fn spawn(
                     }
                 }
                 Err(_) => {
-                    st_tx.send(ConnStatus { up: false, synced: false }).ok();
+                    st_tx
+                        .send(ConnStatus {
+                            up: false,
+                            synced: false,
+                        })
+                        .ok();
                     tokio::time::sleep(std::time::Duration::from_secs(2)).await;
                 }
             }
@@ -117,5 +134,6 @@ async fn write_req(w: &mut tokio::net::unix::OwnedWriteHalf, c: &Cmd) -> std::io
         method: c.method.into(),
         params: c.params.clone(),
     };
-    w.write_all(format!("{}\n", serde_json::to_string(&r)?).as_bytes()).await
+    w.write_all(format!("{}\n", serde_json::to_string(&r)?).as_bytes())
+        .await
 }

@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::types::{PortSpec, Proto};
+use crate::wire::GrantState;
 
 /// JSON-RPC 2.0 request envelope (client -> server).
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -90,8 +91,67 @@ pub mod method {
     pub const EV_REQUEST_NEW: &str = "grant.request.new";
     pub const EV_DECIDED: &str = "grant.decided";
     pub const EV_EXPIRED: &str = "grant.expired";
+    /// Emergency stop swept N grants; not a per-grant decision.
+    pub const EV_STOPPED: &str = "grants.stopped";
     pub const EV_TRAFFIC: &str = "traffic.stat";
     pub const EV_ERROR: &str = "gk.error";
+}
+
+// --------------------------------------------------------- admin.sock params
+// Typed shapes for the commands the TUI sends. grant_id goes over the wire as
+// a string; the lenient deserializer also accepts a JSON number so a
+// hand-rolled `echo` on the socket works.
+
+pub mod admin {
+    use super::*;
+
+    fn de_grant_id<'de, D>(d: D) -> Result<i64, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        use serde::de::Error;
+        match Value::deserialize(d)? {
+            Value::String(s) => s.parse::<i64>().map_err(D::Error::custom),
+            Value::Number(n) => n
+                .as_i64()
+                .ok_or_else(|| D::Error::custom("grant_id out of range")),
+            _ => Err(D::Error::custom("grant_id must be a string or integer")),
+        }
+    }
+
+    /// params of `approve`
+    #[derive(Deserialize, Debug)]
+    pub struct Approve {
+        #[serde(deserialize_with = "de_grant_id")]
+        pub grant_id: i64,
+        #[serde(default)]
+        pub ttl_secs: Option<u64>,
+    }
+
+    /// params of `deny`
+    #[derive(Deserialize, Debug)]
+    pub struct Deny {
+        #[serde(deserialize_with = "de_grant_id")]
+        pub grant_id: i64,
+        #[serde(default)]
+        pub note: Option<String>,
+    }
+
+    /// params of `revoke`
+    #[derive(Deserialize, Debug)]
+    pub struct GrantId {
+        #[serde(deserialize_with = "de_grant_id")]
+        pub grant_id: i64,
+    }
+
+    /// params of `list.history` (absent params = no filter, default page)
+    #[derive(Deserialize, Debug, Default)]
+    pub struct History {
+        #[serde(default)]
+        pub state: Option<GrantState>,
+        #[serde(default)]
+        pub limit: Option<u32>,
+    }
 }
 
 /// params of `access.request` (MCP -> gatekeeper). Exactly one target field.
@@ -199,23 +259,34 @@ pub struct EvRequestNew {
     pub created_at: u64,
 }
 
-/// `grant.decided` — a row left pending/approved. grant_id absent on the
-/// stop.grants broadcast (state == "all_stopped").
+/// `grant.decided` — a row left pending/approved. Internally tagged on
+/// `state`, so each decision carries exactly its own fields: no String state,
+/// no nullable soup, and no `Option<Option<String>>` around `note` (that was
+/// a serde artifact of sharing one struct with the stop broadcast — which is
+/// now its own event, [`EvStopped`], on its own method).
 #[derive(Serialize, Deserialize, Clone, Debug)]
-pub struct EvDecided {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub grant_id: Option<String>,
-    pub state: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub reason_code: Option<DenyReason>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub note: Option<Option<String>>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub ttl_granted: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub expires_at: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub grants_removed: Option<usize>,
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum EvDecided {
+    Approved {
+        grant_id: String,
+        ttl_granted: String,
+        expires_at: String,
+    },
+    Denied {
+        grant_id: String,
+        reason_code: DenyReason,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        note: Option<String>,
+    },
+    Revoked {
+        grant_id: String,
+    },
+}
+
+/// `grants.stopped` — stop.grants swept N grants. Not a per-grant decision.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct EvStopped {
+    pub grants_removed: usize,
 }
 
 /// `grant.expired` — kernel TTL reaped the element.
@@ -247,6 +318,71 @@ pub struct SubscribeAck {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ev_decided_is_typed_per_state() {
+        // internally tagged on `state`; each variant carries only its own fields
+        let a = EvDecided::Approved {
+            grant_id: "7".into(),
+            ttl_granted: "10m".into(),
+            expires_at: "2026-09-15T02:41:00Z".into(),
+        };
+        let j = serde_json::to_string(&a).unwrap();
+        assert!(j.contains("\"state\":\"approved\""));
+        assert!(!j.contains("reason_code") && !j.contains("grants_removed"));
+
+        let d = EvDecided::Denied {
+            grant_id: "8".into(),
+            reason_code: DenyReason::HumanDenied,
+            note: Some("out of scope".into()),
+        };
+        let j = serde_json::to_string(&d).unwrap();
+        assert!(j.contains("\"state\":\"denied\"") && j.contains("\"note\":\"out of scope\""));
+        // note is Option<String>: absent means absent, never a nested null
+        assert!(!j.contains("null"));
+
+        let r = EvDecided::Revoked {
+            grant_id: "9".into(),
+        };
+        let j = serde_json::to_string(&r).unwrap();
+        assert!(matches!(
+            serde_json::from_str::<EvDecided>(&j),
+            Ok(EvDecided::Revoked { .. })
+        ));
+
+        // stop broadcast is its own event with a required count
+        let s = serde_json::to_value(EvStopped { grants_removed: 3 }).unwrap();
+        assert_eq!(s["grants_removed"], 3);
+        assert!(serde_json::from_value::<EvStopped>(serde_json::json!({})).is_err());
+    }
+
+    #[test]
+    fn admin_params_are_typed() {
+        // grant_id as string (canonical) and as number (hand-rolled echo)
+        let a: admin::Approve =
+            serde_json::from_value(serde_json::json!({"grant_id": "42"})).unwrap();
+        assert_eq!((a.grant_id, a.ttl_secs), (42, None));
+        let a: admin::Approve =
+            serde_json::from_value(serde_json::json!({"grant_id": 7, "ttl_secs": 60})).unwrap();
+        assert_eq!((a.grant_id, a.ttl_secs), (7, Some(60)));
+        let d: admin::Deny =
+            serde_json::from_value(serde_json::json!({"grant_id": "3", "note": "no"})).unwrap();
+        assert_eq!((d.grant_id, d.note.as_deref()), (3, Some("no")));
+        assert!(
+            serde_json::from_value::<admin::GrantId>(serde_json::json!({"grant_id": "x"})).is_err()
+        );
+        // history: absent params default; typed state parse; bad state is an error
+        let h: admin::History = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert_eq!((h.state, h.limit), (None, None));
+        let h: admin::History =
+            serde_json::from_value(serde_json::json!({"state": "denied", "limit": 5})).unwrap();
+        assert!(matches!(h.state, Some(GrantState::Denied)));
+        assert!(
+            serde_json::from_value::<admin::History>(serde_json::json!({"state": "pending"}))
+                .map(|h| h.state)
+                .is_ok_and(|s| s == Some(GrantState::Pending))
+        );
+    }
 
     #[test]
     fn access_params_roundtrip() {

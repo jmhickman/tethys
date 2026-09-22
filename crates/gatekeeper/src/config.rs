@@ -93,7 +93,11 @@ impl Default for FileConfig {
 /// (target, port, proto) triple exactly like an access request carries it.
 pub fn parse_allow(
     s: &str,
-) -> anyhow::Result<(gk_core::types::Target, gk_core::types::PortSpec, gk_core::types::Proto)> {
+) -> anyhow::Result<(
+    gk_core::types::Target,
+    gk_core::types::PortSpec,
+    gk_core::types::Proto,
+)> {
     use gk_core::types::{PortSpec, Proto, Target};
     let s = s.trim();
     anyhow::ensure!(!s.is_empty(), "empty allow entry");
@@ -140,7 +144,9 @@ pub fn parse_allow(
         anyhow::ensure!(
             !target_s.is_empty()
                 && !target_s.contains(char::is_whitespace)
-                && target_s.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_')),
+                && target_s
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_')),
             "allow {s:?}: bad target {target_s:?}"
         );
         Target::Host(target_s.to_ascii_lowercase())
@@ -149,12 +155,17 @@ pub fn parse_allow(
     let port = if port.is_empty() {
         PortSpec { from: 0, to: 0 }
     } else if let Some((a, b)) = port.split_once('-') {
-        PortSpec { from: a.parse()?, to: b.parse()? }
+        PortSpec {
+            from: a.parse()?,
+            to: b.parse()?,
+        }
     } else {
         let p = port.parse::<u16>()?;
         PortSpec { from: p, to: p }
     };
-    let port = port.validate().map_err(|e| anyhow::anyhow!("allow {s:?}: {e}"))?;
+    let port = port
+        .validate()
+        .map_err(|e| anyhow::anyhow!("allow {s:?}: {e}"))?;
     Ok((target, port, proto))
 }
 

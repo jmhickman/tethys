@@ -19,7 +19,6 @@ use tokio::sync::mpsc;
 
 use app::{App, Modal, COLS};
 
-
 #[derive(Parser)]
 #[command(name = "gk-tui", about = "gatekeeper approver TUI")]
 struct Args {

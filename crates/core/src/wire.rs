@@ -7,8 +7,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::types::Proto;
 
-/// Grant states. Wire/DB spelling is snake_case (serde is the single
-/// spelling authority; `as_str` is an alloc-free view of it, pinned by test).
+/// Grant states. Wire/DB spelling is snake_case (serde is the authority);
+/// [`GrantState::ALL`] is the alloc-free spelling table behind `as_str`/`parse`,
+/// pinned against serde by test so the two cannot drift silently.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum GrantState {
@@ -22,17 +23,24 @@ pub enum GrantState {
 }
 
 impl GrantState {
+    /// Every state with its wire spelling. One table serves both directions.
+    pub const ALL: [(GrantState, &'static str); 5] = [
+        (GrantState::Pending, "pending"),
+        (GrantState::Approved, "approved"),
+        (GrantState::Denied, "denied"),
+        (GrantState::Expired, "expired"),
+        (GrantState::Revoked, "revoked"),
+    ];
+
     pub fn as_str(self) -> &'static str {
-        match self {
-            GrantState::Pending => "pending",
-            GrantState::Approved => "approved",
-            GrantState::Denied => "denied",
-            GrantState::Expired => "expired",
-            GrantState::Revoked => "revoked",
-        }
+        Self::ALL
+            .iter()
+            .find(|(s, _)| *s == self)
+            .map(|(_, n)| *n)
+            .unwrap()
     }
     pub fn parse(s: &str) -> Option<Self> {
-        serde_json::from_value::<GrantState>(serde_json::Value::String(s.to_string())).ok()
+        Self::ALL.iter().find(|(_, n)| *n == s).map(|(s, _)| *s)
     }
 }
 
@@ -55,15 +63,17 @@ pub enum DenyCode {
 }
 
 impl DenyCode {
-    /// Wire/DB spelling comes from serde alone (snake_case); Unknown carries
-    /// its original string through untouched.
-    pub fn as_str(&self) -> String {
+    /// Alloc-free DB/wire spelling: known variants are the snake_case names
+    /// serde emits (pinned by test); Unknown carries its original string.
+    pub fn as_str(&self) -> &str {
         match self {
-            DenyCode::Unknown(s) => s.clone(),
-            known => serde_json::to_value(known)
-                .ok()
-                .and_then(|v| v.as_str().map(String::from))
-                .unwrap_or_else(|| "unknown".into()),
+            DenyCode::HumanDenied => "human_denied",
+            DenyCode::ApproverOffline => "approver_offline",
+            DenyCode::ApproverTimeout => "approver_timeout",
+            DenyCode::InstallFailed => "install_failed",
+            DenyCode::RestartOrphan => "restart_orphan",
+            DenyCode::RestartReconcile => "restart_reconcile",
+            DenyCode::Unknown(s) => s,
         }
     }
 }
@@ -108,39 +118,43 @@ pub struct PendingRowWire {
 mod tests {
     use super::*;
 
+    /// The alloc-free spelling table and serde agree, both directions —
+    /// the drift guard the reviewer asked for.
     #[test]
     fn state_spellings_match_serde() {
-        for s in [
-            GrantState::Pending,
-            GrantState::Approved,
-            GrantState::Denied,
-            GrantState::Expired,
-            GrantState::Revoked,
-        ] {
+        for s in GrantState::ALL.iter().map(|(s, _)| *s) {
             let ser = serde_json::to_value(s).unwrap();
             assert_eq!(serde_json::Value::String(s.as_str().into()), ser);
             assert_eq!(GrantState::parse(s.as_str()), Some(s));
         }
+        assert_eq!(GrantState::parse("nope"), None);
     }
 
     #[test]
-    fn deny_code_roundtrip_and_alias() {
+    fn deny_code_spellings_match_serde() {
         for c in [
             DenyCode::HumanDenied,
             DenyCode::ApproverOffline,
+            DenyCode::ApproverTimeout,
+            DenyCode::InstallFailed,
+            DenyCode::RestartOrphan,
             DenyCode::RestartReconcile,
         ] {
-            let s = c.as_str();
-            let back: DenyCode = serde_json::from_value(serde_json::Value::String(s)).unwrap();
+            assert_eq!(
+                serde_json::to_value(&c).unwrap(),
+                serde_json::Value::String(c.as_str().into())
+            );
+            let back: DenyCode =
+                serde_json::from_value(serde_json::Value::String(c.as_str().into())).unwrap();
             assert_eq!(back, c);
         }
         // pre-kebab spelling still loads
-        let back: DenyCode =
-            serde_json::from_value("restart-reconcile".into()).unwrap();
+        let back: DenyCode = serde_json::from_value("restart-reconcile".into()).unwrap();
         assert_eq!(back, DenyCode::RestartReconcile);
-        // unknown passes through
+        // unknown passes through (as_str and serde both preserve it verbatim)
         let u: DenyCode = serde_json::from_value("zzz".into()).unwrap();
         assert_eq!(u, DenyCode::Unknown("zzz".into()));
+        assert_eq!(u.as_str(), "zzz");
     }
 
     #[test]

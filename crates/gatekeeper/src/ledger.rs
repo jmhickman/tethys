@@ -34,7 +34,10 @@ pub enum Decide {
     /// pending -> approved
     Approve { expires_at: f64 },
     /// pending -> denied
-    Deny { code: DenyCode, note: Option<String> },
+    Deny {
+        code: DenyCode,
+        note: Option<String>,
+    },
     /// approved -> revoked by operator action
     Revoke { at: f64, note: Option<String> },
     /// approved -> expired, mirrored from the kernel reaper (no human input)
@@ -57,9 +60,9 @@ impl Decide {
     fn legal_origins(&self) -> &'static [GrantState] {
         match self {
             Decide::Approve { .. } | Decide::Deny { .. } => &[GrantState::Pending],
-            Decide::Revoke { .. }
-            | Decide::ExpireByKernel
-            | Decide::ReapRestart { .. } => &[GrantState::Approved],
+            Decide::Revoke { .. } | Decide::ExpireByKernel | Decide::ReapRestart { .. } => {
+                &[GrantState::Approved]
+            }
         }
     }
     fn expires(&self) -> Option<f64> {
@@ -94,7 +97,11 @@ enum LedgerCmd {
     Insert(NewGrant, tokio::sync::oneshot::Sender<Option<i64>>),
     Decide(i64, Decide, tokio::sync::oneshot::Sender<bool>),
     List(GrantState, tokio::sync::oneshot::Sender<Vec<GrantRow>>),
-    History(Option<GrantState>, u32, tokio::sync::oneshot::Sender<Vec<GrantRow>>),
+    History(
+        Option<GrantState>,
+        u32,
+        tokio::sync::oneshot::Sender<Vec<GrantRow>>,
+    ),
     FindActive(tokio::sync::oneshot::Sender<Vec<GrantRow>>),
     SetDst(i64, String, tokio::sync::oneshot::Sender<bool>),
     FindByIdem(String, tokio::sync::oneshot::Sender<Option<GrantRow>>),
@@ -112,7 +119,9 @@ fn row_from(r: &rusqlite::Row) -> rusqlite::Result<GrantRow> {
     let Some(state) = GrantState::parse(&state_raw) else {
         tracing::error!(id = ?r.get::<_, i64>(0).ok(), state = %state_raw,
             "ledger row with unknown state skipped");
-        return Err(rusqlite::Error::InvalidParameterName("unknown_state".into()));
+        return Err(rusqlite::Error::InvalidParameterName(
+            "unknown_state".into(),
+        ));
     };
     let proto_raw: String = r.get(6)?;
     let proto = match proto_raw.parse::<Proto>() {
@@ -120,7 +129,9 @@ fn row_from(r: &rusqlite::Row) -> rusqlite::Result<GrantRow> {
         Err(_) => {
             tracing::error!(id = ?r.get::<_, i64>(0).ok(), proto = %proto_raw,
                 "ledger row with unknown proto skipped");
-            return Err(rusqlite::Error::InvalidParameterName("unknown_proto".into()));
+            return Err(rusqlite::Error::InvalidParameterName(
+                "unknown_proto".into(),
+            ));
         }
     };
     Ok(GrantRow {
@@ -140,10 +151,10 @@ fn row_from(r: &rusqlite::Row) -> rusqlite::Result<GrantRow> {
         expires_at: r.get(13)?,
         // serde is the single parse path (alias covers the pre-kebab spelling;
         // anything else loads as Unknown rather than dropping the row).
-        deny_code: r
-            .get::<_, Option<String>>(14)?
-            .map(|c| serde_json::from_value::<DenyCode>(serde_json::Value::String(c.clone()))
-                .unwrap_or(DenyCode::Unknown(c))),
+        deny_code: r.get::<_, Option<String>>(14)?.map(|c| {
+            serde_json::from_value::<DenyCode>(serde_json::Value::String(c.clone()))
+                .unwrap_or(DenyCode::Unknown(c))
+        }),
         note: r.get(15)?,
     })
 }
@@ -204,9 +215,8 @@ impl Ledger {
                     }
                     LedgerCmd::Decide(id, d, reply) => {
                         let origins = d.legal_origins();
-                        let placeholders: Vec<String> = (0..origins.len())
-                            .map(|i| format!("?{}", 6 + i))
-                            .collect();
+                        let placeholders: Vec<String> =
+                            (0..origins.len()).map(|i| format!("?{}", 6 + i)).collect();
                         let sql = format!(
                             "UPDATE grants SET state=?2, expires_at=COALESCE(?3, expires_at), \
                              deny_code=COALESCE(?4, deny_code), note=COALESCE(?5, note), \
@@ -228,34 +238,37 @@ impl Ledger {
                         };
                         // bind: 1=id, 2=target-state, 3=expires, 4=deny_code, 5=note,
                         // then legal origin states (?6+).
-                        let n = match stmt.execute(rusqlite::params_from_iter(
-                            std::iter::once(rusqlite::types::Value::Integer(id))
-                                .chain(std::iter::once(rusqlite::types::Value::Text(
-                                    d.target().as_str().to_string(),
-                                )))
-                                .chain(std::iter::once(
-                                    d.expires()
-                                        .map(rusqlite::types::Value::Real)
-                                        .unwrap_or(rusqlite::types::Value::Null),
-                                ))
-                                .chain(std::iter::once(
-                                    deny_code
-                                        .map(rusqlite::types::Value::Text)
-                                        .unwrap_or(rusqlite::types::Value::Null),
-                                ))
-                                .chain(std::iter::once(
-                                    deny_note
-                                        .map(rusqlite::types::Value::Text)
-                                        .unwrap_or(rusqlite::types::Value::Null),
-                                ))
-                                .chain(origins.iter().map(|s| rusqlite::types::Value::Text(s.as_str().to_string()))),
-                        )) {
-                            Ok(n) => n,
-                            Err(e) => {
-                                tracing::error!(%e, "decide execute failed");
-                                0
-                            }
-                        };
+                        let n =
+                            match stmt.execute(rusqlite::params_from_iter(
+                                std::iter::once(rusqlite::types::Value::Integer(id))
+                                    .chain(std::iter::once(rusqlite::types::Value::Text(
+                                        d.target().as_str().to_string(),
+                                    )))
+                                    .chain(std::iter::once(
+                                        d.expires()
+                                            .map(rusqlite::types::Value::Real)
+                                            .unwrap_or(rusqlite::types::Value::Null),
+                                    ))
+                                    .chain(std::iter::once(
+                                        deny_code
+                                            .map(rusqlite::types::Value::Text)
+                                            .unwrap_or(rusqlite::types::Value::Null),
+                                    ))
+                                    .chain(std::iter::once(
+                                        deny_note
+                                            .map(rusqlite::types::Value::Text)
+                                            .unwrap_or(rusqlite::types::Value::Null),
+                                    ))
+                                    .chain(origins.iter().map(|s| {
+                                        rusqlite::types::Value::Text(s.as_str().to_string())
+                                    })),
+                            )) {
+                                Ok(n) => n,
+                                Err(e) => {
+                                    tracing::error!(%e, "decide execute failed");
+                                    0
+                                }
+                            };
                         let _ = reply.send(n == 1);
                     }
                     LedgerCmd::List(state, reply) => {
@@ -364,14 +377,16 @@ impl Ledger {
     /// Decided rows (any state except pending), newest first. `state` narrows
     /// to one terminal state; `limit` bounds the page.
     pub async fn history(&self, state: Option<GrantState>, limit: u32) -> Vec<GrantRow> {
-        self.ask(|reply| LedgerCmd::History(state, limit, reply)).await
+        self.ask(|reply| LedgerCmd::History(state, limit, reply))
+            .await
     }
     pub async fn active(&self) -> Vec<GrantRow> {
         self.ask(LedgerCmd::FindActive).await
     }
     /// Persist resolved dst list for an approved grant. False if the row is not approved.
     pub async fn set_dst(&self, id: i64, dst_json: String) -> bool {
-        self.ask(move |reply| LedgerCmd::SetDst(id, dst_json, reply)).await
+        self.ask(move |reply| LedgerCmd::SetDst(id, dst_json, reply))
+            .await
     }
     /// Idempotency lookup for replayed request ids.
     pub async fn find_by_idem(&self, key: &str) -> Option<GrantRow> {
@@ -415,9 +430,27 @@ mod tests {
         let gid = ledger.insert_pending(newg("k1")).await.expect("insert");
 
         let exp = now_secs() as f64 + 60.0;
-        assert!(ledger.decide(gid, Decide::Approve { expires_at: exp }).await);
-        assert!(!ledger.decide(gid, Decide::Approve { expires_at: exp }).await);
-        assert!(ledger.decide(gid, Decide::Revoke { at: now_secs() as f64, note: None }).await);
+        assert!(
+            ledger
+                .decide(gid, Decide::Approve { expires_at: exp })
+                .await
+        );
+        assert!(
+            !ledger
+                .decide(gid, Decide::Approve { expires_at: exp })
+                .await
+        );
+        assert!(
+            ledger
+                .decide(
+                    gid,
+                    Decide::Revoke {
+                        at: now_secs() as f64,
+                        note: None
+                    }
+                )
+                .await
+        );
         // terminal: revoked -> anything = false
         assert!(!ledger.decide(gid, Decide::ExpireByKernel).await);
         assert_eq!(
@@ -427,18 +460,33 @@ mod tests {
 
         // separate row: deny path records code+note
         let gid2 = ledger.insert_pending(newg("k2")).await.expect("insert");
-        assert!(ledger
-            .decide(
-                gid2,
-                Decide::Deny { code: DenyCode::HumanDenied, note: Some("out of scope".into()) }
-            )
-            .await);
+        assert!(
+            ledger
+                .decide(
+                    gid2,
+                    Decide::Deny {
+                        code: DenyCode::HumanDenied,
+                        note: Some("out of scope".into())
+                    }
+                )
+                .await
+        );
         let r = ledger.find_by_idem("k2").await.unwrap();
         assert_eq!(r.state, GrantState::Denied);
         assert_eq!(r.deny_code, Some(DenyCode::HumanDenied));
         assert_eq!(r.note.as_deref(), Some("out of scope"));
         // Deny from a denied row: rejected
-        assert!(!ledger.decide(gid2, Decide::Deny { code: DenyCode::HumanDenied, note: None }).await);
+        assert!(
+            !ledger
+                .decide(
+                    gid2,
+                    Decide::Deny {
+                        code: DenyCode::HumanDenied,
+                        note: None
+                    }
+                )
+                .await
+        );
 
         actor.abort();
         std::fs::remove_dir_all(&dir).ok();
@@ -451,23 +499,53 @@ mod tests {
 
         // 3 decided rows in distinct terminal states + 1 still pending
         let a = ledger.insert_pending(newg("h-a")).await.unwrap();
-        ledger.decide(a, Decide::Approve { expires_at: now_secs() as f64 + 60.0 }).await;
+        ledger
+            .decide(
+                a,
+                Decide::Approve {
+                    expires_at: now_secs() as f64 + 60.0,
+                },
+            )
+            .await;
         let b = ledger.insert_pending(newg("h-b")).await.unwrap();
         ledger
-            .decide(b, Decide::Deny { code: DenyCode::HumanDenied, note: Some("n".into()) })
+            .decide(
+                b,
+                Decide::Deny {
+                    code: DenyCode::HumanDenied,
+                    note: Some("n".into()),
+                },
+            )
             .await;
         let c = ledger.insert_pending(newg("h-c")).await.unwrap();
         // Revoke originates from Approved; pending origin is rejected.
-        ledger.decide(c, Decide::Approve { expires_at: now_secs() as f64 + 60.0 }).await;
-        ledger.decide(c, Decide::Revoke { at: now_secs() as f64, note: None }).await;
+        ledger
+            .decide(
+                c,
+                Decide::Approve {
+                    expires_at: now_secs() as f64 + 60.0,
+                },
+            )
+            .await;
+        ledger
+            .decide(
+                c,
+                Decide::Revoke {
+                    at: now_secs() as f64,
+                    note: None,
+                },
+            )
+            .await;
         // flip a approved row to expired via the kernel path
         ledger.decide(a, Decide::ExpireByKernel).await;
         let _d = ledger.insert_pending(newg("h-pending")).await.unwrap();
 
         let all = ledger.history(None, 100).await;
         // newest first; approved row landed in expired, pending excluded
-        assert_eq!(all.iter().map(|r| r.state).collect::<Vec<_>>(),
-            vec![GrantState::Revoked, GrantState::Denied, GrantState::Expired]);
+        assert_eq!(
+            all.iter().map(|r| r.state).collect::<Vec<_>>(),
+            vec![GrantState::Revoked, GrantState::Denied, GrantState::Expired]
+        );
         assert!(all.iter().all(|r| r.state != GrantState::Pending));
 
         let only_denied = ledger.history(Some(GrantState::Denied), 100).await;
@@ -480,7 +558,10 @@ mod tests {
         assert_eq!(page[0].id, c, "limit must keep the NEWEST rows");
 
         // revoked-only filter proves state narrowing on a second value
-        assert_eq!(ledger.history(Some(GrantState::Revoked), 100).await.len(), 1);
+        assert_eq!(
+            ledger.history(Some(GrantState::Revoked), 100).await.len(),
+            1
+        );
 
         actor.abort();
         std::fs::remove_dir_all(&dir).ok();
@@ -491,13 +572,37 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("gk-idem-{}", now_secs()));
         let (ledger, actor) = Ledger::open(&dir.join("t.db")).unwrap();
         let gid = ledger.insert_pending(newg("req-x")).await.expect("insert");
-        assert!(ledger.insert_pending(newg("req-x")).await.is_none(), "UNIQUE must reject dup");
-        let found = ledger.find_by_idem("req-x").await.expect("must find row by idem key");
+        assert!(
+            ledger.insert_pending(newg("req-x")).await.is_none(),
+            "UNIQUE must reject dup"
+        );
+        let found = ledger
+            .find_by_idem("req-x")
+            .await
+            .expect("must find row by idem key");
         assert_eq!(found.id, gid);
         assert_eq!(found.proto, Proto::Tcp);
-        ledger.decide(gid, Decide::Approve { expires_at: now_secs() as f64 + 5.0 }).await;
-        ledger.decide(gid, Decide::Revoke { at: now_secs() as f64, note: None }).await;
-        let found = ledger.find_by_idem("req-x").await.expect("still found after revoke");
+        ledger
+            .decide(
+                gid,
+                Decide::Approve {
+                    expires_at: now_secs() as f64 + 5.0,
+                },
+            )
+            .await;
+        ledger
+            .decide(
+                gid,
+                Decide::Revoke {
+                    at: now_secs() as f64,
+                    note: None,
+                },
+            )
+            .await;
+        let found = ledger
+            .find_by_idem("req-x")
+            .await
+            .expect("still found after revoke");
         assert_eq!(found.state, GrantState::Revoked);
         actor.abort();
         std::fs::remove_dir_all(&dir).ok();

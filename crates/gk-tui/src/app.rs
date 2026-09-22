@@ -4,7 +4,9 @@ use std::collections::BTreeMap;
 
 use serde_json::Value;
 
-use gk_core::protocol::{method, EvDecided, EvError, EvExpired, EvRequestNew, EvTraffic, SubscribeAck};
+use gk_core::protocol::{
+    method, EvDecided, EvError, EvExpired, EvRequestNew, EvStopped, EvTraffic, SubscribeAck,
+};
 use gk_core::types::PortSpec;
 use gk_core::wire::{GrantRow, PendingRowWire};
 
@@ -213,7 +215,9 @@ impl App {
         match m {
             method::EV_REQUEST_NEW => match serde_json::from_value::<EvRequestNew>(p) {
                 Ok(ev) => {
-                    let Ok(id) = ev.grant_id.parse::<i64>() else { return };
+                    let Ok(id) = ev.grant_id.parse::<i64>() else {
+                        return;
+                    };
                     self.pending.entry(id).or_insert_with(|| PendingRow {
                         target: ev.target,
                         ports: fmt_ports(&ev.dst_port, ev.proto),
@@ -232,9 +236,14 @@ impl App {
             },
             method::EV_DECIDED => match serde_json::from_value::<EvDecided>(p) {
                 Ok(ev) => {
-                    if let Some(gid) =
-                        ev.grant_id.as_deref().and_then(|s| s.parse::<i64>().ok())
-                    {
+                    // tagged enum: each decision names its own grant; no
+                    // state string to compare, no nullable soup.
+                    let gid = match &ev {
+                        EvDecided::Approved { grant_id, .. }
+                        | EvDecided::Denied { grant_id, .. }
+                        | EvDecided::Revoked { grant_id } => grant_id.parse::<i64>().ok(),
+                    };
+                    if let Some(gid) = gid {
                         self.pending.remove(&gid);
                         self.live.remove(&gid);
                         out.push(cmd("c-live", method::LIST_GRANTS, None));
@@ -243,14 +252,15 @@ impl App {
                             self.modal = Modal::None;
                         }
                     }
-                    // stop.grants broadcast: no grant_id
-                    if ev.state == "all_stopped" {
-                        self.live.clear();
-                        self.pending.clear();
-                        self.modal = Modal::None;
-                        let n = ev.grants_removed.unwrap_or(0);
-                        self.set_flash(format!("stop.grants: {n} grants removed"));
-                    }
+                }
+                Err(e) => self.set_flash(bad(e)),
+            },
+            method::EV_STOPPED => match serde_json::from_value::<EvStopped>(p) {
+                Ok(ev) => {
+                    self.live.clear();
+                    self.pending.clear();
+                    self.modal = Modal::None;
+                    self.set_flash(format!("stop.grants: {} grants removed", ev.grants_removed));
                 }
                 Err(e) => self.set_flash(bad(e)),
             },
@@ -265,7 +275,9 @@ impl App {
             method::EV_TRAFFIC => match serde_json::from_value::<EvTraffic>(p) {
                 Ok(ev) => {
                     for g in ev.grants {
-                        let Ok(id) = g.grant_id.parse::<i64>() else { continue };
+                        let Ok(id) = g.grant_id.parse::<i64>() else {
+                            continue;
+                        };
                         if let Some(row) = self.live.get_mut(&id) {
                             row.left = Some(g.seconds_remaining);
                             row.bytes_up = Some(g.bytes_sent);
@@ -286,7 +298,12 @@ impl App {
     fn on_response(&mut self, v: &Value, _out: &mut Vec<Cmd>) {
         // typed deserialize per response id; errors flash rather than silently
         // leaving stale state rendered as fresh
-        let err_msg = |d: &Value| d["error"]["message"].as_str().unwrap_or("daemon error").to_string();
+        let err_msg = |d: &Value| {
+            d["error"]["message"]
+                .as_str()
+                .unwrap_or("daemon error")
+                .to_string()
+        };
         match v.get("id").and_then(|i| i.as_str()).unwrap_or("") {
             "c-sub" => match serde_json::from_value::<SubscribeAck>(v["result"].clone()) {
                 Ok(ack) => {
@@ -340,7 +357,10 @@ impl App {
                                 PendingRow {
                                     target: pr.row.target,
                                     ports: fmt_ports(
-                                        &PortSpec { from: pr.row.port_from, to: pr.row.port_to },
+                                        &PortSpec {
+                                            from: pr.row.port_from,
+                                            to: pr.row.port_to,
+                                        },
                                         pr.row.proto,
                                     ),
                                     reason: pr.row.reason,
@@ -362,17 +382,15 @@ impl App {
                     Err(e) => self.set_flash(format!("bad list.pending payload: {e}")),
                 }
             }
-            "c-hist" => {
-                match serde_json::from_value::<Vec<GrantRow>>(v["result"].clone()) {
-                    Ok(rows) if v.get("error").is_none() => {
-                        self.history = rows;
-                        self.history_err = None;
-                    }
-                    _ => {
-                        self.history_err = Some(err_msg(v));
-                    }
+            "c-hist" => match serde_json::from_value::<Vec<GrantRow>>(v["result"].clone()) {
+                Ok(rows) if v.get("error").is_none() => {
+                    self.history = rows;
+                    self.history_err = None;
                 }
-            }
+                _ => {
+                    self.history_err = Some(err_msg(v));
+                }
+            },
             "a-approve" | "a-deny" | "a-revoke" | "a-stop" => {
                 if let Some(e) = v.get("error") {
                     self.set_flash(format!("daemon: {}", e["message"].as_str().unwrap_or("?")));
@@ -442,7 +460,11 @@ impl App {
     pub fn open_history(&mut self, out: &mut Vec<Cmd>) {
         self.modal = Modal::History;
         self.hist_sel = 0;
-        out.push(cmd("c-hist", method::LIST_HISTORY, Some(serde_json::json!({"limit": 100}))));
+        out.push(cmd(
+            "c-hist",
+            method::LIST_HISTORY,
+            Some(serde_json::json!({"limit": 100})),
+        ));
     }
 
     pub fn stop_confirmed(&mut self, out: &mut Vec<Cmd>) {

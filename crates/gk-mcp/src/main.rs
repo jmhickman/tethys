@@ -9,12 +9,14 @@ use clap::Parser;
 use rmcp::{
     handler::server::wrapper::Parameters,
     model::{ServerCapabilities, ServerConfig},
-    schemars, service::ServiceExt, tool, tool_handler, tool_router, ErrorData, ServerHandler,
+    schemars,
+    service::ServiceExt,
+    tool, tool_handler, tool_router, ErrorData, ServerHandler,
 };
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 
-use gk_core::protocol::{method, AccessRequestParams, RpcRequest, JsonRpcVersion};
+use gk_core::protocol::{method, AccessRequestParams, JsonRpcVersion, RpcRequest};
 
 #[derive(Parser, Debug)]
 #[command(name = "gk-mcp")]
@@ -31,14 +33,20 @@ pub struct GrantRequest {
     #[schemars(description = "Target IPv4/IPv6 address; exactly one target field required")]
     #[serde(default)]
     pub dst_ip: Option<String>,
-    #[schemars(description = "Target CIDR, e.g. 203.0.113.0/24; exactly one target field required")]
+    #[schemars(
+        description = "Target CIDR, e.g. 203.0.113.0/24; exactly one target field required"
+    )]
     #[serde(default)]
     pub dst_net: Option<String>,
-    #[schemars(description = r#"Port spec object, e.g. {"from":443,"to":443}; all ports = {"from":0,"to":0}"#)]
+    #[schemars(
+        description = r#"Port spec object, e.g. {"from":443,"to":443}; all ports = {"from":0,"to":0}"#
+    )]
     pub dst_port: serde_json::Value,
     #[schemars(description = "tcp or udp")]
     pub proto: String,
-    #[schemars(description = "Why this traffic is needed for the engagement (shown verbatim to human approver)")]
+    #[schemars(
+        description = "Why this traffic is needed for the engagement (shown verbatim to human approver)"
+    )]
     pub reason: String,
     #[schemars(description = "Tool you will use (nmap, sqlmap, ...) — shown to approver")]
     pub tool: String,
@@ -76,9 +84,8 @@ impl ScopeMcp {
             "tool": req.tool,
             "ttl_requested": req.ttl,
         });
-        let _typed: AccessRequestParams = serde_json::from_value(params.clone()).map_err(|e| {
-            ErrorData::invalid_params(format!("bad request: {e}"), None)
-        })?;
+        let _typed: AccessRequestParams = serde_json::from_value(params.clone())
+            .map_err(|e| ErrorData::invalid_params(format!("bad request: {e}"), None))?;
 
         let id = format!("req-{}", next_id());
         let rpc = RpcRequest {
@@ -90,12 +97,16 @@ impl ScopeMcp {
 
         let resp = self.ask(&rpc).await?;
         tracing::debug!(%resp, "verdict received");
-        let v: serde_json::Value = serde_json::from_str(&resp)
-            .map_err(|e| ErrorData::internal_error(format!("gatekeeper reply unparseable: {e}"), None))?;
+        let v: serde_json::Value = serde_json::from_str(&resp).map_err(|e| {
+            ErrorData::internal_error(format!("gatekeeper reply unparseable: {e}"), None)
+        })?;
 
         if let Some(err) = v.get("error") {
             return Err(ErrorData::internal_error(
-                err.get("message").and_then(|m| m.as_str()).unwrap_or("gatekeeper error").to_string(),
+                err.get("message")
+                    .and_then(|m| m.as_str())
+                    .unwrap_or("gatekeeper error")
+                    .to_string(),
                 None,
             ));
         }
@@ -128,7 +139,10 @@ impl ScopeMcp {
         .map_err(|e| ErrorData::internal_error(format!("read: {e}"), None))?;
         tracing::debug!(id = %rpc.id, bytes = n, "read reply line");
         if n == 0 {
-            return Err(ErrorData::internal_error("gatekeeper closed connection", None));
+            return Err(ErrorData::internal_error(
+                "gatekeeper closed connection",
+                None,
+            ));
         }
         Ok(line)
     }
@@ -142,18 +156,28 @@ fn render_verdict(r: &serde_json::Value) -> String {
     };
     use gk_core::protocol::Verdict as V;
     match v {
-        V::Approved { effective, ttl_granted, expires_at, .. } => {
+        V::Approved {
+            effective,
+            ttl_granted,
+            expires_at,
+            ..
+        } => {
             format!(
                 "APPROVED: {} {} {}-{} granted for {ttl_granted} (expires {expires_at})",
                 effective.dst,
-                serde_json::to_value(effective.proto).ok()
+                serde_json::to_value(effective.proto)
+                    .ok()
                     .and_then(|p| p.as_str().map(String::from))
                     .unwrap_or_else(|| "?".into()),
                 effective.dst_port.from,
                 effective.dst_port.to,
             )
         }
-        V::AlreadyGranted { grant_id, expires_at, note } => {
+        V::AlreadyGranted {
+            grant_id,
+            expires_at,
+            note,
+        } => {
             let mut s = format!("APPROVED (already active, grant {grant_id})");
             if let Some(e) = expires_at {
                 s.push_str(&format!(" (expires {e})"));
@@ -163,8 +187,11 @@ fn render_verdict(r: &serde_json::Value) -> String {
             }
             s
         }
-        V::Denied { reason_code, note, .. } => {
-            let code = serde_json::to_value(reason_code).ok()
+        V::Denied {
+            reason_code, note, ..
+        } => {
+            let code = serde_json::to_value(reason_code)
+                .ok()
                 .and_then(|c| c.as_str().map(String::from))
                 .unwrap_or_else(|| "denied".into());
             match note {
@@ -200,7 +227,9 @@ impl ServerHandler for ScopeMcp {
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_writer(std::io::stderr) // stdout is the MCP channel
-        .with_env_filter(tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()))
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
+        )
         .init();
     let args = Args::parse();
     let server = ScopeMcp::new(args.gatekeeper_socket);

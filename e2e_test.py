@@ -240,6 +240,9 @@ def main():
                                   capture_output=True, text=True).returncode == 0
     if ("192.0.2.10" in out or "192.0.2.11" in out) or not table_exists or "error" in r:
         fails.append(f"S6 stop.grants: leftover={out[:80]} table={table_exists} resp={r}")
+    stopped = [e["params"] for e in events if e.get("method") == "grants.stopped"]
+    if not stopped or stopped[-1].get("grants_removed") != 2:
+        fails.append(f"S6 grants.stopped broadcast missing/wrong: {stopped}")
     if len(approved_gids) != 2:
         fails.append(f"S6 only {len(approved_gids)} grants confirmed approved before stop")
     if d_pend.get("reason_code") != "human_denied" or "stopped" not in (d_pend.get("note") or ""):
@@ -320,7 +323,7 @@ def main():
                 ack = e
         time.sleep(0.1)
     res = (ack or {}).get("result") or {}
-    if res.get("approver_timeout_secs") != 8 or len(res.get("events", [])) != 5:
+    if res.get("approver_timeout_secs") != 8 or len(res.get("events", [])) != 6:
         fails.append(f"S9 subscribe ack: {res}")
 
     a9 = request("r9", {"dst_ip": "192.0.2.99", "dst_port": {"from": 8080, "to": 8080}, "proto": "tcp",

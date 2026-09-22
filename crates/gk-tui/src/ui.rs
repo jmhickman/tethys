@@ -90,7 +90,9 @@ fn draw_header(f: &mut Frame, app: &App, st: ConnStatus, a: Rect) {
             app.sort.header(),
             if app.sort_asc { " ▲" } else { " ▼" }
         ),
-        Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD),
     );
     let legend = COLS
         .iter()
@@ -131,7 +133,16 @@ const GAP_MIN: u16 = 1;
 const GAP_MAX: u16 = 4;
 /// Smallest slice worth giving reason on a single line; below this, wrap.
 const REASON_MIN: u16 = 8;
-const HEADERS: [&str; 8] = ["id", "tool", "dst", "ports", "proto", "ttl", "left", "\u{2195}B"];
+const HEADERS: [&str; 8] = [
+    "id",
+    "tool",
+    "dst",
+    "ports",
+    "proto",
+    "ttl",
+    "left",
+    "\u{2195}B",
+];
 
 fn truncate(s: &str, w: usize) -> String {
     if dw(s) <= w {
@@ -256,7 +267,11 @@ fn pack_line1(rows: &[RowCells], w: u16) -> ([u16; 8], usize) {
 
 fn draw_table(f: &mut Frame, app: &App, a: Rect) {
     let dim = !app_conn_live(app);
-    let title = if dim { " LIVE (stale — no daemon) " } else { " LIVE " };
+    let title = if dim {
+        " LIVE (stale — no daemon) "
+    } else {
+        " LIVE "
+    };
     let inner = Block::default().borders(Borders::ALL).title(title).inner(a);
     f.render_widget(Block::default().borders(Borders::ALL).title(title), a);
     if inner.width < 8 || inner.height == 0 {
@@ -277,7 +292,9 @@ fn draw_table(f: &mut Frame, app: &App, a: Rect) {
         .max()
         .unwrap_or(6)
         .max(6); // "reason" header
-    let surplus = inner.width.saturating_sub(fixed_nat + need_reason + GAP_MIN * 8);
+    let surplus = inner
+        .width
+        .saturating_sub(fixed_nat + need_reason + GAP_MIN * 8);
     let gap = (GAP_MIN + surplus / 8).clamp(GAP_MIN, GAP_MAX);
     let reason_w = inner.width.saturating_sub(fixed_nat + gap * 8);
 
@@ -308,14 +325,25 @@ fn draw_table(f: &mut Frame, app: &App, a: Rect) {
 
     // ---- header ----------------------------------------------------------
     let mut hdr: Vec<Span> = Vec::with_capacity(9);
-    mk(&mut hdr, &HEADERS.map(|h| h.to_string()).clone(), muted(dim));
+    mk(
+        &mut hdr,
+        &HEADERS.map(|h| h.to_string()).clone(),
+        muted(dim),
+    );
     if !wrap {
-        hdr.push(Span::styled(truncate("reason", reason_w as usize), muted(dim)));
+        hdr.push(Span::styled(
+            truncate("reason", reason_w as usize),
+            muted(dim),
+        ));
     }
     f.render_widget(Paragraph::new(Line::from(hdr)), inner);
 
     // ---- body ------------------------------------------------------------
-    let body = Rect { y: inner.y + 1, height: body_h, ..inner };
+    let body = Rect {
+        y: inner.y + 1,
+        height: body_h,
+        ..inner
+    };
     let mut lines: Vec<Line> = Vec::with_capacity(visible * line_h as usize);
     for (i, c) in rows.iter().skip(start).take(visible).enumerate() {
         let base = c.warn.patch(muted(dim));
@@ -343,14 +371,23 @@ fn draw_table(f: &mut Frame, app: &App, a: Rect) {
         let nx = inner.x + inner.width.saturating_sub(note.len() as u16);
         f.render_widget(
             Paragraph::new(Line::from(Span::styled(note.clone(), muted(true)))),
-            Rect { x: nx, width: note.len() as u16, height: 1, ..inner },
+            Rect {
+                x: nx,
+                width: note.len() as u16,
+                height: 1,
+                ..inner
+            },
         );
     }
 }
 
 /// gap actually used between columns (two-line plan is always GAP_MIN)
 fn gap_used(_inner: Rect, gap: u16, wrap: bool) -> u16 {
-    if wrap { GAP_MIN } else { gap }
+    if wrap {
+        GAP_MIN
+    } else {
+        gap
+    }
 }
 
 fn app_conn_live(_app: &App) -> bool {
@@ -372,26 +409,42 @@ fn draw_keybar(f: &mut Frame, app: &App, a: Rect) {
         Modal::ConfirmStop => "type `stop` + Enter to confirm · any other key cancels",
         Modal::ConnLost => "retrying automatically · Esc to view stale state",
     };
-    f.render_widget(Paragraph::new(Line::from(Span::styled(format!(" {keys}"), muted(true)))), a);
+    f.render_widget(
+        Paragraph::new(Line::from(Span::styled(format!(" {keys}"), muted(true)))),
+        a,
+    );
 }
 
 // ------------------------------------------------------------------ modals
 
 fn centered(a: Rect, w_pct: u16, h_pct: u16) -> Rect {
-    let v = Layout::vertical([Constraint::Percentage(h_pct)]).flex(ratatui::layout::Flex::Center).split(a);
-    let h = Layout::horizontal([Constraint::Percentage(w_pct)]).flex(ratatui::layout::Flex::Center).split(v[0]);
+    let v = Layout::vertical([Constraint::Percentage(h_pct)])
+        .flex(ratatui::layout::Flex::Center)
+        .split(a);
+    let h = Layout::horizontal([Constraint::Percentage(w_pct)])
+        .flex(ratatui::layout::Flex::Center)
+        .split(v[0]);
     h[0]
 }
 
 fn draw_pending_modal(f: &mut Frame, app: &App, idx: usize) {
     let ids = app.pending_ids();
-    let Some(id) = ids.get(idx).copied() else { return };
-    let Some(p) = app.pending.get(&id) else { return };
+    let Some(id) = ids.get(idx).copied() else {
+        return;
+    };
+    let Some(p) = app.pending.get(&id) else {
+        return;
+    };
     let area = centered(f.area(), 70, 60);
     f.render_widget(Clear, area);
 
     let waiting = app.now.saturating_sub(p.created_at);
-    let mut title = format!(" REQUEST {id} · {} · waiting {}:{:02} ", p.tool, waiting / 60, waiting % 60);
+    let mut title = format!(
+        " REQUEST {id} · {} · waiting {}:{:02} ",
+        p.tool,
+        waiting / 60,
+        waiting % 60
+    );
     // countdown to daemon auto-deny (approver_timeout_secs from subscribe ack)
     if let Some(to) = app.timeout_secs {
         let left = to.saturating_sub(waiting);
@@ -406,7 +459,10 @@ fn draw_pending_modal(f: &mut Frame, app: &App, idx: usize) {
     }
 
     let lines = vec![
-        Line::from(vec![Span::styled(" requested  ", muted(true)), Span::raw(&p.target)]),
+        Line::from(vec![
+            Span::styled(" requested  ", muted(true)),
+            Span::raw(&p.target),
+        ]),
         Line::from(vec![
             Span::styled(" ports       ", muted(true)),
             Span::raw(p.ports.clone()),
@@ -415,11 +471,21 @@ fn draw_pending_modal(f: &mut Frame, app: &App, idx: usize) {
         ]),
     ];
     let reason = Paragraph::new(p.reason.clone()).wrap(Wrap { trim: false });
-    let ra = Rect { x: area.x + 2, y: area.y + 4, width: area.width.saturating_sub(4), height: 3 };
+    let ra = Rect {
+        x: area.x + 2,
+        y: area.y + 4,
+        width: area.width.saturating_sub(4),
+        height: 3,
+    };
     f.render_widget(reason, ra);
 
     let mut action_spans = vec![
-        Span::styled(" [a]pprove", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            " [a]pprove",
+            Style::default()
+                .fg(Color::Green)
+                .add_modifier(Modifier::BOLD),
+        ),
         Span::styled("   [d]eny+note", Style::default().fg(Color::Red)),
         Span::styled("   [t]tl→__", Style::default().fg(Color::Cyan)),
     ];
@@ -459,27 +525,44 @@ fn draw_detail_modal(f: &mut Frame, app: &App, id: i64) {
     f.render_widget(Clear, area);
     let differs = r.dst.iter().any(|d| !r.target.ends_with(d.as_str()));
     let mut lines = vec![
-        Line::from(vec![Span::styled(" requested   ", muted(true)), Span::raw(r.target.clone())]),
+        Line::from(vec![
+            Span::styled(" requested   ", muted(true)),
+            Span::raw(r.target.clone()),
+        ]),
         Line::from(vec![
             Span::styled(" installed   ", muted(true)),
             Span::raw(r.dst.join(", ")),
             if differs {
-                Span::styled("   ⚠️ IP addresses resolved from hostname", Style::default().fg(Color::Yellow))
+                Span::styled(
+                    "   ⚠️ IP addresses resolved from hostname",
+                    Style::default().fg(Color::Yellow),
+                )
             } else {
                 Span::raw("")
             },
         ]),
         Line::from(vec![
             Span::styled(" ports/proto ", muted(true)),
-            Span::raw(format!("{}  {}   ttl granted {}", r.ports, r.proto, fmt_ttl_secs(r.ttl_secs))),
+            Span::raw(format!(
+                "{}  {}   ttl granted {}",
+                r.ports,
+                r.proto,
+                fmt_ttl_secs(r.ttl_secs)
+            )),
         ]),
-        Line::from(vec![Span::styled(" reason      ", muted(true)), Span::raw(r.reason.clone())]),
-        Line::from(vec![Span::styled(" traffic     ", muted(true)), Span::raw(format!(
-            "↑ {} B   ↓ {} B   left {}",
-            fmt_bytes(r.bytes_up.unwrap_or(0)),
-            fmt_bytes(r.bytes_down.unwrap_or(0)),
-            fmt_countdown(r.left)
-        ))]),
+        Line::from(vec![
+            Span::styled(" reason      ", muted(true)),
+            Span::raw(r.reason.clone()),
+        ]),
+        Line::from(vec![
+            Span::styled(" traffic     ", muted(true)),
+            Span::raw(format!(
+                "↑ {} B   ↓ {} B   left {}",
+                fmt_bytes(r.bytes_up.unwrap_or(0)),
+                fmt_bytes(r.bytes_down.unwrap_or(0)),
+                fmt_countdown(r.left)
+            )),
+        ]),
     ];
     lines.push(Line::from(""));
     f.render_widget(
@@ -586,7 +669,10 @@ fn draw_conn_modal(f: &mut Frame, st: ConnStatus) {
         )),
         Line::from(" Check its status (systemctl status gatekeeper)."),
         Line::from(Span::styled(
-            format!(" retrying in background… {}", if st.up { "socket up" } else { "socket down" }),
+            format!(
+                " retrying in background… {}",
+                if st.up { "socket up" } else { "socket down" }
+            ),
             muted(true),
         )),
     ];
@@ -616,19 +702,32 @@ fn primary_network() -> String {
         Ok(s) => s,
         Err(_) => return "-".into(),
     };
-    let lines: Vec<Vec<&str>> =
-        rt.lines().skip(1).map(|l| l.split_whitespace().collect()).collect();
+    let lines: Vec<Vec<&str>> = rt
+        .lines()
+        .skip(1)
+        .map(|l| l.split_whitespace().collect())
+        .collect();
     let def_iface = lines
         .iter()
         .find(|c| c.len() >= 8 && c[1] == "00000000")
         .map(|c| c[0]);
-    let Some(iface) = def_iface else { return "-".into() };
+    let Some(iface) = def_iface else {
+        return "-".into();
+    };
     for c in &lines {
         if c.len() >= 8 && c[0] == iface && c[1] != "00000000" && c[2] == "00000000" {
             let dst = unhex_le(c[1]);
             let mask = unhex_le(c[7]);
             if mask != 0 {
-                let ip = |w: u32| format!("{}.{}.{}.{}", w >> 24, (w >> 16) & 255, (w >> 8) & 255, w & 255);
+                let ip = |w: u32| {
+                    format!(
+                        "{}.{}.{}.{}",
+                        w >> 24,
+                        (w >> 16) & 255,
+                        (w >> 8) & 255,
+                        w & 255
+                    )
+                };
                 return format!("{} {}/{}", iface, ip(dst & mask), mask.count_ones());
             }
         }
@@ -668,10 +767,17 @@ mod tests {
         let mut app = App::new();
         app.live.insert(
             1,
-            row(1, "hermes-agent", &["104.26.10.242", "104.26.11.242", "172.67.70.54"],
-                "restore jina MCP web tools (search/read) for agent session"),
+            row(
+                1,
+                "hermes-agent",
+                &["104.26.10.242", "104.26.11.242", "172.67.70.54"],
+                "restore jina MCP web tools (search/read) for agent session",
+            ),
         );
-        app.live.insert(2, row(2, "curl", &["93.184.216.34"], "fetch payload for analysis"));
+        app.live.insert(
+            2,
+            row(2, "curl", &["93.184.216.34"], "fetch payload for analysis"),
+        );
         app.now = 1;
         app
     }
@@ -680,7 +786,10 @@ mod tests {
     fn render(w: u16, h: u16) -> Vec<String> {
         let app = sample_app();
         let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
-        let st = ConnStatus { up: true, synced: true };
+        let st = ConnStatus {
+            up: true,
+            synced: true,
+        };
         terminal.draw(|f| draw(f, &app, st)).unwrap();
         terminal
             .backend()
@@ -696,7 +805,10 @@ mod tests {
         let lines = render(140, 14);
         let body = lines.join("\n");
         // facts intact: full first IP, +N for the rest, no mid-address comma clip
-        assert!(body.contains("104.26.10.242 +2"), "dst summary missing:\n{body}");
+        assert!(
+            body.contains("104.26.10.242 +2"),
+            "dst summary missing:\n{body}"
+        );
         assert!(body.contains("93.184.216.34"));
         // reason fully visible at wide size
         assert!(body.contains("restore jina MCP web tools (search/read) for agent session"));
@@ -720,9 +832,15 @@ mod tests {
         let lines = render(40, 14);
         let body = lines.join("\n");
         // fixed columns still readable
-        assert!(body.contains("93.184.216.34"), "facts must stay complete:\n{body}");
+        assert!(
+            body.contains("93.184.216.34"),
+            "facts must stay complete:\n{body}"
+        );
         // reason appears as full-width continuation lines
-        assert!(body.contains("↳ fetch payload for analysis"), "missing wrap line:\n{body}");
+        assert!(
+            body.contains("↳ fetch payload for analysis"),
+            "missing wrap line:\n{body}"
+        );
         assert!(body.contains("↳ restore jina MCP web tools"));
     }
 
@@ -730,9 +848,16 @@ mod tests {
     fn detail_modal_annotation_survives_narrow_width() {
         let mut app = sample_app();
         app.modal = Modal::Detail(1); // 6-dst-style row: target host, differs
-        app.live.get_mut(&1).unwrap().dst.push("2606:4700:20::681a:af2".into());
+        app.live
+            .get_mut(&1)
+            .unwrap()
+            .dst
+            .push("2606:4700:20::681a:af2".into());
         let mut terminal = Terminal::new(TestBackend::new(56, 16)).unwrap();
-        let st = ConnStatus { up: true, synced: true };
+        let st = ConnStatus {
+            up: true,
+            synced: true,
+        };
         terminal.draw(|f| draw(f, &app, st)).unwrap();
         let body: String = terminal
             .backend()
@@ -768,4 +893,3 @@ mod tests {
         }
     }
 }
-

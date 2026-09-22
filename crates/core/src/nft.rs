@@ -145,7 +145,9 @@ impl GrantElem {
         let dst = match &self.dst {
             ElemDst::Ip(ip) => json!(ip.to_string()),
             // Slash strings are parsed as hostnames; use prefix objects.
-            ElemDst::Net(n) => json!({"prefix": {"addr": n.network().to_string(), "len": n.prefix_len()}}),
+            ElemDst::Net(n) => {
+                json!({"prefix": {"addr": n.network().to_string(), "len": n.prefix_len()}})
+            }
         };
         let (f, t) = self.port.nft_range();
         let port = if f == t {
@@ -167,7 +169,10 @@ pub struct Batch {
 
 impl Default for Batch {
     fn default() -> Self {
-        Self { table: TABLE.into(), cmds: Vec::new() }
+        Self {
+            table: TABLE.into(),
+            cmds: Vec::new(),
+        }
     }
 }
 
@@ -180,7 +185,10 @@ impl Batch {
     /// Batch against a named table (config `nft_table`; tests use a private
     /// table so they never touch production kernel state).
     pub fn with_table(table: &str) -> Self {
-        Self { table: table.into(), cmds: Vec::new() }
+        Self {
+            table: table.into(),
+            cmds: Vec::new(),
+        }
     }
 
     /// Ensure our table exists (idempotent — nft treats add-existing as OK).
@@ -356,9 +364,19 @@ impl Batch {
     /// Count-only rule: match @set . proto variant . counter, no verdict.
     pub fn add_acct_rule(&mut self, gid: i64, dir: Dir, proto: Proto, v6: bool) {
         let (chain, addr_field, port_field, af) = match dir {
-            Dir::Out => (CHAIN_ACCT_OUT, "daddr", "dport", if v6 { "ip6" } else { "ip" }),
+            Dir::Out => (
+                CHAIN_ACCT_OUT,
+                "daddr",
+                "dport",
+                if v6 { "ip6" } else { "ip" },
+            ),
             // replies: granted host is the source of ingress packets
-            Dir::In => (CHAIN_ACCT_IN, "saddr", "sport", if v6 { "ip6" } else { "ip" }),
+            Dir::In => (
+                CHAIN_ACCT_IN,
+                "saddr",
+                "sport",
+                if v6 { "ip6" } else { "ip" },
+            ),
         };
         let counter = dir.counter(gid);
         self.cmds.push(json!({"add":{"rule":{
@@ -394,7 +412,7 @@ impl Batch {
 #[derive(Clone, Debug)]
 pub struct LiveElement {
     pub set: String,
-    pub dst: String,     // canonical "1.2.3.4" / "10.0.0.0/8"
+    pub dst: String, // canonical "1.2.3.4" / "10.0.0.0/8"
     pub proto: Proto,
     pub port_from: u16,
     pub port_to: u16,
@@ -437,7 +455,11 @@ impl NftCli {
     }
 
     /// `nft --json -f` expects a JSON batch, not CLI text. Wraps `list <what>`.
-    pub async fn list_json(&self, what: &str, arg: Option<serde_json::Value>) -> Result<Value, NftError> {
+    pub async fn list_json(
+        &self,
+        what: &str,
+        arg: Option<serde_json::Value>,
+    ) -> Result<Value, NftError> {
         let mut cmd = serde_json::Map::new();
         match arg {
             Some(a) => cmd.insert(what.to_string(), a),
@@ -466,17 +488,22 @@ async fn run_nft_json(
     cmd.env_clear();
     // nft 1.1.6: --json must precede -f.
     cmd.args(["--json", "-f", "-"]);
-    cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
+    cmd.stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
 
     let mut child = cmd.spawn().map_err(NftError::Spawn)?;
     {
         use tokio::io::AsyncWriteExt;
         // A failed write means nft never saw the batch: surface it instead of
         // letting the child fail/hang on an empty stdin (apply miss).
-        let mut si = child.stdin.take().ok_or_else(|| {
-            NftError::Io(std::io::Error::other("stdin pipe unavailable"))
-        })?;
-        si.write_all(payload.as_bytes()).await.map_err(NftError::Io)?;
+        let mut si = child
+            .stdin
+            .take()
+            .ok_or_else(|| NftError::Io(std::io::Error::other("stdin pipe unavailable")))?;
+        si.write_all(payload.as_bytes())
+            .await
+            .map_err(NftError::Io)?;
         si.flush().await.map_err(NftError::Io)?;
         drop(si);
     }
@@ -530,7 +557,11 @@ pub fn parse_poll(doc: &Value, counters: &Value, tname: &str) -> PollState {
     if let Some(arr) = doc.get("nftables").and_then(|v| v.as_array()) {
         for item in arr {
             let Some(set) = item.get("set") else { continue };
-            let name = set.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let name = set
+                .get("name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
             if name != SET_V4 && name != SET_V6 {
                 continue;
             }
@@ -540,9 +571,7 @@ pub fn parse_poll(doc: &Value, counters: &Value, tname: &str) -> PollState {
             for el in elems {
                 // live shape: {"elem":{"val":{"concat":[...]},"expires":f}}
                 let wrapper = el.get("elem");
-                let val = wrapper
-                    .and_then(|e| e.get("val"))
-                    .or(el.get("val"));
+                let val = wrapper.and_then(|e| e.get("val")).or(el.get("val"));
                 let Some(val) = val else { continue };
                 // expires is a sibling of val (on the elem wrapper); tolerate both
                 let expires = wrapper
@@ -612,7 +641,11 @@ pub fn parse_poll(doc: &Value, counters: &Value, tname: &str) -> PollState {
     if let Some(arr) = counters.get("nftables").and_then(|v| v.as_array()) {
         for item in arr {
             if let Some(c) = item.get("counter") {
-                let name = c.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                let name = c
+                    .get("name")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
                 if name.is_empty() || c.get("table").and_then(|v| v.as_str()) != Some(tname) {
                     continue;
                 }
@@ -720,11 +753,17 @@ mod tests {
         let mut b = Batch::new();
         b.rebuild_scope(&[990]);
         let cmds = &b.cmds;
-        assert_eq!(cmds[0]["flush"]["chain"]["name"], serde_json::json!(CHAIN_SCOPE));
+        assert_eq!(
+            cmds[0]["flush"]["chain"]["name"],
+            serde_json::json!(CHAIN_SCOPE)
+        );
         let policed = &cmds[1]["add"]["rule"];
         assert_eq!(policed["chain"], serde_json::json!(CHAIN_SCOPE));
         let exprs = policed["expr"].as_array().unwrap();
-        assert_eq!(exprs[0]["match"]["left"], serde_json::json!({"meta":{"key":"skuid"}}));
+        assert_eq!(
+            exprs[0]["match"]["left"],
+            serde_json::json!({"meta":{"key":"skuid"}})
+        );
         assert_eq!(exprs[0]["match"]["op"], serde_json::json!("=="));
         assert_eq!(exprs[0]["match"]["right"], serde_json::json!(990));
         assert!(exprs[1].get("return").is_some(), "policed uids must RETURN");
@@ -797,7 +836,11 @@ mod tests {
         for cmd in &b.cmds {
             walk(cmd, &mut hits);
             for (k, v) in &hits {
-                assert_eq!(v, &serde_json::json!("gk_alt"), "command with {k} hit wrong table: {cmd}");
+                assert_eq!(
+                    v,
+                    &serde_json::json!("gk_alt"),
+                    "command with {k} hit wrong table: {cmd}"
+                );
             }
         }
         assert!(!hits.is_empty(), "batch emitted no table references at all");
@@ -844,8 +887,14 @@ mod tests {
         // element (cmds[3]) lands in gk_m7_in with the safe prefix encoding.
         let s_out = &cmds[2]["add"]["set"];
         assert_eq!(s_out["name"], "gk_m7_out");
-        assert_eq!(s_out["type"]["typeof"]["concat"][0]["payload"]["field"], "daddr");
-        assert_eq!(s_out["type"]["typeof"]["concat"][2]["payload"]["field"], "dport");
+        assert_eq!(
+            s_out["type"]["typeof"]["concat"][0]["payload"]["field"],
+            "daddr"
+        );
+        assert_eq!(
+            s_out["type"]["typeof"]["concat"][2]["payload"]["field"],
+            "dport"
+        );
         let e = &cmds[3]["add"]["element"];
         assert_eq!(e["name"], "gk_m7_in");
         assert!(e["elem"][0]["concat"][0].get("prefix").is_some());
@@ -877,7 +926,10 @@ mod tests {
         assert_eq!(st.elements.len(), 2);
         assert!((st.elements[0].expires_secs - 41.9).abs() < 0.01);
         assert_eq!(st.elements[1].dst, "10.0.0.0/8");
-        assert_eq!((st.elements[1].port_from, st.elements[1].port_to), (8000, 8100));
+        assert_eq!(
+            (st.elements[1].port_from, st.elements[1].port_to),
+            (8000, 8100)
+        );
         assert_eq!(st.elements[0].comment, None);
         assert_eq!(st.elements[1].comment.as_deref(), Some("gk:g7"));
         assert_eq!(st.counters.get("g7_out"), Some(&(3u64, 120u64)));

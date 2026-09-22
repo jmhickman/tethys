@@ -1,9 +1,12 @@
-//! Gatekeeper runtime: unix sockets, pending-request state machine,
-//! kernel-TTL grants, periodic expiry reconciliation.
+//! Gatekeeper runtime core: shared state, startup, accept loops, background
+//! reconcilers, and the MCP-side `access.request` pipeline.
 //!
 //! `mcp.sock` accepts requests but cannot approve; approvals arrive on
-//! `admin.sock` (0600). No approver connected → deny immediately; silent
-//! past timeout → auto-deny.
+//! `admin.sock` (0600, see [`crate::admin`]). No approver connected → deny
+//! immediately; silent past timeout → auto-deny.
+//!
+//! Kernel install/teardown lives in [`crate::install`], boot reconciliation
+//! in [`crate::reconcile`] — the same split gk-tui got in the last round.
 
 use std::collections::HashMap;
 use std::os::unix::fs::PermissionsExt;
@@ -15,16 +18,19 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{broadcast, oneshot, Mutex};
 
-use gk_core::nft::{
-    acct_set, counter_in, counter_out, Batch, CHAIN_ACCT_IN, CHAIN_ACCT_OUT, Dir, ElemDst,
-    GrantElem, NftCli,
-};
+use gk_core::nft::{counter_in, counter_out, Batch, NftCli};
 use gk_core::protocol::*;
-use gk_core::wire::PendingRowWire;
+use gk_core::types::{fmt_ttl, parse_ttl, PortSpec, SpecError, Target};
 use serde::Serialize;
-use gk_core::types::{fmt_ttl, parse_ttl, PortSpec, Proto, SpecError, Target};
 
-use crate::ledger::{now_secs, ttl_expires, Decide, DenyCode, GrantRow, GrantState, Ledger, NewGrant};
+use crate::admin::handle_admin;
+use crate::install::{
+    install_carves, install_grant, install_scope, rebuild_acct, sweep_grant_objs,
+};
+use crate::ledger::{
+    now_secs, ttl_expires, Decide, DenyCode, GrantRow, GrantState, Ledger, NewGrant,
+};
+use crate::reconcile::reconcile_on_boot;
 use crate::Config;
 
 pub struct State {
@@ -85,109 +91,9 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
         std::fs::set_permissions(&st.cfg.mcp_socket, std::fs::Permissions::from_mode(0o660))?;
     }
 
-    // expiry reconciler: kernel reaps elements via TTL; we flip ledger rows + notify.
-    {
-        let st = st.clone();
-        tokio::spawn(async move {
-            loop {
-                tokio::time::sleep(Duration::from_secs(2)).await;
-                // list(Approved), not active(): active() hides expired rows this loop flips.
-                let approved = st.ledger.list(GrantState::Approved).await;
-                let now = now_secs() as f64;
-                let expired: Vec<i64> = approved
-                    .iter()
-                    .filter(|g| g.expires_at.map(|e| e <= now).unwrap_or(true))
-                    .map(|g| g.id)
-                    .collect();
-                if !expired.is_empty() {
-                    for id in &expired {
-                        st.ledger.decide(*id, Decide::ExpireByKernel).await;
-                        emit(&st, method::EV_EXPIRED, EvExpired { grant_id: id.to_string() });
-                    }
-                    // kernel already reaped the elements (TTL); now mirror the
-                    // ledger into accounting chains and drop dead objects.
-                    if let Err(e) = rebuild_acct(&st).await {
-                        tracing::warn!(%e, "acct rebuild after expiry failed");
-                    }
-                    for id in &expired {
-                        sweep_grant_objs(&st, *id).await;
-                    }
-                }
-            }
-        });
-    }
-
-    // Stats poller (~2s). Ledger for identity/countdown; named counters for
-    // bytes. Runs only while an admin is connected.
+    spawn_expiry_reconciler(st.clone());
     if !st.cfg.dry_run {
-        let st = st.clone();
-        tokio::spawn(async move {
-            use std::time::Instant;
-            // gid -> (last total bytes, when counters last advanced)
-            let mut seen: HashMap<i64, (u64, Instant)> = HashMap::new();
-            loop {
-                tokio::time::sleep(Duration::from_secs(2)).await;
-                if st.admins_online.load(Ordering::SeqCst) == 0 {
-                    continue;
-                }
-                let rows = st.ledger.list(GrantState::Approved).await;
-                if rows.is_empty() {
-                    seen.clear();
-                    continue;
-                }
-                let counters_json = match st.nft.list_json("counters", None).await {
-                    Ok(c) => c,
-                    Err(e) => {
-                        tracing::warn!(%e, "traffic poll: counter list failed");
-                        continue;
-                    }
-                };
-                let poll = gk_core::nft::parse_poll(
-                    &serde_json::json!({ "nftables": [] }),
-                    &counters_json,
-                    &st.cfg.nft_table,
-                );
-                let now = now_secs();
-                let mut stats: Vec<GrantStat> = Vec::new();
-                for g in &rows {
-                    let b_out = poll.counters.get(&counter_out(g.id)).map(|c| c.1).unwrap_or(0);
-                    let b_in = poll.counters.get(&counter_in(g.id)).map(|c| c.1).unwrap_or(0);
-                    let total = b_out + b_in;
-                    let since_moved = match seen.get(&g.id) {
-                        None => {
-                            // first sighting: baseline only
-                            seen.insert(g.id, (total, Instant::now()));
-                            None
-                        }
-                        Some((prev_total, last)) => {
-                            if total != *prev_total {
-                                seen.insert(g.id, (total, Instant::now()));
-                                Some(0)
-                            } else {
-                                Some(last.elapsed().as_secs())
-                            }
-                        }
-                    };
-                    let stat = GrantStat {
-                        grant_id: g.id.to_string(),
-                        name: g.target.clone(),
-                        dst: serde_json::from_str(&g.dst_json).unwrap_or_default(),
-                        dst_port: PortSpec { from: g.port_from, to: g.port_to },
-                        proto: g.proto,
-                        seconds_remaining: g
-                            .expires_at
-                            .map(|e| (e as u64).saturating_sub(now))
-                            .unwrap_or(0),
-                        secs_since_last_packet: since_moved,
-                        bytes_sent: b_out,
-                        bytes_received: b_in,
-                    };
-                    stats.push(stat);
-                }
-                seen.retain(|gid, _| rows.iter().any(|g| g.id == *gid));
-                emit(&st, method::EV_TRAFFIC, EvTraffic { grants: stats });
-            }
-        });
+        spawn_stats_poller(st.clone());
     }
 
     {
@@ -221,7 +127,127 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
     }
 }
 
-fn peer_cred(s: &UnixStream) -> Option<tokio::net::unix::UCred> {
+/// Kernel reaps elements via TTL; this loop flips ledger rows + notifies.
+fn spawn_expiry_reconciler(st: Arc<State>) {
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            // list(Approved), not active(): active() hides expired rows this loop flips.
+            let approved = st.ledger.list(GrantState::Approved).await;
+            let now = now_secs() as f64;
+            let expired: Vec<i64> = approved
+                .iter()
+                .filter(|g| g.expires_at.map(|e| e <= now).unwrap_or(true))
+                .map(|g| g.id)
+                .collect();
+            if !expired.is_empty() {
+                for id in &expired {
+                    st.ledger.decide(*id, Decide::ExpireByKernel).await;
+                    emit(
+                        &st,
+                        method::EV_EXPIRED,
+                        EvExpired {
+                            grant_id: id.to_string(),
+                        },
+                    );
+                }
+                // kernel already reaped the elements (TTL); now mirror the
+                // ledger into accounting chains and drop dead objects.
+                if let Err(e) = rebuild_acct(&st).await {
+                    tracing::warn!(%e, "acct rebuild after expiry failed");
+                }
+                for id in &expired {
+                    sweep_grant_objs(&st, *id).await;
+                }
+            }
+        }
+    });
+}
+
+/// Stats poller (~2s). Ledger for identity/countdown; named counters for
+/// bytes. Runs only while an admin is connected.
+fn spawn_stats_poller(st: Arc<State>) {
+    tokio::spawn(async move {
+        use std::time::Instant;
+        // gid -> (last total bytes, when counters last advanced)
+        let mut seen: HashMap<i64, (u64, Instant)> = HashMap::new();
+        loop {
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            if st.admins_online.load(Ordering::SeqCst) == 0 {
+                continue;
+            }
+            let rows = st.ledger.list(GrantState::Approved).await;
+            if rows.is_empty() {
+                seen.clear();
+                continue;
+            }
+            let counters_json = match st.nft.list_json("counters", None).await {
+                Ok(c) => c,
+                Err(e) => {
+                    tracing::warn!(%e, "traffic poll: counter list failed");
+                    continue;
+                }
+            };
+            let poll = gk_core::nft::parse_poll(
+                &serde_json::json!({ "nftables": [] }),
+                &counters_json,
+                &st.cfg.nft_table,
+            );
+            let now = now_secs();
+            let mut stats: Vec<GrantStat> = Vec::new();
+            for g in &rows {
+                let b_out = poll
+                    .counters
+                    .get(&counter_out(g.id))
+                    .map(|c| c.1)
+                    .unwrap_or(0);
+                let b_in = poll
+                    .counters
+                    .get(&counter_in(g.id))
+                    .map(|c| c.1)
+                    .unwrap_or(0);
+                let total = b_out + b_in;
+                let since_moved = match seen.get(&g.id) {
+                    None => {
+                        // first sighting: baseline only
+                        seen.insert(g.id, (total, Instant::now()));
+                        None
+                    }
+                    Some((prev_total, last)) => {
+                        if total != *prev_total {
+                            seen.insert(g.id, (total, Instant::now()));
+                            Some(0)
+                        } else {
+                            Some(last.elapsed().as_secs())
+                        }
+                    }
+                };
+                let stat = GrantStat {
+                    grant_id: g.id.to_string(),
+                    name: g.target.clone(),
+                    dst: serde_json::from_str(&g.dst_json).unwrap_or_default(),
+                    dst_port: PortSpec {
+                        from: g.port_from,
+                        to: g.port_to,
+                    },
+                    proto: g.proto,
+                    seconds_remaining: g
+                        .expires_at
+                        .map(|e| (e as u64).saturating_sub(now))
+                        .unwrap_or(0),
+                    secs_since_last_packet: since_moved,
+                    bytes_sent: b_out,
+                    bytes_received: b_in,
+                };
+                stats.push(stat);
+            }
+            seen.retain(|gid, _| rows.iter().any(|g| g.id == *gid));
+            emit(&st, method::EV_TRAFFIC, EvTraffic { grants: stats });
+        }
+    });
+}
+
+pub(crate) fn peer_cred(s: &UnixStream) -> Option<tokio::net::unix::UCred> {
     s.peer_cred().ok()
 }
 
@@ -267,7 +293,11 @@ async fn handle_mcp(stream: UnixStream, st: Arc<State>) {
         };
         if req.method != method::ACCESS_REQUEST {
             resp_tx
-                .send(rpc_err_str(&req.id, -32601, "only access.request is served here"))
+                .send(rpc_err_str(
+                    &req.id,
+                    -32601,
+                    "only access.request is served here",
+                ))
                 .ok();
         } else {
             inflight.fetch_add(1, Ordering::SeqCst);
@@ -290,11 +320,7 @@ async fn handle_mcp(stream: UnixStream, st: Arc<State>) {
 
 /// access.request pipeline: validate → dedup → ledger → human or auto-deny.
 /// `respond` is called exactly once with the serialized JSON-RPC reply line.
-fn dispatch_access(
-    req: RpcRequest,
-    st: Arc<State>,
-    respond: impl Fn(String) + Send + 'static,
-) {
+fn dispatch_access(req: RpcRequest, st: Arc<State>, respond: impl Fn(String) + Send + 'static) {
     tokio::spawn(async move {
         let id = req.id.clone();
         let inner = respond;
@@ -353,7 +379,11 @@ fn dispatch_access(
         if st.admins_online.load(Ordering::SeqCst) == 0 {
             let resp = RpcResponse::ok(
                 &id,
-                Verdict::Denied { reason_code: DenyReason::ApproverOffline, grant_id: None, note: None },
+                Verdict::Denied {
+                    reason_code: DenyReason::ApproverOffline,
+                    grant_id: None,
+                    note: None,
+                },
             );
             respond(resp_line(&resp));
             return;
@@ -415,10 +445,15 @@ fn dispatch_access(
         {
             Ok(Ok(HumanDecision::Approve { ttl_secs })) => {
                 let granted = cap_ttl(ttl_secs.map(Duration::from_secs).unwrap_or(ttl), &st);
-                match install_grant(&st, &target, params.dst_port, gid, params.proto, granted).await {
+                match install_grant(&st, &target, params.dst_port, gid, params.proto, granted).await
+                {
                     Ok((eff, dsts)) => {
                         let exp = ttl_expires(granted);
-                        if !st.ledger.decide(gid, Decide::Approve { expires_at: exp }).await {
+                        if !st
+                            .ledger
+                            .decide(gid, Decide::Approve { expires_at: exp })
+                            .await
+                        {
                             tracing::error!(gid, "ledger failed to flip pending->approved");
                         }
                         // Persist this DNS resolution so later delete uses the same IPs.
@@ -427,7 +462,10 @@ fn dispatch_access(
                         )
                         .unwrap_or_else(|_| "[]".into());
                         if !st.ledger.set_dst(gid, dst_json).await {
-                            tracing::warn!(gid, "set_dst: row not approved when persisting resolution");
+                            tracing::warn!(
+                                gid,
+                                "set_dst: row not approved when persisting resolution"
+                            );
                         }
                         // Accounting is best-effort; stats never gate enforcement.
                         if let Err(e) = rebuild_acct(&st).await {
@@ -437,14 +475,10 @@ fn dispatch_access(
                         emit(
                             &st,
                             method::EV_DECIDED,
-                            EvDecided {
-                                grant_id: Some(gid.to_string()),
-                                state: "approved".into(),
-                                reason_code: None,
-                                note: None,
-                                ttl_granted: Some(fmt_ttl(granted)),
-                                expires_at: Some(fmt_unix(exp)),
-                                grants_removed: None,
+                            EvDecided::Approved {
+                                grant_id: gid.to_string(),
+                                ttl_granted: fmt_ttl(granted),
+                                expires_at: fmt_unix(exp),
                             },
                         );
                         Verdict::Approved {
@@ -458,10 +492,13 @@ fn dispatch_access(
                         // nft apply failed: kernel keeps prior state; deny rather than half-install.
                         tracing::error!(gid, %e, "nft install failed — denying");
                         st.ledger
-                            .decide(gid, Decide::Deny {
-                                code: DenyCode::InstallFailed,
-                                note: Some(e.clone()),
-                            })
+                            .decide(
+                                gid,
+                                Decide::Deny {
+                                    code: DenyCode::InstallFailed,
+                                    note: Some(e.clone()),
+                                },
+                            )
                             .await;
                         Verdict::Denied {
                             reason_code: DenyReason::InstallFailed,
@@ -473,572 +510,59 @@ fn dispatch_access(
             }
             Ok(Ok(HumanDecision::Deny { note })) => {
                 st.ledger
-                    .decide(gid, Decide::Deny { code: DenyCode::HumanDenied, note: note.clone() })
+                    .decide(
+                        gid,
+                        Decide::Deny {
+                            code: DenyCode::HumanDenied,
+                            note: note.clone(),
+                        },
+                    )
                     .await;
-                Verdict::Denied { reason_code: DenyReason::HumanDenied, grant_id: Some(gid.to_string()), note }
+                Verdict::Denied {
+                    reason_code: DenyReason::HumanDenied,
+                    grant_id: Some(gid.to_string()),
+                    note,
+                }
             }
             // Err(RecvError)=sender dropped (shutdown) or Elapsed=approver silent → both deny
             Ok(Err(_)) | Err(_) => {
                 st.ledger
-                    .decide(gid, Decide::Deny { code: DenyCode::ApproverTimeout, note: None })
+                    .decide(
+                        gid,
+                        Decide::Deny {
+                            code: DenyCode::ApproverTimeout,
+                            note: None,
+                        },
+                    )
                     .await;
-                Verdict::Denied { reason_code: DenyReason::ApproverTimeout, grant_id: Some(gid.to_string()), note: None }
+                Verdict::Denied {
+                    reason_code: DenyReason::ApproverTimeout,
+                    grant_id: Some(gid.to_string()),
+                    note: None,
+                }
             }
         };
 
         let resp = RpcResponse::ok(&id, &verdict);
         // Notify TUI for every verdict that has a row. Offline denies have neither.
-        if let Verdict::Denied { grant_id: Some(gid), reason_code, note } = &verdict {
+        if let Verdict::Denied {
+            grant_id: Some(gid),
+            reason_code,
+            note,
+        } = &verdict
+        {
             emit(
                 &st,
                 method::EV_DECIDED,
-                EvDecided {
-                    grant_id: Some(gid.clone()),
-                    state: "denied".into(),
-                    reason_code: Some(*reason_code),
-                    note: Some(note.clone()),
-                    ttl_granted: None,
-                    expires_at: None,
-                    grants_removed: None,
+                EvDecided::Denied {
+                    grant_id: gid.clone(),
+                    reason_code: *reason_code,
+                    note: note.clone(),
                 },
             );
         }
         respond(resp_line(&resp));
     });
-}
-
-/// Install kernel elements. Hosts are resolved here; the kernel gets IPs only.
-/// Returns (effective view, installed dsts) for dst_json.
-async fn install_grant(
-    st: &Arc<State>,
-    target: &Target,
-    port_spec: PortSpec,
-    gid: i64,
-    proto: Proto,
-    ttl: Duration,
-) -> Result<(EffectiveGrant, Vec<ElemDst>), String> {
-    let port = PortSpec { from: port_spec.from, to: port_spec.to };
-    let dsts = target_elems(target).await?;
-
-    let mut b = Batch::with_table(&st.cfg.nft_table);
-    for d in &dsts {
-        b.add_grant(&GrantElem { dst: d.clone(), proto, port }, ttl, gid);
-    }
-    if !st.cfg.dry_run {
-        st.nft.apply(&b).await.map_err(|e| e.to_string())?;
-    }
-    let eff_dst = match &dsts[0] {
-        ElemDst::Ip(ip) => ip.to_string(),
-        ElemDst::Net(n) => n.to_string(),
-    };
-    Ok((EffectiveGrant { dst: eff_dst, dst_port: port, proto }, dsts))
-}
-
-/// Scope egress to `agent_user`. Unresolved uid => empty list => host-wide.
-async fn install_scope(st: &Arc<State>) -> anyhow::Result<()> {
-    let mut b = Batch::with_table(&st.cfg.nft_table);
-    match st.cfg.agent_uid {
-        Some(uid) => {
-            b.rebuild_scope(&[uid]);
-            tracing::info!(uid, user = %st.cfg.agent_user, "egress enforcement scoped to agent uid");
-        }
-        None => {
-            b.rebuild_scope(&[]);
-            tracing::warn!(
-                user = %st.cfg.agent_user,
-                "agent_user unresolved — enforcing host-wide (all uids policed)"
-            );
-        }
-    }
-    st.nft.apply(&b)
-        .await
-        .map_err(|e| anyhow::anyhow!("scope install failed: {e}"))
-}
-
-/// Flush carve sets, resolve hostnames, install the operator allow list.
-async fn install_carves(st: &Arc<State>) -> anyhow::Result<()> {
-    let mut b = Batch::with_table(&st.cfg.nft_table);
-    b.ensure_carve_sets();
-    b.flush_carves();
-    let mut n = 0usize;
-    // add-of-existing-element aborts an nft batch: dedupe resolved tuples
-    let mut seen: std::collections::HashSet<(String, u8, u16, u16)> = Default::default();
-    for (target, port, proto) in &st.cfg.allow {
-        let dsts = target_elems(target)
-            .await
-            .map_err(|e| anyhow::anyhow!("allow {}: {e}", target.canonical()))?;
-        anyhow::ensure!(!dsts.is_empty(), "allow {}: resolved to zero addresses", target.canonical());
-        for d in &dsts {
-            let key = (d.canonical(), if *proto == Proto::Tcp { 0 } else { 1 }, port.from, port.to);
-            if !seen.insert(key) {
-                tracing::warn!(target = %target.canonical(), "allow: duplicate tuple skipped");
-                continue;
-            }
-            b.add_carve(&GrantElem { dst: d.clone(), proto: *proto, port: *port });
-            n += 1;
-        }
-        tracing::info!(target = %target.canonical(), %proto, ports = %format!("{}-{}", port.from, port.to), addrs = dsts.len(), "allow entry installed");
-    }
-    if !st.cfg.dry_run {
-        st.nft.apply(&b).await.map_err(|e| anyhow::anyhow!("carve install failed: {e}"))?;
-    }
-    tracing::info!(entries = st.cfg.allow.len(), elements = n, "operator allow list installed");
-    Ok(())
-}
-
-async fn target_elems(t: &Target) -> Result<Vec<ElemDst>, String> {
-    match t {
-        Target::Ip(ip) => Ok(vec![ElemDst::Ip(*ip)]),
-        Target::Net(n) => Ok(vec![ElemDst::Net(*n)]),
-        Target::Host(h) => resolve_host(h).await,
-    }
-}
-
-async fn resolve_host(h: &str) -> Result<Vec<ElemDst>, String> {
-    let addrs = tokio::net::lookup_host((h, 0))
-        .await
-        .map_err(|e| format!("resolve {h}: {e}"))?;
-    let mut out: Vec<ElemDst> = addrs.map(|a| ElemDst::Ip(a.ip())).collect();
-    out.sort_by_key(|e| match e {
-        ElemDst::Ip(ip) => ip.to_string(),
-        _ => String::new(),
-    });
-    out.dedup();
-    if out.is_empty() {
-        return Err(format!("no addresses for host {h}"));
-    }
-    Ok(out)
-}
-
-/// Dsts for a ledger row: persisted dst_json when present, not a fresh lookup.
-async fn row_elems(st: &Arc<State>, row: &GrantRow) -> Result<Vec<ElemDst>, String> {
-    let stored: Vec<String> = serde_json::from_str(&row.dst_json).unwrap_or_default();
-    if !stored.is_empty() {
-        let out: Vec<ElemDst> = stored.iter().filter_map(|s| ElemDst::from_canonical(s)).collect();
-        if out.is_empty() {
-            return Err(format!("dst_json unparseable: {}", row.dst_json));
-        }
-        return Ok(out);
-    }
-    let _ = st;
-    target_elems(&parse_canonical_target(&row.target)?).await
-}
-
-/// Rebuild accounting chains from approved rows. Count-only; no verdicts.
-async fn rebuild_acct(st: &Arc<State>) -> Result<(), String> {
-    if st.cfg.dry_run {
-        return Ok(());
-    }
-    let rows = st.ledger.list(GrantState::Approved).await;
-    let mut b = Batch::with_table(&st.cfg.nft_table);
-    b.flush_chain(CHAIN_ACCT_OUT);
-    b.flush_chain(CHAIN_ACCT_IN);
-    for g in &rows {
-        let dsts = match row_elems(st, g).await {
-            Ok(d) => d,
-            Err(e) => {
-                tracing::warn!(id = g.id, %e, "acct: dst resolution failed (stats only)");
-                continue;
-            }
-        };
-        let proto = g.proto;
-        let port = PortSpec { from: g.port_from, to: g.port_to };
-        for dir in [Dir::Out, Dir::In] {
-            for v6 in [false, true] {
-                let fam: Vec<&ElemDst> = dsts.iter().filter(|d| d.is_v6() == v6).collect();
-                if fam.is_empty() {
-                    continue;
-                }
-                b.add_counter(&dir.counter(g.id));
-                b.add_acct_set(g.id, dir, v6);
-                for d in fam {
-                    b.add_acct_elem(g.id, dir, &GrantElem { dst: d.clone(), proto, port });
-                }
-                b.add_acct_rule(g.id, dir, proto, v6);
-            }
-        }
-    }
-    st.nft.apply(&b).await.map_err(|e| e.to_string())
-}
-
-/// Sweep per-grant objects after a grant leaves approved.
-/// Run after rebuild_acct so objects are unreferenced. One batch per object
-/// (deletes are not idempotent).
-async fn sweep_grant_objs(st: &Arc<State>, gid: i64) {
-    if st.cfg.dry_run {
-        return;
-    }
-    let mut names: Vec<(bool, String)> = Vec::new(); // (is_counter, name)
-    for dir in [Dir::Out, Dir::In] {
-        for v6 in [false, true] {
-            names.push((false, acct_set(gid, dir, v6)));
-        }
-        names.push((true, dir.counter(gid)));
-    }
-    for (is_counter, name) in names {
-        let mut b = Batch::with_table(&st.cfg.nft_table);
-        if is_counter {
-            b.delete_counter(&name);
-        } else {
-            b.delete_set(&name);
-        }
-        // ENOENT/EBUSY: a dead object may linger until the next wipe.
-        if let Err(e) = st.nft.apply(&b).await {
-            tracing::debug!(gid, %e, obj = %name, "acct sweep delete (ignored)");
-        }
-    }
-}
-
-// ---------------------------------------------------------------- reconciliation
-//
-// Boot: grants do not survive reboot (netns teardown is the reaper).
-// Across crashes in one boot, live kernel elements (`gk:g<gid>` comments)
-// are adopted; the ledger follows the kernel. Orphaned elements expire via TTL.
-
-/// Parse a `gk:g<gid>` attribution comment.
-fn grant_gid_of_comment(c: &Option<String>) -> Option<i64> {
-    c.as_deref()?.strip_prefix("gk:g")?.parse().ok()
-}
-
-/// Reconcile ledger against kernel truth at startup (see policy block above).
-async fn reconcile_on_boot(st: &Arc<State>) {
-    let elements = match st.nft.poll_live(&st.cfg.nft_table).await {
-        Ok(p) => p.elements,
-        Err(e) => {
-            // Can't read kernel: treat as no grants (fail closed).
-            tracing::error!(%e, "reconcile: cannot read nft state; reaping all ledger rows");
-            Vec::new()
-        }
-    };
-    let live_gids: std::collections::HashSet<i64> =
-        elements.iter().filter_map(|el| grant_gid_of_comment(&el.comment)).collect();
-
-    // Adopt approved rows iff a live attributed element exists and expiry has not passed.
-    let now = now_secs() as f64;
-    let mut adopted: std::collections::HashSet<i64> = std::collections::HashSet::new();
-    for g in st.ledger.list(GrantState::Approved).await {
-        let adopt = live_gids.contains(&g.id)
-            && g.expires_at.map(|e| e > now).unwrap_or(false);
-        if adopt {
-            adopted.insert(g.id);
-            tracing::info!(gid = g.id, target = %g.target, "reconcile: adopted live kernel grant");
-            continue;
-        }
-        st.ledger
-            .decide(g.id, Decide::ReapRestart { at: now, note: Some("restart-reconcile".into()) })
-            .await;
-        st.ledger.audit("reconcile", g.id, format!("reaped: {} -> expired (no live attributed element or lapsed)", g.target));
-        tracing::info!(gid = g.id, "reconcile: reaped stale approved row");
-    }
-
-    // Pending cannot survive restart: oneshot channels died with the process.
-    for g in st.ledger.list(GrantState::Pending).await {
-        st.ledger
-            .decide(g.id, Decide::Deny {
-                code: DenyCode::RestartOrphan,
-                note: Some("daemon restarted before decision".into()),
-            })
-            .await;
-        st.ledger.audit("reconcile", g.id, "pending row denied: orphaned by restart");
-    }
-
-    // Orphaned live elements (crash between nft apply and ledger flip): leave
-    // for kernel TTL. Unattributed elements: warn only.
-    for el in &elements {
-        match grant_gid_of_comment(&el.comment) {
-            Some(gid) if !adopted.contains(&gid) => {
-                tracing::warn!(gid, dst = %el.dst, ttl = el.expires_secs,
-                    "reconcile: orphaned grant element left for kernel TTL (no corrective action)");
-            }
-            None => {
-                tracing::warn!(dst = %el.dst,
-                    "reconcile: unattributed element in grant set (left alone; check table ownership)");
-            }
-            _ => {}
-        }
-    }
-
-    // Accounting is derived state (counters only) — rebuild from the adopted set.
-    if let Err(e) = rebuild_acct(st).await {
-        tracing::warn!(%e, "reconcile: acct rebuild failed");
-    }
-}
-
-// ---------------------------------------------------------------- admin side
-
-async fn handle_admin(stream: UnixStream, st: Arc<State>) {
-    if let Some(c) = peer_cred(&stream) {
-        tracing::info!(uid = c.uid(), "admin client connected");
-    }
-    st.admins_online.fetch_add(1, Ordering::SeqCst);
-    let mut sub_rx = st.events.subscribe();
-    let (mut r, mut w) = stream.into_split();
-    let mut lines = BufReader::new(&mut r).lines();
-    loop {
-        tokio::select! {
-            ev = sub_rx.recv() => {
-                match ev {
-                    Ok(msg) => { if w.write_all(msg.as_bytes()).await.is_err() { break } }
-                    Err(_) => break, // lagged/closed
-                }
-            }
-            l = lines.next_line() => {
-                let line = match l {
-                    Ok(Some(s)) => s,
-                    _ => break,
-                };
-                let req: RpcRequest = match serde_json::from_str(line.trim()) {
-                    Ok(r) => r,
-                    Err(_) => continue,
-                };
-                let resp = handle_admin_cmd(&req, &st).await;
-                if w.write_all(format!("{}\n", resp_line(&resp)).as_bytes()).await.is_err() {
-                    break;
-                }
-            }
-        }
-    }
-    st.admins_online.fetch_sub(1, Ordering::SeqCst);
-}
-
-async fn handle_admin_cmd(req: &RpcRequest, st: &Arc<State>) -> RpcResponse {
-    match req.method.as_str() {
-        method::APPROVE => match parse_id_ttl(req) {
-            Some((gid, ttl)) => {
-                let tx = st.pending.lock().await.remove(&gid);
-                match tx {
-                    Some(tx) => {
-                        tx.send(HumanDecision::Approve { ttl_secs: ttl }).ok();
-                        RpcResponse::ok(&req.id, serde_json::json!({"queued": true}))
-                    }
-                    None => RpcResponse::err(&req.id, -32004, "no such pending request"),
-                }
-            }
-            None => RpcResponse::err(&req.id, -32602, "need grant_id (+ttl_secs?)"),
-        },
-        method::DENY => {
-            let gid = parse_id(req);
-            let note = req
-                .params
-                .as_ref()
-                .and_then(|p| p.get("note"))
-                .and_then(|v| v.as_str())
-                .map(String::from);
-            let tx = match gid {
-                Some(gid) => st.pending.lock().await.remove(&gid),
-                None => None,
-            };
-            match tx {
-                Some(tx) => {
-                    tx.send(HumanDecision::Deny { note }).ok();
-                    RpcResponse::ok(&req.id, serde_json::json!({"queued": true}))
-                }
-                None => RpcResponse::err(&req.id, -32004, "no such pending request"),
-            }
-        }
-        method::REVOKE => match parse_id(req) {
-            Some(gid) => {
-                revoke(st, gid).await;
-                RpcResponse::ok(&req.id, serde_json::json!({"revoked": gid.to_string()}))
-            }
-            None => RpcResponse::err(&req.id, -32602, "need grant_id"),
-        },
-        method::LIST_GRANTS => {
-            let rows = st.ledger.list(GrantState::Approved).await;
-            RpcResponse::ok(&req.id, rows)
-        }
-        method::LIST_ALLOW => {
-            let out: Vec<serde_json::Value> = st
-                .cfg
-                .allow
-                .iter()
-                .map(|(t, p, proto)| {
-                    serde_json::json!({
-                        "target": t.canonical(),
-                        "port_from": p.from,
-                        "port_to": p.to,
-                        "proto": proto,
-                    })
-                })
-                .collect();
-            RpcResponse::ok(&req.id, out)
-        }
-        method::LIST_PENDING => {
-            // Snapshot for TUI reconnect. Only rows with a live decision channel are decidable.
-            let rows = st.ledger.list(GrantState::Pending).await;
-            let live = st.pending.lock().await;
-            let out: Vec<PendingRowWire> = rows
-                .into_iter()
-                .map(|r| {
-                    let waiting = live.contains_key(&r.id);
-                    PendingRowWire { row: r, waiting }
-                })
-                .collect();
-            RpcResponse::ok(&req.id, out)
-        }
-        method::LIST_HISTORY => {
-            // Decided rows. Unknown state is a client error, not a silent empty.
-            let p = req.params.clone().unwrap_or(serde_json::Value::Null);
-            let state = match p.get("state").and_then(|v| v.as_str()) {
-                Some(s) => match GrantState::parse(s) {
-                    // pending is not history
-                    Some(GrantState::Pending) | None => {
-                        return RpcResponse::err(&req.id, -32602, format!("bad history state {s:?}"))
-                    }
-                    Some(other) => Some(other),
-                },
-                None => None,
-            };
-            let limit = match p.get("limit").and_then(|v| v.as_u64()) {
-                Some(l) if l > 0 && l <= 1000 => l as u32,
-                Some(_) => return RpcResponse::err(&req.id, -32602, "limit must be 1..=1000"),
-                None => 100,
-            };
-            let rows = st.ledger.history(state, limit).await;
-            RpcResponse::ok(&req.id, rows)
-        }
-        method::STOP_GRANTS => {
-            // Emergency stop: terminate grants; baseline rules untouched.
-            tracing::info!("stop.grants invoked");
-            let mut n = 0usize;
-            let rows = st.ledger.list(GrantState::Approved).await;
-            let mut b = Batch::with_table(&st.cfg.nft_table);
-            for g in &rows {
-                let proto = g.proto;
-                let port = PortSpec { from: g.port_from, to: g.port_to };
-                match row_elems(st, g).await {
-                    Ok(dsts) => {
-                        for d in dsts {
-                            b.delete_grant(&GrantElem { dst: d, proto, port });
-                        }
-                        n += 1;
-                    }
-                    Err(e) => tracing::error!(id = g.id, %e, "stop.grants resolve failed"),
-                }
-            }
-            if !st.cfg.dry_run && n > 0 {
-                if let Err(e) = st.nft.apply(&b).await {
-                    // Atomic batch hit a missing element: retry per grant, tolerate ENOENT.
-                    tracing::warn!(%e, "stop.grants batch failed; per-grant fallback");
-                    let mut ok = 0usize;
-                    for g in &rows {
-                        let proto = g.proto;
-                        let port = PortSpec { from: g.port_from, to: g.port_to };
-                        if let Ok(dsts) = row_elems(st, g).await {
-                            let mut gb = Batch::with_table(&st.cfg.nft_table);
-                            for d in dsts {
-                                gb.delete_grant(&GrantElem { dst: d, proto, port });
-                            }
-                            match st.nft.apply(&gb).await {
-                                Ok(()) => ok += 1,
-                                Err(e2) if e2.to_string().contains("No such file") => ok += 1, // already gone
-                                Err(e2) => tracing::error!(id = g.id, %e2, "stop.grants per-grant delete failed"),
-                            }
-                        }
-                    }
-                    n = ok;
-                }
-            }
-            // deny everything currently pending + flip rows
-            let pendings: Vec<i64> = st.pending.lock().await.keys().copied().collect();
-            for gid in pendings {
-                if let Some(tx) = st.pending.lock().await.remove(&gid) {
-                    tx.send(HumanDecision::Deny { note: Some("stopped by operator".into()) }).ok();
-                }
-            }
-            // flip rows (pending ones were just denied above via their channels)
-            for g in &rows {
-                st.ledger
-                    .decide(g.id, Decide::Revoke { at: now_secs() as f64, note: Some("stop.grants".into()) })
-                    .await;
-            }
-            // accounting follows the ledger: chains flush empty, objects swept.
-            if let Err(e) = rebuild_acct(st).await {
-                tracing::warn!(%e, "acct rebuild after stop.grants failed");
-            }
-            for g in &rows {
-                sweep_grant_objs(st, g.id).await;
-            }
-            emit(
-                st,
-                method::EV_DECIDED,
-                EvDecided {
-                    grant_id: None,
-                    state: "all_stopped".into(),
-                    reason_code: None,
-                    note: None,
-                    ttl_granted: None,
-                    expires_at: None,
-                    grants_removed: Some(n),
-                },
-            );
-            RpcResponse::ok(&req.id, serde_json::json!({"revoked": n}))
-        }
-        method::SUBSCRIBE => RpcResponse::ok(
-            &req.id,
-            SubscribeAck {
-                events: [
-                    method::EV_REQUEST_NEW, method::EV_DECIDED,
-                    method::EV_EXPIRED, method::EV_TRAFFIC, method::EV_ERROR
-                ]
-                .map(String::from)
-                .to_vec(),
-                // TUI countdown needs the timeout; version detects daemon skew.
-                approver_timeout_secs: st.cfg.approver_timeout_secs,
-                version: env!("CARGO_PKG_VERSION").into(),
-            },
-        ),
-        _ => RpcResponse::err(&req.id, -32601, "unknown method"),
-    }
-}
-
-async fn revoke(st: &Arc<State>, gid: i64) {
-    if let Some(tx) = st.pending.lock().await.remove(&gid) {
-        tx.send(HumanDecision::Deny { note: Some("revoked".into()) }).ok();
-    }
-    let rows = st.ledger.list(GrantState::Approved).await;
-    if let Some(g) = rows.iter().find(|g| g.id == gid) {
-        let proto = g.proto;
-        let port = PortSpec { from: g.port_from, to: g.port_to };
-        if !st.cfg.dry_run {
-            match row_elems(st, g).await {
-                Ok(dsts) => {
-                    let mut b = Batch::with_table(&st.cfg.nft_table);
-                    for d in dsts {
-                        b.delete_grant(&GrantElem { dst: d, proto, port });
-                    }
-                    if let Err(e) = st.nft.apply(&b).await {
-                        tracing::error!(gid, %e, "revoke delete failed");
-                    }
-                }
-                Err(e) => tracing::error!(gid, %e, "revoke resolve failed"),
-            }
-        }
-    }
-    if !st
-        .ledger
-        .decide(gid, Decide::Revoke { at: now_secs() as f64, note: None })
-        .await
-    {
-        tracing::warn!(gid, "revoke: no approved row to flip (pending-only or already decided)");
-    }
-    if let Err(e) = rebuild_acct(st).await {
-        tracing::warn!(gid, %e, "acct rebuild after revoke failed");
-    }
-    sweep_grant_objs(st, gid).await;
-    emit(
-        st,
-        method::EV_DECIDED,
-        EvDecided {
-            grant_id: Some(gid.to_string()),
-            state: "revoked".into(),
-            reason_code: None,
-            note: None,
-            ttl_granted: None,
-            expires_at: None,
-            grants_removed: None,
-        },
-    );
 }
 
 // ------------------------------------------------------------------- helpers
@@ -1054,7 +578,8 @@ fn pick_target(p: &AccessRequestParams) -> Result<Target, SpecError> {
     if let Some(h) = &p.dst_host {
         let ok = !h.is_empty()
             && h.len() <= 253
-            && h.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_'));
+            && h.bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_'));
         if !ok {
             return Err(SpecError::BadHost(h.clone()));
         }
@@ -1070,18 +595,6 @@ fn pick_target(p: &AccessRequestParams) -> Result<Target, SpecError> {
         return Ok(Target::Net(net));
     }
     unreachable!()
-}
-
-fn parse_canonical_target(t: &str) -> Result<Target, String> {
-    if let Some(h) = t.strip_prefix("host:") {
-        Ok(Target::Host(h.into()))
-    } else if let Some(i) = t.strip_prefix("ip:") {
-        i.parse().map(Target::Ip).map_err(|e| e.to_string())
-    } else if let Some(n) = t.strip_prefix("net:") {
-        n.parse().map(Target::Net).map_err(|e| e.to_string())
-    } else {
-        Err(format!("bad canonical target: {t}"))
-    }
 }
 
 fn cap_ttl(d: Duration, st: &State) -> Duration {
@@ -1100,7 +613,8 @@ fn replay_verdict(orig: &GrantRow) -> String {
             note: Some(
                 "request with this id is already pending approval (no second popup); \
                  do not treat as granted — await the original verdict or re-request \
-                 with a new id".into(),
+                 with a new id"
+                    .into(),
             ),
         },
         GrantState::Approved => Verdict::AlreadyGranted {
@@ -1137,26 +651,17 @@ fn sanitize(s: &str) -> String {
     s.chars().filter(|c| !c.is_control()).take(280).collect()
 }
 
-/// UTC RFC3339 from unix seconds (Hinnant civil-from-days).
+/// UTC RFC3339 from unix seconds.
 pub fn fmt_unix(secs: f64) -> String {
     use chrono::{DateTime, SecondsFormat};
     DateTime::from_timestamp(secs.max(0.0) as i64, 0)
         .map(|dt| dt.to_rfc3339_opts(SecondsFormat::Secs, true))
         .unwrap_or_else(|| "-".into())
 }
-fn parse_id(req: &RpcRequest) -> Option<i64> {
-    req.params.as_ref()?.get("grant_id")?.as_str()?.parse().ok()
-}
-
-fn parse_id_ttl(req: &RpcRequest) -> Option<(i64, Option<u64>)> {
-    let id = parse_id(req)?;
-    let ttl = req.params.as_ref()?.get("ttl_secs").and_then(|v| v.as_u64());
-    Some((id, ttl))
-}
 
 /// Broadcast one event to connected approvers. Serialization failure is
 /// logged and the event dropped — a daemon never panics on the wire.
-fn emit(st: &State, method: &str, params: impl Serialize) {
+pub(crate) fn emit(st: &State, method: &str, params: impl Serialize) {
     let params = match serde_json::to_value(params) {
         Ok(v) => v,
         Err(e) => {
@@ -1190,7 +695,7 @@ fn emit(st: &State, method: &str, params: impl Serialize) {
 
 /// Serialize a response to its wire line; failure degrades to a fixed
 /// internal-error reply rather than panicking the connection task.
-fn resp_line(resp: &RpcResponse) -> String {
+pub(crate) fn resp_line(resp: &RpcResponse) -> String {
     serde_json::to_string(resp).unwrap_or_else(|e| {
         tracing::error!(%e, "response serialization failed");
         r#"{"jsonrpc":"2.0","id":null,"error":{"code":-32603,"message":"serialization failed"}}"#
@@ -1205,6 +710,7 @@ fn rpc_err_str(id: &str, code: i32, msg: impl Into<String>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use gk_core::types::Proto;
 
     #[test]
     fn unix_ts_to_rfc3339_known_values() {
@@ -1251,10 +757,18 @@ mod tests {
         assert_eq!(v["result"]["decision"], "denied");
         assert_eq!(v["result"]["reason_code"], "grant_expired");
 
-        let v = parse(replay_verdict(&row(GrantState::Denied, Some(DenyCode::ApproverTimeout), None)));
+        let v = parse(replay_verdict(&row(
+            GrantState::Denied,
+            Some(DenyCode::ApproverTimeout),
+            None,
+        )));
         assert_eq!(v["result"]["reason_code"], "approver_timeout");
 
-        let v = parse(replay_verdict(&row(GrantState::Denied, Some(DenyCode::HumanDenied), Some("out of scope"))));
+        let v = parse(replay_verdict(&row(
+            GrantState::Denied,
+            Some(DenyCode::HumanDenied),
+            Some("out of scope"),
+        )));
         assert_eq!(v["result"]["reason_code"], "human_denied");
         assert_eq!(v["result"]["note"], "out of scope");
 
@@ -1277,20 +791,29 @@ mod tests {
             tool: String::new(),
             ttl_requested: "1m".into(),
         };
-        assert!(matches!(pick_target(&p), Err(SpecError::TargetCardinality(0))));
+        assert!(matches!(
+            pick_target(&p),
+            Err(SpecError::TargetCardinality(0))
+        ));
 
         let p2 = AccessRequestParams {
             dst_ip: Some("1.2.3.4".into()),
             dst_net: Some("10.0.0.0/8".into()),
             ..p.clone()
         };
-        assert!(matches!(pick_target(&p2), Err(SpecError::TargetCardinality(2))));
+        assert!(matches!(
+            pick_target(&p2),
+            Err(SpecError::TargetCardinality(2))
+        ));
 
         let p3 = AccessRequestParams {
             dst_host: Some("bad$(host)".into()),
             ..p.clone()
         };
-        assert!(pick_target(&p3).is_err(), "shell metachars must not pass host regex");
+        assert!(
+            pick_target(&p3).is_err(),
+            "shell metachars must not pass host regex"
+        );
 
         let p4 = AccessRequestParams {
             dst_net: Some("172.16.0.0/12".into()),

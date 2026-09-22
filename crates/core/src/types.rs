@@ -120,9 +120,7 @@ pub fn parse_ttl(s: &str) -> Result<Duration, SpecError> {
         Some(b'h') => (&s[..s.len() - 1], 3600),
         _ => return Err(SpecError::BadTtl(s.to_string())),
     };
-    let n: u64 = num
-        .parse()
-        .map_err(|_| SpecError::BadTtl(s.to_string()))?;
+    let n: u64 = num.parse().map_err(|_| SpecError::BadTtl(s.to_string()))?;
     if n == 0 {
         return Err(SpecError::BadTtl(s.to_string()));
     }
@@ -167,7 +165,10 @@ mod tests {
     #[test]
     fn port_validation() {
         assert_eq!(
-            PortSpec { from: 80, to: 443 }.validate().unwrap().nft_range(),
+            PortSpec { from: 80, to: 443 }
+                .validate()
+                .unwrap()
+                .nft_range(),
             (80, 443)
         );
         let all = PortSpec { from: 0, to: 0 }.validate().unwrap();

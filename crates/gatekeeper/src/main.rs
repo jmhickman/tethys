@@ -1,5 +1,8 @@
+mod admin;
 mod config;
+mod install;
 mod ledger;
+mod reconcile;
 mod server;
 
 use std::path::PathBuf;
@@ -65,7 +68,11 @@ pub struct Config {
     /// None => owner-only socket (dev)
     pub mcp_sock_gid: Option<u32>,
     /// Operator allow list; a bad entry aborts boot.
-    pub allow: Vec<(gk_core::types::Target, gk_core::types::PortSpec, gk_core::types::Proto)>,
+    pub allow: Vec<(
+        gk_core::types::Target,
+        gk_core::types::PortSpec,
+        gk_core::types::Proto,
+    )>,
     pub dry_run: bool,
 }
 
@@ -112,12 +119,14 @@ async fn main() -> anyhow::Result<()> {
 
     // Allow list: CLI entries replace the file's (same precedence rule as
     // every other knob). Parse eagerly — an unparseable entry is fatal.
-    let allow_src = if cli.allow.is_empty() { &file.allow } else { &cli.allow };
+    let allow_src = if cli.allow.is_empty() {
+        &file.allow
+    } else {
+        &cli.allow
+    };
     for entry in allow_src {
-        cfg.allow.push(
-            config::parse_allow(entry)
-                .map_err(|e| anyhow::anyhow!("config `allow`: {e}"))?,
-        );
+        cfg.allow
+            .push(config::parse_allow(entry).map_err(|e| anyhow::anyhow!("config `allow`: {e}"))?);
     }
 
     // Identity resolution: a named-but-missing mcp user is fatal, since
