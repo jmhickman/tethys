@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 """E2E for gatekeeper over real unix sockets + live nftables.
 
-Run from workspace root with a daemon already listening on /tmp/gk-test/*
-(harness below starts one). Requires: built binaries, a privileged account
-(capable of nftables changes), and nft.
+Run from workspace root as a privileged account (nftables changes + nft
+required); the harness starts its own daemon on /tmp/gk-test/*. NOTE: the
+test enforces into the real `inet gatekeeper` table by design (kernel-truth
+proof) — on a box also running a production gatekeeper, run this in a
+network namespace instead, or expect to restart the service afterwards.
 
 Scenarios (all must pass):
   S1 request -> admin event -> approve -> verdict + kernel element w/ expiry
@@ -33,7 +35,9 @@ def main():
     b = subprocess.run(["cargo", "build", "--workspace"], cwd=ROOT, capture_output=True, text=True)
     if b.returncode != 0:
         print("BUILD FAILED:\n", b.stderr[-2000:]); sys.exit(1)
-    subprocess.run(["pkill", "-x", "gatekeeper"])
+    # kill a leftover TEST daemon from a previous run only — never a
+    # production gatekeeper (match on this harness's distinctive cmdline)
+    subprocess.run(["pkill", "-f", "--", f"{GK_BIN} .*{DIR}/"])
     time.sleep(0.3)
     os.system(f"rm -rf {DIR} && mkdir -p {DIR}")
     gk = subprocess.Popen(
