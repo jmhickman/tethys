@@ -295,7 +295,7 @@ fn draw_table(f: &mut Frame, app: &App, a: Rect) {
     let line_h = if wrap { 2 } else { 1 };
     let body_h = inner.height.saturating_sub(1); // header row
     let visible = (body_h / line_h).max(1) as usize;
-    // keep the cursor inside the window (Table used to do this via state)
+    // keep the selected row inside the visible window
     let start = sel_row.saturating_sub(visible.saturating_sub(1));
 
     // ---- emit a padded cell row (fixed cols + optional reason) -----------

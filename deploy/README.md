@@ -56,9 +56,6 @@ gk-mcp beyond the binary.
    systemctl enable --now gatekeeper-baseline.service gatekeeper.service
    ```
 
-   Earlier revisions shipped `gk-mcp.socket` / `gk-mcp@.service`; if you find
-   them on an old install, disable and remove them (see history note below).
-
 4. **Harness MCP config** (`mcp.json` in the Hermes Capabilities UI, or the
    equivalent in any MCP client):
 
@@ -75,16 +72,6 @@ gk-mcp beyond the binary.
 
 5. **Approver side.** Run `gk-tui` (or `scopeadm`) as root — or under sudo —
    on the machine. Nothing to configure; the admin socket path is the default.
-
-## A note on history: socket-activated gk-mcp (retired)
-
-Earlier revisions shipped `gk-mcp.socket` + `gk-mcp@.service`: systemd
-accepted a unix socket and spawned one gk-mcp per connection as a dedicated
-service user, with the harness bridged in via `systemd-run --pipe`. That
-topology existed because the dev harness ran as root and needed help matching
-the peer-cred uid. With the harness running unprivileged (the standard case)
-it buys nothing — the harness spawns gk-mcp directly — and a live socket is
-a footgun, so both units are retired (git history preserves them).
 
 ## Smoke test
 

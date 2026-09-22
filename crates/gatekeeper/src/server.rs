@@ -552,7 +552,7 @@ async fn install_grant(
 /// sets, resolve hostnames (fail startup if an entry cannot resolve), add
 /// elements. Wholesale reinstall means removed config entries actually go
 /// away on restart; kernel state always equals declared config.
-/// UID-scope the egress verdict (R11): only agent_user's uid is policed by
+/// UID-scope the egress verdict: only agent_user's uid is policed by
 /// the baseline drop; everyone else on the host is exempt-accepted in the
 /// scope chain. Unresolved agent_user => empty policed list => host-wide
 /// enforcement (fail-safe: stricter, never silently off).
@@ -775,8 +775,8 @@ async fn reconcile_on_boot(st: &Arc<State>) {
 
     // Orphaned live elements (attributed to a row we just reaped/denied — the
     // crash window between nft apply and ledger flip): NOT deleted. Kernel TTL
-    // expires them normally. Unattributed elements (pre-marker binary or an
-    // operator hand) likewise: warn only. Accounting rebuild below simply won't
+    // expires them normally. Unattributed elements (installed by hand)
+    // likewise: warn only. Accounting rebuild below simply won't
     // cover them, which is honest — their ledger rows don't exist anymore.
     for el in &elements {
         match grant_gid_of_comment(&el.comment) {
@@ -1148,7 +1148,7 @@ fn replay_verdict(orig: &GrantRow) -> String {
                 Some(DenyCode::ApproverOffline) => DenyReason::ApproverOffline,
                 Some(DenyCode::ApproverTimeout) => DenyReason::ApproverTimeout,
                 Some(DenyCode::InstallFailed) => DenyReason::InstallFailed,
-                _ => DenyReason::HumanDenied, // human/orphan/legacy codes all read as "a human said no"
+                _ => DenyReason::HumanDenied, // any other code reads as "a human said no"
             },
             grant_id: Some(gid.clone()),
             note: orig.note.clone(),

@@ -55,9 +55,8 @@ impl GrantState {
     }
 }
 
-/// Why a grant was denied. `Legacy` exists ONLY to load rows written by older
-/// binaries without dropping them; nothing constructs it (grant rows age out
-/// within their TTL, so the variant disappears in practice).
+/// Why a grant was denied. The untagged catch-all keeps rows carrying an
+/// unrecognized code loadable (reported verbatim) instead of dropping them.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DenyCode {
@@ -66,11 +65,11 @@ pub enum DenyCode {
     ApproverTimeout,
     InstallFailed,
     RestartOrphan,
-    /// reconcile_on_boot found an approved row with no live attributed element
-    /// (reboot semantics R9) — the row is reaped, not revived.
+    /// reconcile_on_boot found an approved row with no live attributed
+    /// element — the row is reaped, not revived.
     RestartReconcile,
     #[serde(untagged)]
-    Legacy(String),
+    Unknown(String),
 }
 
 impl DenyCode {
@@ -82,7 +81,7 @@ impl DenyCode {
             DenyCode::InstallFailed => "install_failed",
             DenyCode::RestartOrphan => "restart_orphan",
             DenyCode::RestartReconcile => "restart_reconcile",
-            DenyCode::Legacy(s) => s,
+            DenyCode::Unknown(s) => s,
         }
     }
 }
@@ -249,7 +248,7 @@ fn row_from(r: &rusqlite::Row) -> rusqlite::Result<GrantRow> {
                 "install_failed" => DenyCode::InstallFailed,
                 "restart_orphan" => DenyCode::RestartOrphan,
                 "restart_reconcile" | "restart-reconcile" => DenyCode::RestartReconcile,
-                other => DenyCode::Legacy(other.to_string()),
+                other => DenyCode::Unknown(other.to_string()),
             }),
         note: r.get(15)?,
     })
