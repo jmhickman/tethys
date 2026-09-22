@@ -321,7 +321,7 @@ impl Batch {
 
     fn delete_in(&mut self, e: &GrantElem, set: &str) {
         self.cmds.push(json!({"delete": {"element": {
-            "family": "inet", "table": TABLE, "name": set,
+            "family": "inet", "table": &self.table, "name": set,
             "elem": [e.concat()]
         }}}));
     }
@@ -770,6 +770,67 @@ mod tests {
         // flush only — no accept rule, so all packets fall through to drop
         assert_eq!(b.cmds.len(), 1);
         assert!(b.cmds[0].get("flush").is_some());
+    }
+
+    /// Every object a batch touches must live in the batch's table — a single
+    /// missed `self.table` substitution silently deletes from the wrong table
+    /// (kernel: ENOENT) and once bit the whole revoke/stop path under
+    /// non-default nft_table. This test walks every command builder.
+    #[test]
+    fn every_command_targets_the_batches_table() {
+        let mut b = Batch::with_table("gk_alt");
+        b.ensure_base();
+        b.rebuild_scope(&[990]);
+        let e = GrantElem {
+            dst: ElemDst::Ip(ip("203.0.113.7")),
+            proto: Proto::Tcp,
+            port: PortSpec { from: 443, to: 443 },
+        };
+        b.add_grant(&e, Duration::from_secs(60), 7);
+        b.delete_grant(&e);
+        b.ensure_carve_sets();
+        b.add_carve(&e);
+        b.flush_carves();
+        b.add_acct_set(7, Dir::Out, false);
+        b.add_acct_elem(7, Dir::Out, &e);
+        b.add_acct_rule(7, Dir::Out, Proto::Tcp, false);
+        b.flush_chain(CHAIN_ACCT_OUT);
+        b.add_counter("g7_out");
+        b.delete_counter("g7_out");
+        b.delete_set("gk_m7_out");
+
+        fn walk(v: &Value, hits: &mut Vec<(String, Value)>) {
+            match v {
+                Value::Object(m) => {
+                    for (k, x) in m {
+                        if k == "table" {
+                            // two shapes: `"table": "name"` inside element/
+                            // rule ops, or `"table": {"family":..,"name":..}`
+                            match x {
+                                Value::String(_) => hits.push((k.clone(), x.clone())),
+                                Value::Object(_) => {
+                                    hits.push((k.clone(), serde_json::json!(x["name"])));
+                                    walk(x, hits);
+                                }
+                                _ => {}
+                            }
+                        } else {
+                            walk(x, hits);
+                        }
+                    }
+                }
+                Value::Array(a) => a.iter().for_each(|x| walk(x, hits)),
+                _ => {}
+            }
+        }
+        let mut hits = Vec::new();
+        for cmd in &b.cmds {
+            walk(cmd, &mut hits);
+            for (k, v) in &hits {
+                assert_eq!(v, &serde_json::json!("gk_alt"), "command with {k} hit wrong table: {cmd}");
+            }
+        }
+        assert!(!hits.is_empty(), "batch emitted no table references at all");
     }
 
     #[test]
