@@ -4,7 +4,7 @@
 
 use std::sync::Arc;
 
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 
 use gk_core::nft::{Batch, GrantElem};
@@ -16,7 +16,9 @@ use gk_core::wire::{GrantState, PendingRowWire};
 
 use crate::install::{rebuild_acct, row_elems, sweep_grant_objs};
 use crate::ledger::{now_secs, Decide};
-use crate::server::{emit, peer_cred, resp_line, CountGuard, HumanDecision, State};
+use crate::server::{
+    emit, peer_cred, read_frame, resp_line, CountGuard, Frame, HumanDecision, State,
+};
 
 pub(crate) async fn handle_admin(stream: UnixStream, st: Arc<State>) {
     // TOCTOU-001 defense-in-depth: the 0600 inode mode is the primary gate;
@@ -43,7 +45,8 @@ pub(crate) async fn handle_admin(stream: UnixStream, st: Arc<State>) {
     let _online = CountGuard::inc(&st.admins_online);
     let mut sub_rx = st.events.subscribe();
     let (mut r, mut w) = stream.into_split();
-    let mut lines = BufReader::new(&mut r).lines();
+    let mut reader = BufReader::new(&mut r);
+    let mut buf: Vec<u8> = Vec::with_capacity(4096);
     loop {
         tokio::select! {
             ev = sub_rx.recv() => {
@@ -52,10 +55,11 @@ pub(crate) async fn handle_admin(stream: UnixStream, st: Arc<State>) {
                     Err(_) => break, // lagged/closed
                 }
             }
-            l = lines.next_line() => {
-                let line = match l {
-                    Ok(Some(s)) => s,
-                    _ => break,
+            f = read_frame(&mut reader, &mut buf) => {
+                // root-only socket, but it shares the slow-loris/oversize pattern
+                let line = match f {
+                    Frame::Line(s) => s,
+                    Frame::TooLong | Frame::Idle | Frame::Eof => break,
                 };
                 let req: RpcRequest = match serde_json::from_str(line.trim()) {
                     Ok(r) => r,

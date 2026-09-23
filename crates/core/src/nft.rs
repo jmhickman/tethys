@@ -694,9 +694,16 @@ mod tests {
             ]}}
         ]});
         let st = parse_poll(&doc, &serde_json::json!({"nftables": []}), "t");
-        assert_eq!(st.elements.len(), 1, "only the well-formed 2-elem range loads");
+        assert_eq!(
+            st.elements.len(),
+            1,
+            "only the well-formed 2-elem range loads"
+        );
         assert_eq!(st.elements[0].dst, "10.0.0.4");
-        assert_eq!((st.elements[0].port_from, st.elements[0].port_to), (443, 449));
+        assert_eq!(
+            (st.elements[0].port_from, st.elements[0].port_to),
+            (443, 449)
+        );
     }
 
     #[test]

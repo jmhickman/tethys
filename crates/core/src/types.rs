@@ -126,7 +126,9 @@ pub fn parse_ttl(s: &str) -> Result<Duration, SpecError> {
     }
     // ARITHOFL-001: attacker-controlled multiplier — overflow is a bad ttl,
     // not a panic (debug) or a silently-wrapped grant (release).
-    let secs = n.checked_mul(mult).ok_or_else(|| SpecError::BadTtl(s.to_string()))?;
+    let secs = n
+        .checked_mul(mult)
+        .ok_or_else(|| SpecError::BadTtl(s.to_string()))?;
     Ok(Duration::from_secs(secs))
 }
 

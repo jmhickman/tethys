@@ -14,9 +14,10 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+use tokio::io::AsyncBufRead;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
-use tokio::sync::{broadcast, oneshot, Mutex};
+use tokio::sync::{broadcast, oneshot, Mutex, Semaphore};
 
 use gk_core::nft::{counter_in, counter_out, Batch, NftCli};
 use gk_core::protocol::*;
@@ -44,7 +45,19 @@ pub struct State {
     /// Arc so admin sessions can hold an RAII decrement guard (CountGuard)
     /// that survives task unwind.
     pub admins_online: Arc<AtomicUsize>,
+    /// RESEXHAUST-001: daemon-wide cap on requests awaiting a human. One
+    /// permit is held for the pending lifetime of each in-flight
+    /// access.request; exhausted => -32000 busy, no popup, no ledger row.
+    pub pending_budget: Arc<Semaphore>,
 }
+
+/// RESEXHAUST-001: per-mcp-connection cap on concurrently dispatched frames.
+pub(crate) const MAX_INFLIGHT: usize = 32;
+/// RESEXHAUST-003: max bytes in one NDJSON frame (64 KiB of JSON is far
+/// beyond any legitimate access.request).
+pub(crate) const MAX_FRAME: usize = 64 * 1024;
+/// RESEXHAUST-003: close a connection silent for this long (slow loris).
+pub(crate) const IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 
 pub enum HumanDecision {
     Approve { ttl_secs: Option<u64> },
@@ -75,6 +88,7 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
         pending: Mutex::new(HashMap::new()),
         events: broadcast::channel(256).0,
         admins_online: Arc::new(AtomicUsize::new(0)),
+        pending_budget: Arc::new(Semaphore::new(256)),
     });
 
     // Idempotent; fail startup if install fails so enforcement is never off.
@@ -112,7 +126,10 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
     let admin = UnixListener::bind(&st.cfg.admin_socket)?;
     drop(_umask);
     debug_assert_eq!(
-        std::fs::metadata(&st.cfg.admin_socket)?.permissions().mode() & 0o777,
+        std::fs::metadata(&st.cfg.admin_socket)?
+            .permissions()
+            .mode()
+            & 0o777,
         0o600,
         "admin.sock must be born 0600 (umask-guarded bind)"
     );
@@ -263,6 +280,34 @@ pub(crate) fn peer_cred(s: &UnixStream) -> Option<tokio::net::unix::UCred> {
     s.peer_cred().ok()
 }
 
+/// Outcome of one capped, idle-timed NDJSON frame read (RESEXHAUST-003).
+pub(crate) enum Frame {
+    Line(String),
+    TooLong,
+    Idle,
+    Eof,
+}
+
+/// One line from a BufReader: never buffers more than MAX_FRAME bytes and
+/// never waits longer than IDLE_TIMEOUT. Shared by the mcp and admin loops
+/// (admin.sock is root-only, but it shares the slow-loris pattern).
+pub(crate) async fn read_frame<R: AsyncBufRead + Unpin>(r: &mut R, buf: &mut Vec<u8>) -> Frame {
+    buf.clear();
+    match tokio::time::timeout(IDLE_TIMEOUT, r.read_until(b'\n', buf)).await {
+        Err(_) => return Frame::Idle,
+        Ok(Err(_)) | Ok(Ok(0)) => return Frame::Eof,
+        Ok(Ok(_)) => {}
+    }
+    if buf.len() > MAX_FRAME {
+        return Frame::TooLong;
+    }
+    // trim trailing LF/CRLF; invalid utf8 degrades lossy, never panics
+    let s = String::from_utf8_lossy(buf)
+        .trim_end_matches(['\n', '\r'])
+        .to_string();
+    Frame::Line(s)
+}
+
 // ------------------------------------------------------------------ MCP side
 
 async fn handle_mcp(stream: UnixStream, st: Arc<State>) {
@@ -278,7 +323,9 @@ async fn handle_mcp(stream: UnixStream, st: Arc<State>) {
         }
     }
     let (r, mut w) = stream.into_split();
-    let (resp_tx, mut resp_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+    // RESEXHAUST-001: bounded reply queue — a client that stops reading
+    // throttles its own requests instead of buffering replies in daemon RAM.
+    let (resp_tx, mut resp_rx) = tokio::sync::mpsc::channel::<String>(64);
     let writer = tokio::spawn(async move {
         while let Some(line) = resp_rx.recv().await {
             if let Err(e) = w.write_all(format!("{line}\n").as_bytes()).await {
@@ -290,13 +337,26 @@ async fn handle_mcp(stream: UnixStream, st: Arc<State>) {
     });
     // Connection must outlive in-flight requests; approval can arrive minutes later.
     let inflight = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let mut lines = BufReader::new(r).lines();
-    while let Ok(Some(line)) = lines.next_line().await {
-        let line = line.trim();
+    let mut reader = BufReader::new(r);
+    let mut buf: Vec<u8> = Vec::with_capacity(4096);
+    loop {
+        // RESEXHAUST-003: capped frame + idle timeout, never unbounded lines()
+        let line = match read_frame(&mut reader, &mut buf).await {
+            Frame::Line(s) => s,
+            Frame::TooLong => {
+                tracing::warn!("mcp frame exceeds {MAX_FRAME} bytes; dropping connection");
+                break;
+            }
+            Frame::Idle => {
+                tracing::info!("mcp connection idle past timeout; closing");
+                break;
+            }
+            Frame::Eof => break,
+        };
         if line.is_empty() {
             continue;
         }
-        let req: RpcRequest = match serde_json::from_str(line) {
+        let req: RpcRequest = match serde_json::from_str(&line) {
             Ok(r) => r,
             Err(e) => {
                 tracing::warn!(%e, "bad json on mcp sock");
@@ -310,41 +370,64 @@ async fn handle_mcp(stream: UnixStream, st: Arc<State>) {
                     -32601,
                     "only access.request is served here",
                 ))
+                .await
                 .ok();
         } else {
-            inflight.fetch_add(1, Ordering::SeqCst);
-            let tx = resp_tx.clone();
-            let done = inflight.clone();
-            dispatch_access(req, st.clone(), move |s: String| {
-                tx.send(s).ok();
-                done.fetch_sub(1, Ordering::SeqCst);
-            });
+            // RESEXHAUST-001: per-connection fan-out cap — excess frames are
+            // rejected at the gate: no task spawned, no ledger row.
+            if inflight.load(Ordering::SeqCst) >= MAX_INFLIGHT {
+                resp_tx
+                    .send(rpc_err_str(&req.id, -32000, "too many in-flight requests"))
+                    .await
+                    .ok();
+                continue;
+            }
+            // ATOMICRACE-002: increment synchronously (can never race the EOF
+            // drain below); the guard rides into the task and decrements on
+            // drop — including panic unwind, which the old respond-closure
+            // decrement missed, wedging this loop forever.
+            let guard = CountGuard::inc(&inflight);
+            dispatch_access(req, st.clone(), resp_tx.clone(), guard);
         }
     }
     tracing::debug!("mcp client EOF; awaiting in-flight tasks");
     drop(resp_tx); // our copy goes; clones live in in-flight tasks
-    while inflight.load(Ordering::SeqCst) > 0 {
+                   // Bounded drain: the guards make this a formality, but never spin forever.
+    let deadline =
+        tokio::time::Instant::now() + Duration::from_secs(st.cfg.approver_timeout_secs + 30);
+    while inflight.load(Ordering::SeqCst) > 0 && tokio::time::Instant::now() < deadline {
         tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    if inflight.load(Ordering::SeqCst) > 0 {
+        tracing::warn!("mcp drain deadline hit with in-flight requests still open");
     }
     tracing::debug!("mcp conn fully closed");
     let _ = writer.await;
 }
 
 /// access.request pipeline: validate → dedup → ledger → human or auto-deny.
-/// `respond` is called exactly once with the serialized JSON-RPC reply line.
-fn dispatch_access(req: RpcRequest, st: Arc<State>, respond: impl Fn(String) + Send + 'static) {
+fn dispatch_access(
+    req: RpcRequest,
+    st: Arc<State>,
+    resp_tx: tokio::sync::mpsc::Sender<String>,
+    inflight_guard: CountGuard,
+) {
     tokio::spawn(async move {
+        // held for the whole task; releases the connection's count on any exit
+        let _inflight = inflight_guard;
         let id = req.id.clone();
-        let inner = respond;
-        let dbg_id = id.clone();
-        let respond = move |s: String| {
-            tracing::debug!(id = %dbg_id, len = s.len(), "responding on mcp conn");
-            inner(s);
-        };
+        // awaited send on the bounded queue: a client that stops reading
+        // backpressures this task, not daemon RAM (RESEXHAUST-001)
+        macro_rules! respond {
+            ($s:expr) => {{
+                tracing::debug!(id = %id, len = $s.len(), "responding on mcp conn");
+                resp_tx.send($s).await.ok();
+            }};
+        }
         let params: AccessRequestParams = match req.params.map(serde_json::from_value) {
             Some(Ok(p)) => p,
             _ => {
-                respond(rpc_err_str(&id, -32602, "invalid params"));
+                respond!(rpc_err_str(&id, -32602, "invalid params"));
                 return;
             }
         };
@@ -352,18 +435,18 @@ fn dispatch_access(req: RpcRequest, st: Arc<State>, respond: impl Fn(String) + S
         let target = match pick_target(&params) {
             Ok(t) => t,
             Err(e) => {
-                respond(rpc_err_str(&id, -32602, e.to_string()));
+                respond!(rpc_err_str(&id, -32602, e.to_string()));
                 return;
             }
         };
         if let Err(e) = params.dst_port.validate() {
-            respond(rpc_err_str(&id, -32602, e.to_string()));
+            respond!(rpc_err_str(&id, -32602, e.to_string()));
             return;
         }
         let ttl = match parse_ttl(&params.ttl_requested) {
             Ok(t) => t,
             Err(e) => {
-                respond(rpc_err_str(&id, -32602, e.to_string()));
+                respond!(rpc_err_str(&id, -32602, e.to_string()));
                 return;
             }
         };
@@ -383,9 +466,25 @@ fn dispatch_access(req: RpcRequest, st: Arc<State>, respond: impl Fn(String) + S
                     note: None,
                 },
             );
-            respond(resp_line(&resp));
+            respond!(resp_line(&resp));
             return;
         }
+
+        // RESEXHAUST-001: daemon-wide pending budget, checked before the
+        // ledger insert so an over-budget burst leaves no rows and no popups.
+        // The permit lives for this task — the human round-trip window.
+        let _pending_permit = match st.pending_budget.clone().try_acquire_owned() {
+            Ok(pr) => pr,
+            Err(_) => {
+                tracing::warn!("pending budget exhausted; rejecting request");
+                respond!(rpc_err_str(
+                    &id,
+                    -32000,
+                    "daemon busy: pending budget exhausted"
+                ));
+                return;
+            }
+        };
 
         // No approver connected: deny immediately rather than queueing.
         if st.admins_online.load(Ordering::SeqCst) == 0 {
@@ -397,7 +496,7 @@ fn dispatch_access(req: RpcRequest, st: Arc<State>, respond: impl Fn(String) + S
                     note: None,
                 },
             );
-            respond(resp_line(&resp));
+            respond!(resp_line(&resp));
             return;
         }
 
@@ -422,8 +521,8 @@ fn dispatch_access(req: RpcRequest, st: Arc<State>, respond: impl Fn(String) + S
             None => {
                 // UNIQUE idem_key = redelivery. Do not re-popup; return the original row.
                 match st.ledger.find_by_idem(&id).await {
-                    Some(orig) => respond(replay_verdict(&orig)),
-                    None => respond(rpc_err_str(&id, -32001, "duplicate request id")),
+                    Some(orig) => respond!(replay_verdict(&orig)),
+                    None => respond!(rpc_err_str(&id, -32001, "duplicate request id")),
                 }
                 return;
             }
@@ -555,6 +654,13 @@ fn dispatch_access(req: RpcRequest, st: Arc<State>, respond: impl Fn(String) + S
             }
         };
 
+        // CHANSTARVE-001: the decision channel is dead weight once a verdict
+        // exists, whatever path produced it. Without this, timed-out requests
+        // leaked map entries forever (admin removals only covered rows an
+        // admin actually decided) and a late approve on a dead gid replied
+        // queued:true for an already-denied grant.
+        st.pending.lock().await.remove(&gid);
+
         let resp = RpcResponse::ok(&id, &verdict);
         // Notify TUI for every verdict that has a row. Offline denies have neither.
         if let Verdict::Denied {
@@ -573,7 +679,7 @@ fn dispatch_access(req: RpcRequest, st: Arc<State>, respond: impl Fn(String) + S
                 },
             );
         }
-        respond(resp_line(&resp));
+        respond!(resp_line(&resp));
     });
 }
 
