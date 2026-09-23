@@ -26,7 +26,7 @@ use serde::Serialize;
 
 use crate::admin::handle_admin;
 use crate::install::{
-    install_carves, install_grant, install_scope, rebuild_acct, sweep_grant_objs,
+    install_carves, install_grant, install_scope, rebuild_acct, sweep_grant_objs, uninstall_grant,
 };
 use crate::ledger::{
     now_secs, ttl_expires, Decide, DenyCode, GrantRow, GrantState, Ledger, NewGrant,
@@ -115,13 +115,20 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
     // admin session (socket perms are checked at connect only). Tighten
     // umask so both sockets are born owner-rw-only, then restore. admin.sock
     // stays 0600; mcp.sock is widened to its group below when pinned.
+    //
+    // The workspace unsafe_code="deny" exception: umask(2) is a plain,
+    // thread-safe libc call; audited and scoped to this one helper.
+    #[allow(unsafe_code)] // audited: the only unsafe in the workspace
+    fn set_umask(mask: libc::mode_t) -> libc::mode_t {
+        unsafe { libc::umask(mask) }
+    }
     struct UmaskGuard(libc::mode_t);
     impl Drop for UmaskGuard {
         fn drop(&mut self) {
-            unsafe { libc::umask(self.0) };
+            set_umask(self.0);
         }
     }
-    let _umask = UmaskGuard(unsafe { libc::umask(0o177) });
+    let _umask = UmaskGuard(set_umask(0o177));
     let mcp = UnixListener::bind(&st.cfg.mcp_socket)?;
     let admin = UnixListener::bind(&st.cfg.admin_socket)?;
     drop(_umask);
@@ -560,43 +567,73 @@ fn dispatch_access(
                 {
                     Ok((eff, dsts)) => {
                         let exp = ttl_expires(granted);
-                        if !st
+                        // Persist this DNS resolution BEFORE the approve flip
+                        // (row still pending, so rollback is a legal
+                        // pending->denied). RESDISC-002: if the write fails,
+                        // revoke could later re-derive different IPs and leak
+                        // the installed elements until TTL — fail closed.
+                        let dst_json = serde_json::to_string(
+                            &dsts.iter().map(|d| d.canonical()).collect::<Vec<_>>(),
+                        )
+                        .unwrap_or_else(|_| "[]".into());
+                        if let Err(e) = st.ledger.set_dst(gid, dst_json).await {
+                            tracing::error!(gid, %e, "set_dst failed — uninstalling grant, denying");
+                            uninstall_grant(&st, &dsts, params.proto, params.dst_port).await;
+                            st.ledger
+                                .decide(
+                                    gid,
+                                    Decide::Deny {
+                                        code: DenyCode::InstallFailed,
+                                        note: Some(format!("resolution persist failed: {e}")),
+                                    },
+                                )
+                                .await;
+                            // fall through the shared verdict path (pending
+                            // cleanup + EV_DECIDED + respond happen there)
+                            Verdict::Denied {
+                                reason_code: DenyReason::InstallFailed,
+                                grant_id: Some(gid.to_string()),
+                                note: Some("enforcement state could not be pinned; retry".into()),
+                            }
+                        } else if !st
                             .ledger
                             .decide(gid, Decide::Approve { expires_at: exp })
                             .await
                         {
                             tracing::error!(gid, "ledger failed to flip pending->approved");
-                        }
-                        // Persist this DNS resolution so later delete uses the same IPs.
-                        let dst_json = serde_json::to_string(
-                            &dsts.iter().map(|d| d.canonical()).collect::<Vec<_>>(),
-                        )
-                        .unwrap_or_else(|_| "[]".into());
-                        if !st.ledger.set_dst(gid, dst_json).await {
-                            tracing::warn!(
-                                gid,
-                                "set_dst: row not approved when persisting resolution"
+                            Verdict::Denied {
+                                reason_code: DenyReason::InstallFailed,
+                                grant_id: Some(gid.to_string()),
+                                note: Some("ledger state flip failed; retry".into()),
+                            }
+                        } else {
+                            if !st
+                                .ledger
+                                .decide(gid, Decide::Approve { expires_at: exp })
+                                .await
+                            {
+                                tracing::error!(gid, "ledger failed to flip pending->approved");
+                            }
+                            // Accounting is best-effort; stats never gate enforcement.
+                            if let Err(e) = rebuild_acct(&st).await {
+                                tracing::warn!(gid, %e, "acct rebuild failed (stats degraded only)");
+                            }
+                            st.ledger.audit("approved", gid, format!("{eff:?}"));
+                            emit(
+                                &st,
+                                method::EV_DECIDED,
+                                EvDecided::Approved {
+                                    grant_id: gid.to_string(),
+                                    ttl_granted: fmt_ttl(granted),
+                                    expires_at: fmt_unix(exp),
+                                },
                             );
-                        }
-                        // Accounting is best-effort; stats never gate enforcement.
-                        if let Err(e) = rebuild_acct(&st).await {
-                            tracing::warn!(gid, %e, "acct rebuild failed (stats degraded only)");
-                        }
-                        st.ledger.audit("approved", gid, format!("{eff:?}"));
-                        emit(
-                            &st,
-                            method::EV_DECIDED,
-                            EvDecided::Approved {
+                            Verdict::Approved {
                                 grant_id: gid.to_string(),
+                                effective: eff,
                                 ttl_granted: fmt_ttl(granted),
                                 expires_at: fmt_unix(exp),
-                            },
-                        );
-                        Verdict::Approved {
-                            grant_id: gid.to_string(),
-                            effective: eff,
-                            ttl_granted: fmt_ttl(granted),
-                            expires_at: fmt_unix(exp),
+                            }
                         }
                     }
                     Err(e) => {

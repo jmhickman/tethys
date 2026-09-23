@@ -6,6 +6,10 @@ members = ["crates/core", "crates/gatekeeper", "crates/gk-mcp", "crates/gk-tui"]
 version = "0.1.0"
 edition = "2021"
 license = "Apache-2.0"
+# MSRV-001: floor the code actually needs (u64::is_multiple_of => 1.87).
+# Deliberately no rust-toolchain.toml: there is no CI to consume it, and a
+# pin would freeze dev machines too — declare the floor, don't freeze it.
+rust-version = "1.87"
 
 [workspace.dependencies]
 gk-core = { path = "crates/core" }
@@ -27,6 +31,17 @@ rmcp = { version = "3.4", features = ["transport-io"] }
 ratatui = "0.29"
 crossterm = { version = "0.28", features = ["event-stream"] }
 unicode-width = "0.2"
+
+# CARGOLINT-001: the root daemon is unsafe-free by policy. `deny` (not
+# `forbid`) so the single audited umask guard can carry a scoped allow; any
+# NEW unsafe fails the build until it gets that treatment.
+[workspace.lints.rust]
+unsafe_code = "deny"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+# pedantic deliberately not enabled: ~100 pre-existing style lints would
+# bury the signal; adopt incrementally if ever wanted.
 
 [profile.dev]
 debug = 0

@@ -58,6 +58,31 @@ pub(crate) async fn install_grant(
     ))
 }
 
+/// Remove installed elements for a grant whose approval could not be pinned
+/// (RESDISC-002 rollback). Best-effort: an uninstall failure is logged; the
+/// kernel element still dies with its TTL.
+pub(crate) async fn uninstall_grant(
+    st: &Arc<State>,
+    dsts: &[ElemDst],
+    proto: Proto,
+    port: PortSpec,
+) {
+    if st.cfg.dry_run {
+        return;
+    }
+    let mut b = Batch::with_table(&st.cfg.nft_table);
+    for d in dsts {
+        b.delete_grant(&GrantElem {
+            dst: d.clone(),
+            proto,
+            port,
+        });
+    }
+    if let Err(e) = st.nft.apply(&b).await {
+        tracing::error!(%e, "uninstall_grant rollback failed (TTL will reap)");
+    }
+}
+
 /// Scope egress to `agent_user`. Unresolved uid => empty list => host-wide.
 pub(crate) async fn install_scope(st: &Arc<State>) -> anyhow::Result<()> {
     let mut b = Batch::with_table(&st.cfg.nft_table);

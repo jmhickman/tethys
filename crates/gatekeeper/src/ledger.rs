@@ -103,7 +103,11 @@ enum LedgerCmd {
         tokio::sync::oneshot::Sender<Vec<GrantRow>>,
     ),
     FindActive(tokio::sync::oneshot::Sender<Vec<GrantRow>>),
-    SetDst(i64, String, tokio::sync::oneshot::Sender<bool>),
+    SetDst(
+        i64,
+        String,
+        tokio::sync::oneshot::Sender<Result<(), String>>,
+    ),
     FindByIdem(String, tokio::sync::oneshot::Sender<Option<GrantRow>>),
     Audit(String, String, i64),
 }
@@ -170,7 +174,12 @@ impl Ledger {
         }
         let conn = Connection::open(path)?;
         conn.execute_batch(
+            // WAL + NORMAL: durable within the last few commits at worst on
+            // power loss — grants are reconciled against kernel truth at
+            // boot anyway. busy_timeout keeps a hot reader from erroring out.
             "PRAGMA journal_mode=WAL;
+             PRAGMA synchronous=NORMAL;
+             PRAGMA busy_timeout=5000;
              CREATE TABLE IF NOT EXISTS grants(
                id INTEGER PRIMARY KEY,
                idem_key TEXT UNIQUE,
@@ -190,8 +199,12 @@ impl Ledger {
                grant_id INTEGER NOT NULL, detail TEXT NOT NULL DEFAULT '');",
         )?;
         let (tx, mut rx) = mpsc::unbounded_channel::<LedgerCmd>();
-        let h = tokio::spawn(async move {
-            while let Some(cmd) = rx.recv().await {
+        // ASYNCBLOCK-001: rusqlite is synchronous; running the whole command
+        // loop on a tokio worker parks that worker for every WAL fsync under
+        // disk pressure. blocking_recv() + spawn_blocking keeps the async
+        // runtime free and needs no second channel type.
+        let h = tokio::task::spawn_blocking(move || {
+            while let Some(cmd) = rx.blocking_recv() {
                 match cmd {
                     LedgerCmd::Insert(g, reply) => {
                         let res = conn.execute(
@@ -324,14 +337,24 @@ impl Ledger {
                         let _ = reply.send(out);
                     }
                     LedgerCmd::SetDst(id, dst_json, reply) => {
-                        // Persist resolved IPs; revoke uses these, not a fresh lookup.
-                        let n = conn
-                            .execute(
-                                "UPDATE grants SET dst_json=?2 WHERE id=?1 AND state='approved'",
-                                params![id, dst_json],
-                            )
-                            .unwrap_or(0);
-                        let _ = reply.send(n == 1);
+                        // Persist resolved IPs; revoke uses these, not a fresh
+                        // lookup. RESDISC-002: a DB fault must not masquerade
+                        // as "row not approved" — the caller fail-closes on it.
+                        match conn.execute(
+                            "UPDATE grants SET dst_json=?2 WHERE id=?1 AND state IN ('pending','approved')",
+                            params![id, dst_json],
+                        ) {
+                            Ok(0) => {
+                                let _ = reply.send(Err("row left pending/approved".into()));
+                            }
+                            Ok(_) => {
+                                let _ = reply.send(Ok(()));
+                            }
+                            Err(e) => {
+                                tracing::error!(id, %e, "set_dst UPDATE failed");
+                                let _ = reply.send(Err(format!("db fault: {e}")));
+                            }
+                        }
                     }
                     LedgerCmd::FindByIdem(key, reply) => {
                         let row = conn
@@ -344,10 +367,15 @@ impl Ledger {
                         let _ = reply.send(row);
                     }
                     LedgerCmd::Audit(event, detail, grant_id) => {
-                        let _ = conn.execute(
+                        // RESDISC-001: the approval trail must not fail
+                        // silently — a full DB would otherwise erase forensics
+                        // with zero operator signal while grants keep flowing.
+                        if let Err(e) = conn.execute(
                             "INSERT INTO audit(ts,event,grant_id,detail) VALUES(?1,?2,?3,?4)",
                             params![now_secs() as i64, event, grant_id, detail],
-                        );
+                        ) {
+                            tracing::error!(%e, event, grant_id, "audit INSERT failed — trail incomplete");
+                        }
                     }
                 }
             }
@@ -383,8 +411,11 @@ impl Ledger {
     pub async fn active(&self) -> Vec<GrantRow> {
         self.ask(LedgerCmd::FindActive).await
     }
-    /// Persist resolved dst list for an approved grant. False if the row is not approved.
-    pub async fn set_dst(&self, id: i64, dst_json: String) -> bool {
+    /// Persist resolved dst list for an approved grant. Err distinguishes a
+    /// DB fault from "row not approved" (RESDISC-002); both are hard failures
+    /// on the approval path — without the pinned resolution, revoke could
+    /// tear down the wrong elements and leave stale egress until TTL.
+    pub async fn set_dst(&self, id: i64, dst_json: String) -> Result<(), String> {
         self.ask(move |reply| LedgerCmd::SetDst(id, dst_json, reply))
             .await
     }
@@ -394,9 +425,12 @@ impl Ledger {
         self.ask(move |reply| LedgerCmd::FindByIdem(k, reply)).await
     }
     pub fn audit(&self, event: &str, grant_id: i64, detail: impl Into<String>) {
-        self.tx
+        if let Err(e) = self
+            .tx
             .send(LedgerCmd::Audit(event.into(), detail.into(), grant_id))
-            .ok();
+        {
+            tracing::error!(%e, "audit command lost — ledger actor gone");
+        }
     }
 }
 

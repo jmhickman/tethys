@@ -689,14 +689,25 @@ fn draw_conn_modal(f: &mut Frame, st: ConnStatus) {
     );
 }
 
-fn hostname() -> String {
-    std::fs::read_to_string("/proc/sys/kernel/hostname")
-        .map(|s| s.trim().to_string())
-        .unwrap_or_else(|_| "?".into())
+/// ASYNCBLOCK-002: header identity facts are read once and cached — the
+/// render path must not touch /proc every 500 ms tick/keypress/event.
+fn hostname() -> &'static str {
+    static HOST: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    HOST.get_or_init(|| {
+        std::fs::read_to_string("/proc/sys/kernel/hostname")
+            .map(|s| s.trim().to_string())
+            .unwrap_or_else(|_| "?".into())
+    })
 }
 
 /// Default-route interface and its subnet from /proc/net/route (hex LE).
-fn primary_network() -> String {
+/// Cached like hostname(); a mid-session interface change is cosmetic here.
+fn primary_network() -> &'static str {
+    static NET: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    NET.get_or_init(compute_primary_network)
+}
+
+fn compute_primary_network() -> String {
     // /proc/net/route columns: Iface Dst GW Flags RefCnt Use Metric Mask ...
     // The default route (Dst=0) carries mask 0 — useless. The interface's
     // subnet lives in the ON-LINK route for the same iface (GW=0, real mask).
