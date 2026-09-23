@@ -615,8 +615,16 @@ pub fn parse_poll(doc: &Value, counters: &Value, tname: &str) -> PollState {
                         let p = n.as_u64().unwrap_or(0) as u16;
                         (p, p)
                     }
+                    // OOBIDX-001: nft echoes what we wrote, but a short or
+                    // non-array range must skip the element, not panic boot.
                     v if v.get("range").is_some() => {
-                        let r = v["range"].as_array().unwrap();
+                        let Some(r) = v
+                            .get("range")
+                            .and_then(Value::as_array)
+                            .filter(|r| r.len() >= 2)
+                        else {
+                            continue;
+                        };
                         (
                             r[0].as_u64().unwrap_or(0) as u16,
                             r[1].as_u64().unwrap_or(0) as u16,
@@ -671,6 +679,24 @@ mod tests {
 
     fn ip(s: &str) -> IpAddr {
         s.parse().unwrap()
+    }
+
+    #[test]
+    fn parse_poll_survives_malformed_ranges() {
+        // OOBIDX-001: short / non-array / null ranges must skip, never panic
+        // (boot reconcile and the stats poller share this parser).
+        let doc = serde_json::json!({"nftables": [
+            {"set": {"name": "grants_v4", "elem": [
+                {"elem": {"val": {"concat": ["10.0.0.1", "tcp", {"range": [80]}]}}},
+                {"elem": {"val": {"concat": ["10.0.0.2", "tcp", {"range": "nope"}]}}},
+                {"elem": {"val": {"concat": ["10.0.0.3", "tcp", {"range": null}]}}},
+                {"elem": {"val": {"concat": ["10.0.0.4", "tcp", {"range": [443, 449]}]}}}
+            ]}}
+        ]});
+        let st = parse_poll(&doc, &serde_json::json!({"nftables": []}), "t");
+        assert_eq!(st.elements.len(), 1, "only the well-formed 2-elem range loads");
+        assert_eq!(st.elements[0].dst, "10.0.0.4");
+        assert_eq!((st.elements[0].port_from, st.elements[0].port_to), (443, 449));
     }
 
     #[test]

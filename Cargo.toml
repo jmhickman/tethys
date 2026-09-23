@@ -30,3 +30,8 @@ unicode-width = "0.2"
 
 [profile.dev]
 debug = 0
+
+# Security-relevant arithmetic must behave identically in both profiles:
+# overflow panics (checked) instead of wrapping silently.
+[profile.release]
+overflow-checks = true

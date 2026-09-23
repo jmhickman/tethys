@@ -124,7 +124,10 @@ pub fn parse_ttl(s: &str) -> Result<Duration, SpecError> {
     if n == 0 {
         return Err(SpecError::BadTtl(s.to_string()));
     }
-    Ok(Duration::from_secs(n * mult))
+    // ARITHOFL-001: attacker-controlled multiplier — overflow is a bad ttl,
+    // not a panic (debug) or a silently-wrapped grant (release).
+    let secs = n.checked_mul(mult).ok_or_else(|| SpecError::BadTtl(s.to_string()))?;
+    Ok(Duration::from_secs(secs))
 }
 
 /// Canonical seconds spelling ("1h" / "15m" / "45s"); "-" for zero (the TUI's
@@ -158,6 +161,9 @@ mod tests {
         assert!(parse_ttl("15").is_err());
         assert!(parse_ttl("0m").is_err());
         assert!(parse_ttl("1d").is_err());
+        // overflow arms: huge multipliers are rejected, not wrapped/panicked
+        assert!(parse_ttl("9999999999999999999h").is_err());
+        assert!(parse_ttl("18446744073709551616s").is_err());
         assert_eq!(fmt_ttl(Duration::from_secs(900)), "15m");
         assert_eq!(fmt_ttl(Duration::from_secs(45)), "45s");
     }

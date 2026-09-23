@@ -41,12 +41,29 @@ pub struct State {
     pub pending: Mutex<HashMap<i64, oneshot::Sender<HumanDecision>>>,
     /// fire-and-forget events for all admin clients
     pub events: broadcast::Sender<String>,
-    pub admins_online: AtomicUsize,
+    /// Arc so admin sessions can hold an RAII decrement guard (CountGuard)
+    /// that survives task unwind.
+    pub admins_online: Arc<AtomicUsize>,
 }
 
 pub enum HumanDecision {
     Approve { ttl_secs: Option<u64> },
     Deny { note: Option<String> },
+}
+
+/// ATOMICRACE-001/002: decrements a counter on drop, so a panic between
+/// increment and the end of scope can never leak the count upward.
+pub(crate) struct CountGuard(Arc<AtomicUsize>);
+impl CountGuard {
+    pub(crate) fn inc(c: &Arc<AtomicUsize>) -> Self {
+        c.fetch_add(1, Ordering::SeqCst);
+        Self(c.clone())
+    }
+}
+impl Drop for CountGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 pub async fn run(cfg: Config) -> anyhow::Result<()> {
@@ -57,7 +74,7 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
         nft: NftCli::default(),
         pending: Mutex::new(HashMap::new()),
         events: broadcast::channel(256).0,
-        admins_online: AtomicUsize::new(0),
+        admins_online: Arc::new(AtomicUsize::new(0)),
     });
 
     // Idempotent; fail startup if install fails so enforcement is never off.

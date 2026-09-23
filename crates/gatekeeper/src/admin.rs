@@ -2,7 +2,6 @@
 //! everything the TUI sends. Reads state through `State`, flips the ledger,
 //! installs/tears down kernel elements via `crate::install`.
 
-use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -17,7 +16,7 @@ use gk_core::wire::{GrantState, PendingRowWire};
 
 use crate::install::{rebuild_acct, row_elems, sweep_grant_objs};
 use crate::ledger::{now_secs, Decide};
-use crate::server::{emit, peer_cred, resp_line, HumanDecision, State};
+use crate::server::{emit, peer_cred, resp_line, CountGuard, HumanDecision, State};
 
 pub(crate) async fn handle_admin(stream: UnixStream, st: Arc<State>) {
     // TOCTOU-001 defense-in-depth: the 0600 inode mode is the primary gate;
@@ -39,7 +38,9 @@ pub(crate) async fn handle_admin(stream: UnixStream, st: Arc<State>) {
         return;
     }
     tracing::info!(uid = ?peer_cred(&stream).map(|c| c.uid()), "admin client connected");
-    st.admins_online.fetch_add(1, Ordering::SeqCst);
+    // RAII: a panic in the loop (e.g. ledger actor death) must not leave a
+    // phantom admin online — that would disable ApproverOffline forever.
+    let _online = CountGuard::inc(&st.admins_online);
     let mut sub_rx = st.events.subscribe();
     let (mut r, mut w) = stream.into_split();
     let mut lines = BufReader::new(&mut r).lines();
@@ -67,7 +68,6 @@ pub(crate) async fn handle_admin(stream: UnixStream, st: Arc<State>) {
             }
         }
     }
-    st.admins_online.fetch_sub(1, Ordering::SeqCst);
 }
 
 /// Deserialize admin params; a shape error is a client error (-32602), never
