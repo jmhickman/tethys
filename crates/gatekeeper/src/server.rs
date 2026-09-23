@@ -607,13 +607,6 @@ fn dispatch_access(
                                 note: Some("ledger state flip failed; retry".into()),
                             }
                         } else {
-                            if !st
-                                .ledger
-                                .decide(gid, Decide::Approve { expires_at: exp })
-                                .await
-                            {
-                                tracing::error!(gid, "ledger failed to flip pending->approved");
-                            }
                             // Accounting is best-effort; stats never gate enforcement.
                             if let Err(e) = rebuild_acct(&st).await {
                                 tracing::warn!(gid, %e, "acct rebuild failed (stats degraded only)");
@@ -738,7 +731,11 @@ fn pick_target(p: &AccessRequestParams) -> Result<Target, SpecError> {
         if !ok {
             return Err(SpecError::BadHost(h.clone()));
         }
-        return Ok(Target::Host(h.clone()));
+        // STRCMP-001: DNS identity is case-insensitive; canonicalize now so
+        // dedup, the ledger target, and config `allow` (already lowercased)
+        // share one identity. Case-churn can no longer mint duplicate
+        // grants/popups/kernel elements for the same host.
+        return Ok(Target::Host(h.to_ascii_lowercase()));
     }
     if let Some(i) = &p.dst_ip {
         return Ok(Target::Ip(i.parse()?));
@@ -975,5 +972,12 @@ mod tests {
             ..p.clone()
         };
         assert_eq!(pick_target(&p4).unwrap().canonical(), "net:172.16.0.0/12");
+
+        // STRCMP-001: case variants canonicalize to one identity
+        let p5 = AccessRequestParams {
+            dst_host: Some("Api.X.COM".into()),
+            ..p.clone()
+        };
+        assert_eq!(pick_target(&p5).unwrap().canonical(), "host:api.x.com");
     }
 }
