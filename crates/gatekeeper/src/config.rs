@@ -29,6 +29,12 @@ fn default_agent_user() -> String {
     // the common default here).
     "hermes-agent".into()
 }
+fn default_admin_user() -> String {
+    // Who may drive admin.sock. The 0600 socket mode is the primary gate;
+    // SO_PEERCRED enforcement is defense-in-depth against the bind/chmod
+    // race and any deployment that loosens the mode.
+    "root".into()
+}
 fn default_mcp_user() -> String {
     // Service account that runs gk-mcp; the daemon only accepts MCP
     // connections from processes with this uid.
@@ -54,6 +60,8 @@ pub struct FileConfig {
     pub approver_timeout_secs: u64,
     #[serde(default = "default_agent_user")]
     pub agent_user: String,
+    #[serde(default = "default_admin_user")]
+    pub admin_user: String,
     #[serde(default = "default_mcp_user")]
     pub mcp_user: String,
     /// Operator allow list (see parse_allow). Installed into carve sets at startup.
@@ -74,6 +82,7 @@ impl Default for FileConfig {
             max_ttl: default_max_ttl(),
             approver_timeout_secs: default_approver_timeout(),
             agent_user: default_agent_user(),
+            admin_user: default_admin_user(),
             mcp_user: default_mcp_user(),
             allow: Vec::new(),
             dry_run: false,

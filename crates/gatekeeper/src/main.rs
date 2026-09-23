@@ -40,6 +40,9 @@ pub struct Cli {
     /// (e.g. --allow api.anthropic.com:443 --allow 192.168.10.165:1234)
     #[arg(long = "allow")]
     pub allow: Vec<String>,
+    /// username allowed on admin.sock (SO_PEERCRED gate; default root)
+    #[arg(long)]
+    pub admin_user: Option<String>,
     /// don't fail startup if configured users are missing (dev only)
     #[arg(long)]
     pub allow_missing_users: bool,
@@ -61,6 +64,10 @@ pub struct Config {
     pub agent_user: String,
     /// resolved uid of the pentest agent (None until the account exists)
     pub agent_uid: Option<u32>,
+    pub admin_user: String,
+    /// resolved uid allowed on admin.sock besides the daemon's own euid
+    /// (SO_PEERCRED gate; TOCTOU-001 defense-in-depth)
+    pub admin_peer_uid: Option<u32>,
     pub mcp_user: String,
     /// Some(uid) => only that uid is accepted on mcp.sock; None => accept all (dev)
     pub mcp_peer_uid: Option<u32>,
@@ -110,6 +117,8 @@ async fn main() -> anyhow::Result<()> {
             .unwrap_or(file.approver_timeout_secs),
         agent_user: cli.agent_user.unwrap_or(file.agent_user),
         agent_uid: None,
+        admin_user: cli.admin_user.unwrap_or(file.admin_user),
+        admin_peer_uid: None,
         mcp_user: cli.mcp_user.unwrap_or(file.mcp_user),
         mcp_peer_uid: None,
         mcp_sock_gid: None,
@@ -141,6 +150,17 @@ async fn main() -> anyhow::Result<()> {
         }
         Err(e) => return Err(e),
     }
+    // admin user: the socket's 0600 mode is the primary gate; this uid is
+    // enforced per connection as defense-in-depth (TOCTOU-001). A missing
+    // admin user is fatal unless dev mode opts out; either way the daemon's
+    // own euid is always admitted (it owns the socket inode).
+    match config::resolve_uid(&cfg.admin_user) {
+        Ok(uid) => cfg.admin_peer_uid = Some(uid),
+        Err(e) if cli.allow_missing_users => {
+            tracing::warn!(%e, "--allow-missing-users: admin.sock gate = daemon euid only (dev only!)");
+        }
+        Err(e) => return Err(e),
+    }
     // agent user may legitimately not exist yet at first boot before the
     // harness provisions it — warn, don't block enforcement plumbing.
     match config::resolve_uid(&cfg.agent_user) {
@@ -153,6 +173,8 @@ async fn main() -> anyhow::Result<()> {
         agent_uid = ?cfg.agent_uid,
         mcp_user = %cfg.mcp_user,
         mcp_peer_uid = ?cfg.mcp_peer_uid,
+        admin_user = %cfg.admin_user,
+        admin_peer_uid = ?cfg.admin_peer_uid,
         "identities resolved"
     );
 

@@ -1,0 +1,6 @@
+  ⚠ tirith security scanner enabled but not available — command scanning will use pattern matching only
+Verification: RECURSEFMT-*.md count = 0 (matches the cleared pass), coverage file and empty index shard both present on disk. The pass was searched exhaustively (Phase-A recursive-type seeds all empty; every serde_json decode site uses default-capped `from_str`/`from_value`; zero `{:?}` format sinks in scope), so it clears with evidence rather than by absence of search.
+
+worker-7 complete: cluster recursion-dos-2, wrote 0 finding files, coverage at /home/hermes-agent/gatekeeper/.rust-review-results/20260923T021944Z/coverage/worker-7.md
+
+session_id: 20260923_042604_76e7d8

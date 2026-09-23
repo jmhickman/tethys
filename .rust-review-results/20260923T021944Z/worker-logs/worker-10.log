@@ -1,0 +1,6 @@
+  ⚠ tirith security scanner enabled but not available — command scanning will use pattern matching only
+Verified: empty index shard at findings-index.d/worker-10.txt (the "ran, found nothing" signal), 0 BUFFLUSH finding files on disk, coverage file present.
+
+worker-10 complete: cluster error-handling-2, wrote 0 finding files, coverage at /home/hermes-agent/gatekeeper/.rust-review-results/20260923T021944Z/coverage/worker-10.md
+
+session_id: 20260923_050443_091e17

@@ -1,0 +1,6 @@
+  ⚠ tirith security scanner enabled but not available — command scanning will use pattern matching only
+All eight passes ran against a definitively empty unsafe_map: `crates/` contains zero `unsafe` blocks/fns/impls, zero FFI, zero transmutes, zero raw-pointer operations, zero `#[repr]` attributes, and zero `debug_assert*` (confirmed with both rg seeds and a plain `grep -rn 'unsafe'` cross-check over all 17 files). Empty index shard and coverage gate written; 0 finding files.
+
+worker-1 complete: cluster unsafe-boundary, wrote 0 finding files, coverage at /home/hermes-agent/gatekeeper/.rust-review-results/20260923T021944Z/coverage/worker-1.md
+
+session_id: 20260923_023759_3024c7

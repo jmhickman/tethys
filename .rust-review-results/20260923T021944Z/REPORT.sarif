@@ -1,0 +1,650 @@
+{
+  "$schema": "https://raw.githubusercontent.com/oasis-tcs/sarif-spec/master/Schemata/sarif-schema-2.1.0.json",
+  "version": "2.1.0",
+  "runs": [
+    {
+      "tool": {
+        "driver": {
+          "name": "rust-review",
+          "informationUri": "https://github.com/trailofbits/skills/tree/main/plugins/rust-review",
+          "rules": [
+            {
+              "id": "arithmetic-overflow",
+              "shortDescription": {
+                "text": "Integer overflow on an attacker-reachable path"
+              },
+              "defaultConfiguration": {
+                "level": "warning"
+              }
+            },
+            {
+              "id": "async-blocking",
+              "shortDescription": {
+                "text": "Blocking call inside an async runtime"
+              },
+              "defaultConfiguration": {
+                "level": "warning"
+              }
+            },
+            {
+              "id": "atomic-race",
+              "shortDescription": {
+                "text": "Non-atomic read-modify-write race on shared state"
+              },
+              "defaultConfiguration": {
+                "level": "warning"
+              }
+            },
+            {
+              "id": "cargo-lint-config",
+              "shortDescription": {
+                "text": "Cargo lint config weakens safety checks"
+              },
+              "defaultConfiguration": {
+                "level": "note"
+              }
+            },
+            {
+              "id": "channel-starvation",
+              "shortDescription": {
+                "text": "Channel send or receive starvation or deadlock"
+              },
+              "defaultConfiguration": {
+                "level": "warning"
+              }
+            },
+            {
+              "id": "msrv-mismatch",
+              "shortDescription": {
+                "text": "MSRV or edition mismatch with APIs in use"
+              },
+              "defaultConfiguration": {
+                "level": "note"
+              }
+            },
+            {
+              "id": "out-of-bounds-index",
+              "shortDescription": {
+                "text": "Slice or vector index without bounds check on untrusted input"
+              },
+              "defaultConfiguration": {
+                "level": "warning"
+              }
+            },
+            {
+              "id": "resource-exhaustion",
+              "shortDescription": {
+                "text": "CPU or memory exhaustion DoS on untrusted input"
+              },
+              "defaultConfiguration": {
+                "level": "warning"
+              }
+            },
+            {
+              "id": "result-discarded",
+              "shortDescription": {
+                "text": "Security-relevant Result discarded without handling"
+              },
+              "defaultConfiguration": {
+                "level": "warning"
+              }
+            },
+            {
+              "id": "string-comparison",
+              "shortDescription": {
+                "text": "Partial or case-insensitive string comparison bypasses a check"
+              },
+              "defaultConfiguration": {
+                "level": "warning"
+              }
+            },
+            {
+              "id": "toctou",
+              "shortDescription": {
+                "text": "Filesystem time-of-check to time-of-use race"
+              },
+              "defaultConfiguration": {
+                "level": "error"
+              }
+            }
+          ]
+        }
+      },
+      "originalUriBaseIds": {
+        "%SRCROOT%": {
+          "description": {
+            "text": "Root of the audited Rust crate or workspace; finding URIs are relative to this."
+          }
+        }
+      },
+      "invocations": [
+        {
+          "executionSuccessful": true,
+          "properties": {
+            "threat_model": "LOCAL_UNPRIVILEGED",
+            "severity_filter": "all",
+            "skipped_findings": 0
+          }
+        }
+      ],
+      "results": [
+        {
+          "ruleId": "arithmetic-overflow",
+          "level": "warning",
+          "message": {
+            "text": "Attacker-controlled TTL multiply `n * mult` in parse_ttl overflows \u2014 panics on the deployed (debug) build, wraps silently in release"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "crates/core/src/types.rs",
+                  "uriBaseId": "%SRCROOT%"
+                },
+                "region": {
+                  "startLine": 127
+                }
+              }
+            }
+          ],
+          "properties": {
+            "finding_id": "ARITHOFL-001",
+            "bug_class": "arithmetic-overflow",
+            "severity": "MEDIUM",
+            "attack_vector": "Local",
+            "exploitability": "Reliable",
+            "fp_verdict": "TRUE_POSITIVE",
+            "unjudged": false,
+            "severity_validated": true,
+            "location_missing": false,
+            "also_known_as": []
+          }
+        },
+        {
+          "ruleId": "async-blocking",
+          "level": "warning",
+          "message": {
+            "text": "Ledger actor performs synchronous rusqlite disk I/O directly inside a tokio async task (no spawn_blocking)"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "crates/gatekeeper/src/ledger.rs",
+                  "uriBaseId": "%SRCROOT%"
+                },
+                "region": {
+                  "startLine": 197
+                }
+              }
+            }
+          ],
+          "properties": {
+            "finding_id": "ASYNCBLOCK-001",
+            "bug_class": "async-blocking",
+            "severity": "MEDIUM",
+            "attack_vector": "Local",
+            "exploitability": "Difficult",
+            "fp_verdict": "TRUE_POSITIVE",
+            "unjudged": false,
+            "severity_validated": true,
+            "location_missing": false,
+            "also_known_as": []
+          }
+        },
+        {
+          "ruleId": "async-blocking",
+          "level": "note",
+          "message": {
+            "text": "TUI render path does synchronous /proc reads inside the tokio main task every 500 ms tick"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "crates/gk-tui/src/ui.rs",
+                  "uriBaseId": "%SRCROOT%"
+                },
+                "region": {
+                  "startLine": 693
+                }
+              }
+            }
+          ],
+          "properties": {
+            "finding_id": "ASYNCBLOCK-002",
+            "bug_class": "async-blocking",
+            "severity": "LOW",
+            "attack_vector": "Local",
+            "exploitability": "Difficult",
+            "fp_verdict": "TRUE_POSITIVE",
+            "unjudged": false,
+            "severity_validated": true,
+            "location_missing": false,
+            "also_known_as": []
+          }
+        },
+        {
+          "ruleId": "atomic-race",
+          "level": "warning",
+          "message": {
+            "text": "admins_online counter leaks upward when the admin task panics (fetch_add with no RAII guard)"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "crates/gatekeeper/src/admin.rs",
+                  "uriBaseId": "%SRCROOT%"
+                },
+                "region": {
+                  "startLine": 26
+                }
+              }
+            }
+          ],
+          "properties": {
+            "finding_id": "ATOMICRACE-001",
+            "bug_class": "atomic-race",
+            "severity": "MEDIUM",
+            "attack_vector": "Local",
+            "exploitability": "Difficult",
+            "fp_verdict": "LIKELY_TP",
+            "unjudged": false,
+            "severity_validated": true,
+            "location_missing": false,
+            "also_known_as": []
+          }
+        },
+        {
+          "ruleId": "atomic-race",
+          "level": "warning",
+          "message": {
+            "text": "per-connection inflight counter leak wedges handle_mcp in an endless drain loop when a dispatch task panics"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "crates/gatekeeper/src/server.rs",
+                  "uriBaseId": "%SRCROOT%"
+                },
+                "region": {
+                  "startLine": 281
+                }
+              }
+            }
+          ],
+          "properties": {
+            "finding_id": "ATOMICRACE-002",
+            "bug_class": "atomic-race",
+            "severity": "MEDIUM",
+            "attack_vector": "Local",
+            "exploitability": "Difficult",
+            "fp_verdict": "TRUE_POSITIVE",
+            "unjudged": false,
+            "severity_validated": true,
+            "location_missing": false,
+            "also_known_as": []
+          }
+        },
+        {
+          "ruleId": "cargo-lint-config",
+          "level": "note",
+          "message": {
+            "text": "Unsafe-free security crates declare no [lints] \u2014 unsafe_code not denied, so future unsafe can land silently in the root daemon"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "crates/gatekeeper/Cargo.toml",
+                  "uriBaseId": "%SRCROOT%"
+                },
+                "region": {
+                  "startLine": 1
+                }
+              }
+            }
+          ],
+          "properties": {
+            "finding_id": "CARGOLINT-001",
+            "bug_class": "cargo-lint-config",
+            "severity": "LOW",
+            "attack_vector": "Local",
+            "exploitability": "Theoretical",
+            "fp_verdict": "TRUE_POSITIVE",
+            "unjudged": false,
+            "severity_validated": true,
+            "location_missing": false,
+            "also_known_as": []
+          }
+        },
+        {
+          "ruleId": "channel-starvation",
+          "level": "warning",
+          "message": {
+            "text": "Orphaned oneshot Senders leak in `pending` map forever after approver timeout (unbounded memory/ledger growth)"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "crates/gatekeeper/src/server.rs",
+                  "uriBaseId": "%SRCROOT%"
+                },
+                "region": {
+                  "startLine": 400
+                }
+              }
+            }
+          ],
+          "properties": {
+            "finding_id": "CHANSTARVE-001",
+            "bug_class": "channel-starvation",
+            "severity": "MEDIUM",
+            "attack_vector": "Local",
+            "exploitability": "Reliable",
+            "fp_verdict": "TRUE_POSITIVE",
+            "unjudged": false,
+            "severity_validated": true,
+            "location_missing": false,
+            "also_known_as": [
+              "CANCELSAFETY-001"
+            ]
+          }
+        },
+        {
+          "ruleId": "msrv-mismatch",
+          "level": "note",
+          "message": {
+            "text": "No rust-version (MSRV) declared in workspace or any member manifest, and no rust-toolchain.toml"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "crates/gatekeeper/Cargo.toml",
+                  "uriBaseId": "%SRCROOT%"
+                },
+                "region": {
+                  "startLine": 3
+                }
+              }
+            }
+          ],
+          "properties": {
+            "finding_id": "MSRV-001",
+            "bug_class": "msrv-mismatch",
+            "severity": "LOW",
+            "attack_vector": "Local",
+            "exploitability": "Theoretical",
+            "fp_verdict": "TRUE_POSITIVE",
+            "unjudged": false,
+            "severity_validated": true,
+            "location_missing": false,
+            "also_known_as": []
+          }
+        },
+        {
+          "ruleId": "out-of-bounds-index",
+          "level": "warning",
+          "message": {
+            "text": "nft JSON \"range\" array indexed at [0]/[1] with no length check in parse_poll"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "crates/core/src/nft.rs",
+                  "uriBaseId": "%SRCROOT%"
+                },
+                "region": {
+                  "startLine": 621
+                }
+              }
+            }
+          ],
+          "properties": {
+            "finding_id": "OOBIDX-001",
+            "bug_class": "out-of-bounds-index",
+            "severity": "MEDIUM",
+            "attack_vector": "Local",
+            "exploitability": "Difficult",
+            "fp_verdict": "LIKELY_TP",
+            "unjudged": false,
+            "severity_validated": true,
+            "location_missing": false,
+            "also_known_as": [
+              "UNWRAP-001"
+            ]
+          }
+        },
+        {
+          "ruleId": "result-discarded",
+          "level": "warning",
+          "message": {
+            "text": "Audit-log INSERT error silently discarded \u2014 security-relevant audit records can vanish without a trace"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "crates/gatekeeper/src/ledger.rs",
+                  "uriBaseId": "%SRCROOT%"
+                },
+                "region": {
+                  "startLine": 347
+                }
+              }
+            }
+          ],
+          "properties": {
+            "finding_id": "RESDISC-001",
+            "bug_class": "result-discarded",
+            "severity": "MEDIUM",
+            "attack_vector": "Local",
+            "exploitability": "Difficult",
+            "fp_verdict": "TRUE_POSITIVE",
+            "unjudged": false,
+            "severity_validated": true,
+            "location_missing": false,
+            "also_known_as": []
+          }
+        },
+        {
+          "ruleId": "result-discarded",
+          "level": "warning",
+          "message": {
+            "text": "SetDst UPDATE error swallowed by `.unwrap_or(0)` \u2014 DB failure conflated with \"row not approved\", resolution silently unpersisted"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "crates/gatekeeper/src/ledger.rs",
+                  "uriBaseId": "%SRCROOT%"
+                },
+                "region": {
+                  "startLine": 333
+                }
+              }
+            }
+          ],
+          "properties": {
+            "finding_id": "RESDISC-002",
+            "bug_class": "result-discarded",
+            "severity": "MEDIUM",
+            "attack_vector": "Local",
+            "exploitability": "Difficult",
+            "fp_verdict": "TRUE_POSITIVE",
+            "unjudged": false,
+            "severity_validated": true,
+            "location_missing": false,
+            "also_known_as": []
+          }
+        },
+        {
+          "ruleId": "resource-exhaustion",
+          "level": "warning",
+          "message": {
+            "text": "Uncapped per-connection request fan-out on mcp.sock \u2014 unbounded response channel, unbounded task spawn, unbounded ledger growth"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "crates/gatekeeper/src/server.rs",
+                  "uriBaseId": "%SRCROOT%"
+                },
+                "region": {
+                  "startLine": 247
+                }
+              }
+            }
+          ],
+          "properties": {
+            "finding_id": "RESEXHAUST-001",
+            "bug_class": "resource-exhaustion",
+            "severity": "MEDIUM",
+            "attack_vector": "Local",
+            "exploitability": "Reliable",
+            "fp_verdict": "TRUE_POSITIVE",
+            "unjudged": false,
+            "severity_validated": true,
+            "location_missing": false,
+            "also_known_as": []
+          }
+        },
+        {
+          "ruleId": "resource-exhaustion",
+          "level": "warning",
+          "message": {
+            "text": "rebuild_acct is O(approved rows) per approve/expire event and spawns an nft subprocess each time \u2014 quadratic churn driven by attacker-created grants"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "crates/gatekeeper/src/install.rs",
+                  "uriBaseId": "%SRCROOT%"
+                },
+                "region": {
+                  "startLine": 175
+                }
+              }
+            }
+          ],
+          "properties": {
+            "finding_id": "RESEXHAUST-002",
+            "bug_class": "resource-exhaustion",
+            "severity": "MEDIUM",
+            "attack_vector": "Local",
+            "exploitability": "Difficult",
+            "fp_verdict": "TRUE_POSITIVE",
+            "unjudged": false,
+            "severity_validated": true,
+            "location_missing": false,
+            "also_known_as": []
+          }
+        },
+        {
+          "ruleId": "resource-exhaustion",
+          "level": "warning",
+          "message": {
+            "text": "Unbounded NDJSON line length on mcp.sock \u2014 one unterminated line grows daemon RAM without limit"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "crates/gatekeeper/src/server.rs",
+                  "uriBaseId": "%SRCROOT%"
+                },
+                "region": {
+                  "startLine": 259
+                }
+              }
+            }
+          ],
+          "properties": {
+            "finding_id": "RESEXHAUST-003",
+            "bug_class": "resource-exhaustion",
+            "severity": "MEDIUM",
+            "attack_vector": "Local",
+            "exploitability": "Reliable",
+            "fp_verdict": "TRUE_POSITIVE",
+            "unjudged": false,
+            "severity_validated": true,
+            "location_missing": false,
+            "also_known_as": []
+          }
+        },
+        {
+          "ruleId": "string-comparison",
+          "level": "warning",
+          "message": {
+            "text": "Grant dedup compares case-sensitive canonical host targets while DNS identity is case-insensitive (config path lowercases, wire path does not)"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "crates/gatekeeper/src/server.rs",
+                  "uriBaseId": "%SRCROOT%"
+                },
+                "region": {
+                  "startLine": 340
+                }
+              }
+            }
+          ],
+          "properties": {
+            "finding_id": "STRCMP-001",
+            "bug_class": "string-comparison",
+            "severity": "MEDIUM",
+            "attack_vector": "Local",
+            "exploitability": "Reliable",
+            "fp_verdict": "TRUE_POSITIVE",
+            "unjudged": false,
+            "severity_validated": true,
+            "location_missing": false,
+            "also_known_as": []
+          }
+        },
+        {
+          "ruleId": "toctou",
+          "level": "error",
+          "message": {
+            "text": "admin.sock is connectable between bind() and the 0600 chmod; handle_admin enforces no uid check, so the window is the only access control"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "crates/gatekeeper/src/server.rs",
+                  "uriBaseId": "%SRCROOT%"
+                },
+                "region": {
+                  "startLine": 83
+                }
+              }
+            }
+          ],
+          "properties": {
+            "finding_id": "TOCTOU-001",
+            "bug_class": "toctou",
+            "severity": "HIGH",
+            "attack_vector": "Local",
+            "exploitability": "Difficult",
+            "fp_verdict": "LIKELY_TP",
+            "unjudged": false,
+            "severity_validated": true,
+            "location_missing": false,
+            "also_known_as": []
+          }
+        }
+      ]
+    }
+  ]
+}

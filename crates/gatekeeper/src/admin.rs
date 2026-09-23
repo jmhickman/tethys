@@ -20,9 +20,25 @@ use crate::ledger::{now_secs, Decide};
 use crate::server::{emit, peer_cred, resp_line, HumanDecision, State};
 
 pub(crate) async fn handle_admin(stream: UnixStream, st: Arc<State>) {
-    if let Some(c) = peer_cred(&stream) {
-        tracing::info!(uid = c.uid(), "admin client connected");
+    // TOCTOU-001 defense-in-depth: the 0600 inode mode is the primary gate;
+    // SO_PEERCRED makes it enforced rather than assumed. Admitted: root (or
+    // the configured admin uid) and the daemon's own euid (dev/test runs
+    // where nobody is root). Unreadable creds fail closed, like mcp.sock.
+    let self_uid = nix::unistd::geteuid().as_raw();
+    let ok = match peer_cred(&stream) {
+        Some(c) => c.uid() == self_uid || st.cfg.admin_peer_uid == Some(c.uid()),
+        None => false,
+    };
+    if !ok {
+        tracing::warn!(
+            uid = ?peer_cred(&stream).map(|c| c.uid()),
+            admin_uid = ?st.cfg.admin_peer_uid,
+            self_uid,
+            "admin peer rejected by SO_PEERCRED"
+        );
+        return;
     }
+    tracing::info!(uid = ?peer_cred(&stream).map(|c| c.uid()), "admin client connected");
     st.admins_online.fetch_add(1, Ordering::SeqCst);
     let mut sub_rx = st.events.subscribe();
     let (mut r, mut w) = stream.into_split();

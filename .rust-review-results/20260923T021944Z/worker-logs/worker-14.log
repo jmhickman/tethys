@@ -1,0 +1,6 @@
+  ⚠ tirith security scanner enabled but not available — command scanning will use pattern matching only
+All artifacts verified on disk: shard lists both findings, counts match (CARGOLINT 1, MSRV 1, DEPRECAPI 0), coverage file present.
+
+worker-14 complete: cluster static-hygiene, wrote 2 finding files to /home/hermes-agent/gatekeeper/.rust-review-results/20260923T021944Z/findings/, coverage at /home/hermes-agent/gatekeeper/.rust-review-results/20260923T021944Z/coverage/worker-14.md
+
+session_id: 20260923_060417_d8b02a

@@ -1,0 +1,6 @@
+  ⚠ tirith security scanner enabled but not available — command scanning will use pattern matching only
+Artifacts verified on disk: 1 finding file, index shard matches, coverage gate present. PATHJOIN cleared with seeds run (no untrusted component reaches any path sink); TOCTOU-001 filed for the bind→chmod window on admin.sock with no uid gate in handle_admin.
+
+worker-16 complete: cluster input-os-safety, wrote 1 finding files to /home/hermes-agent/gatekeeper/.rust-review-results/20260923T021944Z/findings/, coverage at /home/hermes-agent/gatekeeper/.rust-review-results/20260923T021944Z/coverage/worker-16.md
+
+session_id: 20260923_135600_cab328

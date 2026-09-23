@@ -79,9 +79,26 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
     for path in [&st.cfg.mcp_socket, &st.cfg.admin_socket] {
         let _ = std::fs::remove_file(path);
     }
+    // TOCTOU-001: bind() creates the inode at 0777&~umask and it is live
+    // immediately; a connect() before the chmod would hold a permanent
+    // admin session (socket perms are checked at connect only). Tighten
+    // umask so both sockets are born owner-rw-only, then restore. admin.sock
+    // stays 0600; mcp.sock is widened to its group below when pinned.
+    struct UmaskGuard(libc::mode_t);
+    impl Drop for UmaskGuard {
+        fn drop(&mut self) {
+            unsafe { libc::umask(self.0) };
+        }
+    }
+    let _umask = UmaskGuard(unsafe { libc::umask(0o177) });
     let mcp = UnixListener::bind(&st.cfg.mcp_socket)?;
     let admin = UnixListener::bind(&st.cfg.admin_socket)?;
-    std::fs::set_permissions(&st.cfg.admin_socket, std::fs::Permissions::from_mode(0o600))?;
+    drop(_umask);
+    debug_assert_eq!(
+        std::fs::metadata(&st.cfg.admin_socket)?.permissions().mode() & 0o777,
+        0o600,
+        "admin.sock must be born 0600 (umask-guarded bind)"
+    );
     // mcp.sock: reachable only by mcp_user's group (identity is still checked
     // per connection via SO_PEERCRED); with no resolved gid the socket stays
     // owner-only, which in dev means whoever started the daemon.

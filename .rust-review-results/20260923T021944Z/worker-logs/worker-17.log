@@ -1,0 +1,6 @@
+  ⚠ tirith security scanner enabled but not available — command scanning will use pattern matching only
+
+session_id: 20260923_022356_cd2b70
+Phase-A seed and corroborating searches (rg, no grep fallback needed) over crates/ found zero pointer→address derivations — the codebase is pure safe Rust with no `*const`/`*mut`/`NonNull`/`unsafe`, so Gate 1 of the pointer-exposure pass cannot hold; all `as usize` hits are integer arithmetic in gk-tui layout code. Empty shard and coverage row written and verified on disk.
+
+worker-17 complete: cluster info-disclosure, wrote 0 finding files, coverage at /home/hermes-agent/gatekeeper/.rust-review-results/20260923T021944Z/coverage/worker-17.md

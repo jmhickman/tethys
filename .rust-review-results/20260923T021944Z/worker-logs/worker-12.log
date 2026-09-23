@@ -1,0 +1,6 @@
+  ⚠ tirith security scanner enabled but not available — command scanning will use pattern matching only
+Both passes ran to completion with zero confirmed findings; empty index shard and coverage gate written and verified on disk (0 NONDET/KEYMUT finding files, coverage OK).
+
+worker-12 complete: cluster logic-correctness-2, wrote 0 finding files, coverage at /home/hermes-agent/gatekeeper/.rust-review-results/20260923T021944Z/coverage/worker-12.md
+
+session_id: 20260923_054115_c860c8

@@ -1,0 +1,6 @@
+  ⚠ tirith security scanner enabled but not available — command scanning will use pattern matching only
+Both passes ran with real rg seeds (ripgrep 15.2.0 confirmed present, so no false-empty risk): the full Phase-A inventory found zero raw-fd sites (`from_raw_fd`/`into_raw_fd`/`as_raw_fd`/`RawFd`/`OwnedFd`/`libc::close|dup|open|pipe|socket`) and zero Drop-bypass sites (`mem::forget`/`ManuallyDrop`/`process::exit`/`libc::exit`, no `impl Drop`) in `crates/` — all fd ownership is RAII (`tokio::net::UnixStream`, `File`, rusqlite `Connection`). Empty index shard and coverage file verified on disk.
+
+worker-15 complete: cluster resource-handling, wrote 0 finding files, coverage at /home/hermes-agent/gatekeeper/.rust-review-results/20260923T021944Z/coverage/worker-15.md
+
+session_id: 20260923_061807_ed5710

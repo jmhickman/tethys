@@ -27,6 +27,10 @@ agent_user = "hermes-agent" # THE POLICED UID: the baseline's egress drop
                             # egresses freely (counted by nft counter
                             # gk_exempt). Unresolvable user => fail-safe:
                             # enforcement covers ALL uids (host-wide).
+admin_user = "root"           # uid enforced on admin.sock via SO_PEERCRED, on
+                            # top of the 0600 socket mode (bind is umask-
+                            # guarded so the mode never lags visibility). The
+                            # daemon's own euid is always admitted (dev runs).
 mcp_user   = "gk-mcp-service" # uid accepted on mcp.sock (SO_PEERCRED) and the
                             # group that owns it. In the standard stdio
                             # topology the agent harness spawns gk-mcp itself,
