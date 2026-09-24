@@ -1,6 +1,0 @@
-  ⚠ tirith security scanner enabled but not available — command scanning will use pattern matching only
-All three passes ran with rg seeds; artifacts verified on disk (2 finding files match the shard, coverage file present). ATOMICRACE found two unguarded fetch_add/fetch_sub counter-leak sites; SENDSYNCBOUND and SHMRACE cleared — the crate has zero `unsafe`/`transmute`/manual Send-Sync impls and zero shared-memory mappings.
-
-worker-3 complete: cluster concurrency-data-race, wrote 2 finding files to /home/hermes-agent/gatekeeper/.rust-review-results/20260923T021944Z/findings/, coverage at /home/hermes-agent/gatekeeper/.rust-review-results/20260923T021944Z/coverage/worker-3.md
-
-session_id: 20260923_024408_0833fe

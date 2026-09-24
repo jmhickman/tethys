@@ -1,4 +1,0 @@
-  ⚠ tirith security scanner enabled but not available — command scanning will use pattern matching only
-fp+severity-judge complete: 17 primaries → 13 TRUE_POSITIVE, 3 LIKELY_TP (1 HIGH, 12 MEDIUM survivors total incl. LOWs), 1 LIKELY_FP, 0 FALSE_POSITIVE, 0 OOS; REPORT.md + REPORT.sarif written
-
-session_id: 20260923_151518_1018ea

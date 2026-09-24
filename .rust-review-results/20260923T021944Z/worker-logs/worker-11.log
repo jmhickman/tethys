@@ -1,6 +1,0 @@
-  ⚠ tirith security scanner enabled but not available — command scanning will use pattern matching only
-All artifacts verified on disk: 1 finding file (STRCMP-001 — case-sensitive grant dedup vs. case-insensitive host identity across the config/wire normalization split), coverage rows verbatim for all four passes, index shard populated.
-
-worker-11 complete: cluster logic-correctness-1, wrote 1 finding file to /home/hermes-agent/gatekeeper/.rust-review-results/20260923T021944Z/findings/, coverage at /home/hermes-agent/gatekeeper/.rust-review-results/20260923T021944Z/coverage/worker-11.md
-
-session_id: 20260923_050835_6fd117

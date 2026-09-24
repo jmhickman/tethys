@@ -1,6 +1,0 @@
-  ⚠ tirith security scanner enabled but not available — command scanning will use pattern matching only
-All 4 passes ran; 5 finding files and the coverage gate verified on disk (counts match claimed IDs), and the ARITHOFL panic/wrap claim was confirmed with a real rustc debug-vs-release probe rather than assumed.
-
-worker-4 complete: cluster panic-dos-1, wrote 5 finding files to /home/hermes-agent/gatekeeper/.rust-review-results/20260923T021944Z/findings/, coverage at /home/hermes-agent/gatekeeper/.rust-review-results/20260923T021944Z/coverage/worker-4.md
-
-session_id: 20260923_030402_51220d

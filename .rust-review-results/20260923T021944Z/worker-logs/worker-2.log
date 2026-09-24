@@ -1,6 +1,0 @@
-  ⚠ tirith security scanner enabled but not available — command scanning will use pattern matching only
-All six passes ran; artifacts verified on disk (shard lists the 1 finding file, count matches, coverage file present).
-
-worker-2 complete: cluster concurrency-locking, wrote 1 finding files to /home/hermes-agent/gatekeeper/.rust-review-results/20260923T021944Z/findings/, coverage at /home/hermes-agent/gatekeeper/.rust-review-results/20260923T021944Z/coverage/worker-2.md
-
-session_id: 20260923_023759_b9388e

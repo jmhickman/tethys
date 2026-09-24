@@ -1,6 +1,0 @@
-  ⚠ tirith security scanner enabled but not available — command scanning will use pattern matching only
-dedup-judge complete: 19 findings → 17 primaries (0 tier-1 merges, 0 tier-2 merges, 2 tier-3 cross-class merges, 4 related groups)
-
-Details: Tier 3 merged CANCELSAFETY-001 into CHANSTARVE-001 (same `st.pending` insert + uncleaned timeout arm at server.rs:400/506; High-confidence primary kept) and UNWRAP-001 into OOBIDX-001 (same nft-JSON `range` block at nft.rs:619-622; confidence tie broken by lexicographic id). Tier 1/2 found no eligible buckets — the two server.rs:400 co-located findings differ in class, and same-function same-class pairs (RESDISC-001/002, RESEXHAUST-001/003) sit >5 lines apart on distinct constructs. Summary written to /home/hermes-agent/gatekeeper/.rust-review-results/20260923T021944Z/dedup-summary.md; no finding files deleted.
-
-session_id: 20260923_150526_873063

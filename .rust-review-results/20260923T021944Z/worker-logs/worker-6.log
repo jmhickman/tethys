@@ -1,8 +1,0 @@
-  ⚠ tirith security scanner enabled but not available — command scanning will use pattern matching only
-All artifacts verified: empty index shard at findings-index.d/worker-6.txt (ran, found nothing), coverage gate file present with the required RECURSEDES row.
-
-Analysis summary: every untrusted deserialize site in `crates/` (mcp.sock `RpcRequest` with `serde_json::Value` params, gk-mcp stdio via rmcp) goes through serde_json's derived-Deserialize path with the default 128-frame recursion cap intact — `unbounded_depth` is absent from the resolved feature graph (`cargo tree -e features`), and there is no `disable_recursion_limit`, `serde_stacker`, bincode, postcard, or custom out-of-band parser anywhere in scope. The sole custom `Deserialize` helper (`de_grant_id`) recurses through the normal serde API on the trusted admin.sock, which the finder's FP rules explicitly exclude; remaining sites are root-owned config (toml, built-in cap) or daemon-side/trusted sources with non-recursive targets.
-
-worker-6 complete: cluster recursion-dos-1, wrote 0 finding files, coverage at /home/hermes-agent/gatekeeper/.rust-review-results/20260923T021944Z/coverage/worker-6.md
-
-session_id: 20260923_040437_e00a22

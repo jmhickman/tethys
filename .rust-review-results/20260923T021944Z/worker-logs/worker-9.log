@@ -1,6 +1,0 @@
-  ⚠ tirith security scanner enabled but not available — command scanning will use pattern matching only
-All artifacts verified on disk: shard lists 3 finding files matching per-prefix counts (RESDISC 2, DROPPANIC 0, LOSSYFROM 1, LOSSYSTR 0), coverage file present.
-
-worker-9 complete: cluster error-handling-1, wrote 3 finding files to /home/hermes-agent/gatekeeper/.rust-review-results/20260923T021944Z/findings/, coverage at /home/hermes-agent/gatekeeper/.rust-review-results/20260923T021944Z/coverage/worker-9.md
-
-session_id: 20260923_045838_e92f8e

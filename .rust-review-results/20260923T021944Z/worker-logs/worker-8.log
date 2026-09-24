@@ -1,6 +1,0 @@
-  ⚠ tirith security scanner enabled but not available — command scanning will use pattern matching only
-Phase A inventory found no crate-local recursive types (`Box<Self>`/`Vec<Self>`/`Option<Box<Self>>`/self-referential map seeds all empty; no `impl Drop` anywhere in `crates/`). The only recursive type reachable from untrusted input is library `serde_json::Value`, and every producer site (`server.rs:265`, `admin.rs:43`, `gk-mcp/main.rs:100`, `gk-tui/conn.rs:94`, `nft.rs:470`) parses via `from_str`/`from_value` with serde_json's default 128-depth recursion limit — no `disable_recursion_limit`, no `from_reader` (all socket readers are line-based `.lines()` → `from_str`). Programmatic `json!`/`Batch.cmds` construction is wide-but-shallow. RECURSEDROP gate 4 (depth capped before storage) holds on every path, so the pass clears with zero findings; coverage row and empty index shard are on disk and verified.
-
-worker-8 complete: cluster recursion-dos-3, wrote 0 finding files, coverage at /home/hermes-agent/gatekeeper/.rust-review-results/20260923T021944Z/coverage/worker-8.md
-
-session_id: 20260923_045007_e6d515

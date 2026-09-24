@@ -1,6 +1,0 @@
-  ⚠ tirith security scanner enabled but not available — command scanning will use pattern matching only
-All three artifacts verified on disk: shard lists exactly the 3 finding files, coverage rows match claimed counts (SELECTBIAS cleared with seed).
-
-worker-13 complete: cluster async-runtime, wrote 3 finding files to /home/hermes-agent/gatekeeper/.rust-review-results/20260923T021944Z/findings/, coverage at /home/hermes-agent/gatekeeper/.rust-review-results/20260923T021944Z/coverage/worker-13.md
-
-session_id: 20260923_135600_94ef0d
