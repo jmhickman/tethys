@@ -11,10 +11,10 @@ use clap::Parser;
 use config::FileConfig;
 
 #[derive(Parser, Debug)]
-#[command(name = "gatekeeper", about = "pentest scope enforcement daemon")]
+#[command(name = "tethysd", version, about = "pentest scope enforcement daemon")]
 pub struct Cli {
     /// TOML config file (see config.example.toml)
-    #[arg(long, default_value = "/etc/gatekeeper/config.toml")]
+    #[arg(long, default_value = "/etc/tethys/config.toml")]
     pub config: PathBuf,
     #[arg(long)]
     pub mcp_socket: Option<PathBuf>,
@@ -22,22 +22,18 @@ pub struct Cli {
     pub admin_socket: Option<PathBuf>,
     #[arg(long)]
     pub db: Option<PathBuf>,
-    /// nftables table to own (default: gatekeeper)
+    /// nftables table to own (default: tethys)
     #[arg(long)]
     pub nft_table: Option<String>,
     #[arg(long)]
     pub max_ttl: Option<String>,
     #[arg(long)]
     pub approver_timeout_secs: Option<u64>,
-    /// username that runs gk-mcp; connections on mcp.sock must come from a
-    /// process with this uid (resolved at startup)
-    #[arg(long)]
-    pub mcp_user: Option<String>,
     /// user of the pentest agent workload (configurable name, default hermes-agent)
     #[arg(long)]
     pub agent_user: Option<String>,
     /// operator allow-list entry (repeatable); same grammar as config `allow`
-    /// (e.g. --allow api.anthropic.com:443 --allow 192.168.10.165:1234)
+    /// (e.g. --allow api.anthropic.com:443 --allow 192.168.1.5:1234)
     #[arg(long = "allow")]
     pub allow: Vec<String>,
     /// username allowed on admin.sock (SO_PEERCRED gate; default root)
@@ -54,6 +50,10 @@ pub struct Cli {
 /// File + CLI overrides, with resolved uids.
 #[derive(Debug, Clone)]
 pub struct Config {
+    /// the file the operator allow list reloads from (--config value)
+    pub config_path: PathBuf,
+    /// true when --allow flags replaced the file's list; reload.allow refuses
+    pub allow_from_cli: bool,
     pub mcp_socket: PathBuf,
     pub admin_socket: PathBuf,
     pub db: PathBuf,
@@ -68,17 +68,17 @@ pub struct Config {
     /// resolved uid allowed on admin.sock besides the daemon's own euid
     /// (SO_PEERCRED gate; TOCTOU-001 defense-in-depth)
     pub admin_peer_uid: Option<u32>,
-    pub mcp_user: String,
-    /// Some(uid) => only that uid is accepted on mcp.sock; None => accept all (dev)
+    /// Some(uid) => only that uid is accepted on mcp.sock (always
+    /// agent_user's, when resolvable); None => accept all (dev fallback)
     pub mcp_peer_uid: Option<u32>,
-    /// group that may connect to mcp.sock (mcp_user's primary gid);
+    /// group that may connect to mcp.sock (agent_user's primary gid);
     /// None => owner-only socket (dev)
     pub mcp_sock_gid: Option<u32>,
     /// Operator allow list; a bad entry aborts boot.
     pub allow: Vec<(
-        gk_core::types::Target,
-        gk_core::types::PortSpec,
-        gk_core::types::Proto,
+        tethys_core::types::Target,
+        tethys_core::types::PortSpec,
+        tethys_core::types::Proto,
     )>,
     pub dry_run: bool,
 }
@@ -107,6 +107,8 @@ async fn main() -> anyhow::Result<()> {
     };
 
     let mut cfg = Config {
+        config_path: cli.config.clone(),
+        allow_from_cli: !cli.allow.is_empty(),
         mcp_socket: cli.mcp_socket.unwrap_or(file.mcp_socket),
         admin_socket: cli.admin_socket.unwrap_or(file.admin_socket),
         db: cli.db.unwrap_or(file.db),
@@ -119,7 +121,6 @@ async fn main() -> anyhow::Result<()> {
         agent_uid: None,
         admin_user: cli.admin_user.unwrap_or(file.admin_user),
         admin_peer_uid: None,
-        mcp_user: cli.mcp_user.unwrap_or(file.mcp_user),
         mcp_peer_uid: None,
         mcp_sock_gid: None,
         allow: Vec::new(),
@@ -128,28 +129,18 @@ async fn main() -> anyhow::Result<()> {
 
     // Allow list: CLI entries replace the file's (same precedence rule as
     // every other knob). Parse eagerly — an unparseable entry is fatal.
+    // (allow_from_cli was recorded on cfg above; reload.allow reads it there.)
     let allow_src = if cli.allow.is_empty() {
         &file.allow
     } else {
         &cli.allow
     };
     for entry in allow_src {
-        cfg.allow
-            .push(config::parse_allow(entry).map_err(|e| anyhow::anyhow!("config `allow`: {e}"))?);
+        cfg.allow.extend(
+            config::parse_allow(entry).map_err(|e| anyhow::anyhow!("config `allow`: {e}"))?,
+        );
     }
 
-    // Identity resolution: a named-but-missing mcp user is fatal, since
-    // accepting any peer would defeat the uid check on mcp.sock.
-    match config::resolve_uid(&cfg.mcp_user) {
-        Ok(uid) => {
-            cfg.mcp_peer_uid = Some(uid);
-            cfg.mcp_sock_gid = config::resolve_gid(&cfg.mcp_user).ok();
-        }
-        Err(e) if cli.allow_missing_users => {
-            tracing::warn!(%e, "--allow-missing-users: mcp.sock peer pin DISABLED (dev only!)");
-        }
-        Err(e) => return Err(e),
-    }
     // admin user: the socket's 0600 mode is the primary gate; this uid is
     // enforced per connection as defense-in-depth (TOCTOU-001). A missing
     // admin user is fatal unless dev mode opts out; either way the daemon's
@@ -162,16 +153,25 @@ async fn main() -> anyhow::Result<()> {
         Err(e) => return Err(e),
     }
     // agent user may legitimately not exist yet at first boot before the
-    // harness provisions it — warn, don't block enforcement plumbing.
+    // harness provisions it — warn, don't block enforcement plumbing. The
+    // same uid is what mcp.sock pins peers to: in the stdio topology the
+    // harness spawns tethys-mcp itself, so the connecting process shares
+    // agent_user's uid by construction. Unresolved agent => no pin (accept
+    // all), mirroring the host-wide fallback on the enforcement side.
     match config::resolve_uid(&cfg.agent_user) {
-        Ok(uid) => cfg.agent_uid = Some(uid),
-        Err(e) => tracing::warn!(%e, "agent_user unresolved until provisioned"),
+        Ok(uid) => {
+            cfg.agent_uid = Some(uid);
+            cfg.mcp_peer_uid = Some(uid);
+            cfg.mcp_sock_gid = config::resolve_gid(&cfg.agent_user).ok();
+        }
+        Err(e) => {
+            tracing::warn!(%e, "agent_user unresolved until provisioned (mcp.sock peer pin inactive)")
+        }
     }
 
     tracing::info!(
         agent_user = %cfg.agent_user,
         agent_uid = ?cfg.agent_uid,
-        mcp_user = %cfg.mcp_user,
         mcp_peer_uid = ?cfg.mcp_peer_uid,
         admin_user = %cfg.admin_user,
         admin_peer_uid = ?cfg.admin_peer_uid,

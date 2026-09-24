@@ -7,9 +7,9 @@ use std::sync::Arc;
 use crate::ledger::{now_secs, Decide, DenyCode, GrantState};
 use crate::server::State;
 
-/// Parse a `gk:g<gid>` attribution comment.
+/// Parse a `tethys:g<gid>` attribution comment.
 fn grant_gid_of_comment(c: &Option<String>) -> Option<i64> {
-    c.as_deref()?.strip_prefix("gk:g")?.parse().ok()
+    c.as_deref()?.strip_prefix("tethys:g")?.parse().ok()
 }
 
 /// Reconcile ledger against kernel truth at startup (see policy block above).
@@ -100,8 +100,8 @@ mod tests {
 
     #[test]
     fn comment_attribution_parse() {
-        assert_eq!(grant_gid_of_comment(&Some("gk:g42".into())), Some(42));
-        assert_eq!(grant_gid_of_comment(&Some("gk:g-1".into())), Some(-1));
+        assert_eq!(grant_gid_of_comment(&Some("tethys:g42".into())), Some(42));
+        assert_eq!(grant_gid_of_comment(&Some("tethys:g-1".into())), Some(-1));
         assert_eq!(grant_gid_of_comment(&Some("other".into())), None);
         assert_eq!(grant_gid_of_comment(&None), None);
     }

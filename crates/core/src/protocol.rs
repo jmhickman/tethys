@@ -1,4 +1,4 @@
-//! Wire protocol: MCP server <-> gatekeeper over NDJSON JSON-RPC 2.0.
+//! Wire protocol: MCP server <-> tethysd over NDJSON JSON-RPC 2.0.
 //! Also defines the TUI-facing event/command surface (same envelope).
 
 use serde::{Deserialize, Serialize};
@@ -75,7 +75,7 @@ impl RpcResponse {
 
 pub mod method {
     pub const ACCESS_REQUEST: &str = "access.request";
-    // TUI -> gatekeeper
+    // TUI -> tethysd
     pub const APPROVE: &str = "approve";
     pub const DENY: &str = "deny";
     pub const REVOKE: &str = "revoke";
@@ -85,16 +85,19 @@ pub mod method {
     /// the baseline carve sets); read-only, no params
     pub const LIST_ALLOW: &str = "list.allow";
     pub const LIST_HISTORY: &str = "list.history";
+    /// re-read the config file and reinstall the operator allow list;
+    /// rejected when the daemon started with --allow overrides
+    pub const RELOAD_ALLOW: &str = "reload.allow";
     pub const STOP_GRANTS: &str = "stop.grants";
     pub const SUBSCRIBE: &str = "subscribe";
-    // gatekeeper -> TUI (server push notifications; id omitted per JSON-RPC)
+    // tethysd -> TUI (server push notifications; id omitted per JSON-RPC)
     pub const EV_REQUEST_NEW: &str = "grant.request.new";
     pub const EV_DECIDED: &str = "grant.decided";
     pub const EV_EXPIRED: &str = "grant.expired";
     /// Emergency stop swept N grants; not a per-grant decision.
     pub const EV_STOPPED: &str = "grants.stopped";
     pub const EV_TRAFFIC: &str = "traffic.stat";
-    pub const EV_ERROR: &str = "gk.error";
+    pub const EV_ERROR: &str = "tethys.error";
 }
 
 // --------------------------------------------------------- admin.sock params
@@ -154,7 +157,7 @@ pub mod admin {
     }
 }
 
-/// params of `access.request` (MCP -> gatekeeper). Exactly one target field.
+/// params of `access.request` (MCP -> tethysd). Exactly one target field.
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct AccessRequestParams {
     #[serde(default)]
@@ -240,7 +243,7 @@ pub struct GrantStat {
 }
 
 // ------------------------------------------------------- admin event payloads
-// One struct per broadcast so producer (daemon emit()) and consumer (gk-tui)
+// One struct per broadcast so producer (daemon emit()) and consumer (tethys)
 // share a compile-checked contract instead of agreeing on string keys.
 
 /// `grant.request.new` — a request awaits human decision.

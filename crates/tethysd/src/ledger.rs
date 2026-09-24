@@ -4,14 +4,14 @@
 use std::path::Path;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use gk_core::types::Proto;
 use rusqlite::{params, Connection};
+use tethys_core::types::Proto;
 
 use tokio::sync::mpsc;
 
-/// Ledger/wire vocabulary types live in gk-core (shared verbatim with gk-tui
+/// Ledger/wire vocabulary types live in tethys-core (shared verbatim with tethys
 /// over admin.sock); re-exported so daemon code says `crate::ledger::…`.
-pub use gk_core::wire::{DenyCode, GrantRow, GrantState};
+pub use tethys_core::wire::{DenyCode, GrantRow, GrantState};
 
 /// New request. State, expiry, and verdict are filled in later.
 #[derive(Clone, Debug)]
@@ -459,7 +459,7 @@ mod tests {
     /// Wrong-origin decisions flip zero rows; right-origin flips exactly one.
     #[tokio::test]
     async fn transitions_enforce_origin_state() {
-        let dir = std::env::temp_dir().join(format!("gk-ledger-test-{}", now_secs()));
+        let dir = std::env::temp_dir().join(format!("tethys-ledger-test-{}", now_secs()));
         let (ledger, actor) = Ledger::open(&dir.join("t.db")).unwrap();
         let gid = ledger.insert_pending(newg("k1")).await.expect("insert");
 
@@ -528,7 +528,7 @@ mod tests {
 
     #[tokio::test]
     async fn history_excludes_pending_filters_and_limits() {
-        let dir = std::env::temp_dir().join(format!("gk-hist-{}", now_secs()));
+        let dir = std::env::temp_dir().join(format!("tethys-hist-{}", now_secs()));
         let (ledger, actor) = Ledger::open(&dir.join("t.db")).unwrap();
 
         // 3 decided rows in distinct terminal states + 1 still pending
@@ -603,7 +603,7 @@ mod tests {
 
     #[tokio::test]
     async fn dup_idem_key_rejected_and_findable_across_states() {
-        let dir = std::env::temp_dir().join(format!("gk-idem-{}", now_secs()));
+        let dir = std::env::temp_dir().join(format!("tethys-idem-{}", now_secs()));
         let (ledger, actor) = Ledger::open(&dir.join("t.db")).unwrap();
         let gid = ledger.insert_pending(newg("req-x")).await.expect("insert");
         assert!(

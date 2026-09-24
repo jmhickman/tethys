@@ -1,11 +1,11 @@
 [Unit]
-Description=Pentest scope enforcement gatekeeper (grant ledger + nft enforcer)
-Requires=gatekeeper-baseline.service
-After=gatekeeper-baseline.service
+Description=Tethys pentest scope enforcement (grant ledger + nft enforcer)
+Requires=tethys-baseline.service
+After=tethys-baseline.service
 
 [Service]
 Type=simple
-ExecStart=/usr/local/bin/gatekeeper --config /etc/gatekeeper/config.toml
+ExecStart=/usr/local/bin/tethysd --config /etc/tethys/config.toml
 Restart=on-failure
 RestartSec=2s
 # The account that owns the admin socket and holds the nft privileges. root is
@@ -18,7 +18,11 @@ AmbientCapabilities=CAP_NET_ADMIN CAP_CHOWN
 CapabilityBoundingSet=CAP_NET_ADMIN CAP_CHOWN CAP_SETUID CAP_SETGID
 ProtectSystem=strict
 ProtectHome=yes
-ReadWritePaths=/var/lib/gatekeeper /run/gatekeeper
+# systemd-managed dirs: created (and writable) before ExecStart; plain
+# ReadWritePaths does NOT create missing dirs and fails the mount namespace
+# on a fresh boot where /run/tethys doesn't exist yet.
+RuntimeDirectory=tethys
+StateDirectory=tethys
 PrivateTmp=yes
 NoNewPrivileges=no
 

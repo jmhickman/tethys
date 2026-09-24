@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""E2E for gatekeeper over real unix sockets + live nftables.
+"""E2E for tethysd over real unix sockets + live nftables.
 
 Run from workspace root as a privileged account (nftables changes + nft
-required); the harness starts its own daemon on /tmp/gk-test/* and points
-it at a private nftables table (GK_E2E_TABLE, default gk_e2e) — production
+required); the harness starts its own daemon on /tmp/tethys-e2e/* and points
+it at a private nftables table (TETHYS_E2E_TABLE, default tethys_e2e) — production
 kernel state is untouched.
 
 Scenarios (all must pass):
@@ -16,13 +16,13 @@ Scenarios (all must pass):
 import json, os, signal, socket, subprocess, sys, threading, time
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
-DIR = "/tmp/gk-test"
+DIR = "/tmp/tethys-e2e"
 ADMIN = f"{DIR}/admin.sock"
 MCP = f"{DIR}/mcp.sock"
-GK_BIN = os.environ.get("GK_BIN", os.path.join(ROOT, "target/debug/gatekeeper"))
-# private table: the kernel is shared with any production gatekeeper, so the
+TETHYSD_BIN = os.environ.get("TETHYSD_BIN", os.path.join(ROOT, "target/debug/tethysd"))
+# private table: the kernel is shared with any production tethysd, so the
 # harness owns its own table end-to-end (daemon flag + every verification query)
-TABLE = os.environ.get("GK_E2E_TABLE", "gk_e2e")
+TABLE = os.environ.get("TETHYS_E2E_TABLE", "tethys_e2e")
 
 
 def nft_grants():
@@ -38,19 +38,19 @@ def main():
     if b.returncode != 0:
         print("BUILD FAILED:\n", b.stderr[-2000:]); sys.exit(1)
     # kill a leftover TEST daemon from a previous run only — never a
-    # production gatekeeper (match on this harness's distinctive cmdline)
-    subprocess.run(["pkill", "-f", "--", f"{GK_BIN} .*{DIR}/"])
+    # production tethysd (match on this harness's distinctive cmdline)
+    subprocess.run(["pkill", "-f", "--", f"{TETHYSD_BIN} .*{DIR}/"])
     time.sleep(0.3)
     os.system(f"rm -rf {DIR} && mkdir -p {DIR}")
     # start from a clean private table (idempotent; needs nft privileges)
     subprocess.run(["nft", "delete", "table", "inet", TABLE], capture_output=True)
-    gk = subprocess.Popen(
-        [GK_BIN, "--db", f"{DIR}/ledger.db", "--mcp-socket", MCP, "--admin-socket", ADMIN,
+    daemon = subprocess.Popen(
+        [TETHYSD_BIN, "--db", f"{DIR}/ledger.db", "--mcp-socket", MCP, "--admin-socket", ADMIN,
          "--nft-table", TABLE,
          "--approver-timeout-secs", "8",
-         # dev mode: no peer pin (real pin behavior covered by pin_e2e.sh)
-         "--mcp-user", "gk-e2e-absent", "--allow-missing-users"],
-        stdout=open(f"{DIR}/gk.log", "w"), stderr=subprocess.STDOUT)
+         # dev mode: no peer pin
+         "--mcp-user", "tethys-e2e-absent", "--allow-missing-users"],
+        stdout=open(f"{DIR}/tethysd.log", "w"), stderr=subprocess.STDOUT)
     time.sleep(0.8)
 
     adm = socket.socket(socket.AF_UNIX); adm.connect(ADMIN)
@@ -361,8 +361,8 @@ def main():
         fails.append(f"S9 deny event missing/wrong: {dec}")
     print("S9 tui-contract:", "ok" if "S9" not in str(fails) else fails[-1])
 
-    gk.send_signal(signal.SIGTERM)
-    gk.wait(timeout=5)
+    daemon.send_signal(signal.SIGTERM)
+    daemon.wait(timeout=5)
     # leave no kernel residue: the private table is ours, drop it whole
     subprocess.run(["nft", "delete", "table", "inet", TABLE], capture_output=True)
     if fails:

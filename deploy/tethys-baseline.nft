@@ -1,18 +1,18 @@
 #!/usr/sbin/nft -f
-# gatekeeper static egress baseline — applied at boot by
-# gatekeeper-baseline.service, before gatekeeper.service starts.
+# Tethys static egress baseline — applied at boot by
+# tethys-baseline.service, before tethysd.service starts.
 #
-# Ownership contract: the gatekeeper NEVER edits rules or verdicts in this
+# Ownership contract: tethysd NEVER edits rules or verdicts in this
 # layer. It adds/removes ELEMENTS inside grants_v4/grants_v6 (expiry comes
 # from each element's kernel timeout; no cron/poller deletes them), and it
 # OWNS the CONTENTS of carve_v4/carve_v6 wholesale: those sets are flushed
 # and reinstalled from the config `allow` list on every daemon start. To
-# change always-allowed egress, edit /etc/gatekeeper/config.toml (`allow`)
-# and restart gatekeeper — do NOT `nft add element` into carve_* by hand;
+# change always-allowed egress, edit /etc/tethys/config.toml (`allow`)
+# and restart tethysd — do NOT `nft add element` into carve_* by hand;
 # it will be wiped on the next restart.
 # This file pre-creates all four sets EMPTY so the lookup rules below parse;
-# the grant set definitions MUST stay byte-compatible with gk_core::nft
-# ensure_base() (crates/core/src/nft.rs) or gatekeeper startup fails.
+# the grant set definitions MUST stay byte-compatible with tethys_core::nft
+# ensure_base() (crates/core/src/nft.rs) or tethysd startup fails.
 #
 # Grammar is the verified nft 1.1.6 form: set keys are
 # `ip daddr . meta l4proto . th dport` and rule concats match that key order
@@ -20,18 +20,18 @@
 #
 # RELOAD CONTRACT: do not reload this file while grants are
 # live (`add set` on an existing set aborts). Change sequence:
-#   systemctl stop gatekeeper \
-#     && nft delete table inet gatekeeper || true \
-#     && nft -f /etc/gatekeeper/baseline.nft \
-#     && systemctl start gatekeeper
-# Escape hatch if the egress policy ever locks you out: LXC console from the
-# Proxmox host (never network-dependent), then `nft delete table inet gatekeeper`.
+#   systemctl stop tethysd \
+#     && nft delete table inet tethys || true \
+#     && nft -f /etc/tethys/baseline.nft \
+#     && systemctl start tethysd
+# Escape hatch if the egress policy ever locks you out: LXC console from #
+# Proxmox host (never network-dependent), then `nft delete table inet tethys`.
 
-table inet gatekeeper {
+table inet tethys {
     # ---- operator-declared always-allowed tuples -----------------------
-    # CONTENTS owned by gatekeeper at runtime: flushed + reinstalled from
+    # CONTENTS owned by tethysd at runtime: flushed + reinstalled from
     # config `allow` on every start. Same key grammar as the grant sets so
-    # one rule shape serves both; no timeout — entries persist until the
+    # one rule shape serves both; no timeout — entries persist until #
     # next restart's reinstall.
     set carve_v4 {
         typeof ip daddr . meta l4proto . th dport
@@ -42,7 +42,7 @@ table inet gatekeeper {
         flags interval
     }
 
-    # ---- gatekeeper-owned element sets (created EMPTY here) ------------
+    # ---- tethysd-owned element sets (created EMPTY here) ------------
     set grants_v4 {
         typeof ip daddr . meta l4proto . th dport
         flags interval,timeout
@@ -54,20 +54,20 @@ table inet gatekeeper {
         timeout 86400s
     }
 
-    counter gk_drops { }
+    counter tethys_drops { }
 
-    # Enforcement scope chain (UID scoping, R11): declared EMPTY here; the
-    # gatekeeper owns its contents (flush + rebuild from agent_user at every
+    # Enforcement scope chain (UID scoping, R11): declared EMPTY here; #
+    # tethysd owns its contents (flush + rebuild from agent_user at every
     # start). The `jump scope` in egress below is the ONLY way to exempt uids
     # before the drop: a separate hooked chain cannot do it (each base chain
     # on the same hook is an independent netfilter callback; accept in one
     # does NOT skip the others — probe-verified on nft 1.1.6). Inside scope,
     # policed uids RETURN (verdict falls through to the drop below) and
-    # everyone else ACCEPTs (short-circuits egress, counted by gk_exempt).
+    # everyone else ACCEPTs (short-circuits egress, counted by tethys_exempt).
     chain scope { }
 
     # Accounting chains: declared EMPTY by the baseline, but their contents
-    # are owned exclusively by gatekeeper (flush + rebuild from its ledger).
+    # are owned exclusively by tethysd (flush + rebuild from its ledger).
     # Rules here only ever carry named counters — no verdict can live in these
     # chains, so they cannot influence enforcement. Priority filter-10: they
     # observe every locally-generated packet BEFORE the egress verdict runs,
@@ -85,7 +85,7 @@ table inet gatekeeper {
         oifname "lo" accept
         ct state established,related accept
 
-        # UID scoping: non-policed uids leave here (accept, counted gk_exempt);
+        # UID scoping: non-policed uids leave here (accept, counted tethys_exempt);
         # policed uids RETURN and continue down the policed path below.
         jump scope
 
@@ -103,7 +103,7 @@ table inet gatekeeper {
         ip6 daddr . meta l4proto . tcp dport @carve_v6 accept
         ip6 daddr . meta l4proto . udp dport @carve_v6 accept
 
-        # model-approved grants (elements + kernel TTL owned by gatekeeper)
+        # model-approved grants (elements + kernel TTL owned by tethysd)
         ip  daddr . meta l4proto . tcp dport @grants_v4 accept
         ip  daddr . meta l4proto . udp dport @grants_v4 accept
         ip6 daddr . meta l4proto . tcp dport @grants_v6 accept
@@ -111,6 +111,6 @@ table inet gatekeeper {
 
         # The emergency stop removes grants, never anything in this chain:
         # the baseline is the safe-by-default state and needs no off-switch.
-        counter name gk_drops limit rate 20/second log prefix "GK-DROP: " drop
+        counter name tethys_drops limit rate 20/second log prefix "TETHYS-DROP: " drop
     }
 }

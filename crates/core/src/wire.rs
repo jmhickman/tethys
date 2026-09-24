@@ -1,6 +1,6 @@
 //! The shared ledger-row vocabulary. Lives here (not in the daemon) because
 //! the wire contract is exactly these shapes: `list.grants`, `list.pending`
-//! and `list.history` serialize them verbatim, and gk-tui deserializes them
+//! and `list.history` serialize them verbatim, and tethys deserializes them
 //! back — one struct definition, no string-indexed JSON on either side.
 
 use serde::{Deserialize, Serialize};

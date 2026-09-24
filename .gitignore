@@ -2,3 +2,6 @@ target/
 *.db
 *.db-wal
 *.db-shm
+dist/
+REPORT.md
+.rust-review-results/

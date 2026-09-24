@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/core", "crates/gatekeeper", "crates/gk-mcp", "crates/gk-tui"]
+members = ["crates/core", "crates/tethysd", "crates/tethys-mcp", "crates/tethys"]
 
 [workspace.package]
 version = "0.1.0"
@@ -12,7 +12,7 @@ license = "Apache-2.0"
 rust-version = "1.87"
 
 [workspace.dependencies]
-gk-core = { path = "crates/core" }
+tethys-core = { path = "crates/core" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "time", "sync", "io-util", "io-std", "process"] }

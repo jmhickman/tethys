@@ -7,12 +7,12 @@ use std::sync::Arc;
 use tokio::io::{AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 
-use gk_core::nft::{Batch, GrantElem};
-use gk_core::protocol::{
+use tethys_core::nft::{Batch, GrantElem};
+use tethys_core::protocol::{
     admin, method, EvDecided, EvStopped, RpcRequest, RpcResponse, SubscribeAck,
 };
-use gk_core::types::PortSpec;
-use gk_core::wire::{GrantState, PendingRowWire};
+use tethys_core::types::PortSpec;
+use tethys_core::wire::{GrantState, PendingRowWire};
 
 use crate::install::{rebuild_acct, row_elems, sweep_grant_objs};
 use crate::ledger::{now_secs, Decide};
@@ -135,8 +135,9 @@ async fn admin_cmd(req: &RpcRequest, st: &Arc<State>) -> Result<RpcResponse, Rpc
         }
         method::LIST_ALLOW => {
             let out: Vec<serde_json::Value> = st
-                .cfg
                 .allow
+                .read()
+                .await
                 .iter()
                 .map(|(t, p, proto)| {
                     serde_json::json!({
@@ -181,6 +182,7 @@ async fn admin_cmd(req: &RpcRequest, st: &Arc<State>) -> Result<RpcResponse, Rpc
             let rows = st.ledger.history(h.state, limit).await;
             Ok(RpcResponse::ok(&req.id, rows))
         }
+        method::RELOAD_ALLOW => reload_allow(req, st).await,
         method::STOP_GRANTS => Ok(stop_grants(req, st).await),
         method::SUBSCRIBE => Ok(RpcResponse::ok(
             &req.id,
@@ -293,6 +295,62 @@ async fn stop_grants(req: &RpcRequest, st: &Arc<State>) -> RpcResponse {
     }
     emit(st, method::EV_STOPPED, EvStopped { grants_removed: n });
     RpcResponse::ok(&req.id, serde_json::json!({"revoked": n}))
+}
+
+/// `reload.allow`: re-read the config file's allow list and reinstall the
+/// carve sets, so operators can adjust to drift mid-engagement without a
+/// daemon restart (which would drop nothing but costs a blip + journal noise).
+/// Refused when the daemon started with --allow flags: those replace the file
+/// entirely, and silently switching authority between file and flags is worse
+/// than asking for a restart.
+async fn reload_allow(req: &RpcRequest, st: &Arc<State>) -> Result<RpcResponse, RpcResponse> {
+    if st.cfg.allow_from_cli {
+        return Err(RpcResponse::err(
+            &req.id,
+            -32001,
+            "allow list came from CLI flags; restart to change it",
+        ));
+    }
+    // Re-read + re-parse the whole file (not just `allow`): if the operator
+    // broke something else in it, we refuse rather than reload a list parsed
+    // from a file that would no longer boot. Unknown keys still rejected.
+    let text = std::fs::read_to_string(&st.cfg.config_path).map_err(|e| {
+        RpcResponse::err(
+            &req.id,
+            -32001,
+            format!("read {}: {e}", st.cfg.config_path.display()),
+        )
+    })?;
+    let file: crate::config::FileConfig = toml::from_str(&text).map_err(|e| {
+        RpcResponse::err(
+            &req.id,
+            -32001,
+            format!("parse {}: {e}", st.cfg.config_path.display()),
+        )
+    })?;
+    let mut fresh = Vec::with_capacity(file.allow.len());
+    for entry in &file.allow {
+        match crate::config::parse_allow(entry) {
+            Ok(v) => fresh.extend(v),
+            Err(e) => {
+                return Err(RpcResponse::err(
+                    &req.id,
+                    -32001,
+                    format!("config `allow`: {e}"),
+                ))
+            }
+        }
+    }
+    // Swap first, then install: install_carves snapshots st.allow, so a
+    // failure after the swap leaves kernel+state consistent with each other
+    // (both new); failure before it is unreachable since parse already passed.
+    *st.allow.write().await = fresh;
+    crate::install::install_carves(st)
+        .await
+        .map_err(|e| RpcResponse::err(&req.id, -32001, format!("carve reinstall failed: {e}")))?;
+    let n = st.allow.read().await.len();
+    tracing::info!(entries = n, "reload.allow: operator allow list reinstalled");
+    Ok(RpcResponse::ok(&req.id, serde_json::json!({"reloaded": n})))
 }
 
 async fn revoke(st: &Arc<State>, gid: i64) {

@@ -1,4 +1,4 @@
-//! gk-tui: the human approver's control plane. ratatui frontend over the
+//! tethys: the human approver's control plane. ratatui frontend over the
 //! admin socket; all daemon interaction via conn.rs, all state in app.rs.
 
 mod app;
@@ -20,9 +20,9 @@ use tokio::sync::mpsc;
 use app::{App, Modal, COLS};
 
 #[derive(Parser)]
-#[command(name = "gk-tui", about = "gatekeeper approver TUI")]
+#[command(name = "tethys", version, about = "tethysd approver TUI")]
 struct Args {
-    #[arg(long, default_value = "/run/gatekeeper/admin.sock")]
+    #[arg(long, default_value = "/run/tethys/admin.sock")]
     socket: PathBuf,
 }
 
@@ -152,6 +152,12 @@ fn handle_key(app: &mut App, k: event::KeyEvent, out: &mut Vec<conn::Cmd>) -> bo
             key_stop(app, k, out);
             false
         }
+        Modal::Net => {
+            if matches!(k.code, KeyCode::Esc) {
+                app.modal = Modal::None;
+            }
+            false
+        }
         Modal::ConnLost => {
             if matches!(k.code, KeyCode::Esc) {
                 app.modal = Modal::None; // view stale table meanwhile
@@ -175,6 +181,18 @@ fn key_table(app: &mut App, k: event::KeyEvent, out: &mut Vec<conn::Cmd>) -> boo
         }
         KeyCode::Char('e') => app.revoke_focused(out),
         KeyCode::Char('d') => app.open_history(out),
+        // reload the config file's allow list (drift control without restart)
+        KeyCode::Char('R') => {
+            out.push(conn::cmd(
+                "a-reload",
+                tethys_core::protocol::method::RELOAD_ALLOW,
+                None,
+            ));
+        }
+        KeyCode::Char('n') => {
+            app.net = crate::ui::collect_ifaces(); // snapshot on open
+            app.modal = Modal::Net;
+        }
         KeyCode::Char('!') => {
             app.stop_typed.clear();
             app.modal = Modal::ConfirmStop;
@@ -278,7 +296,7 @@ fn key_detail(app: &mut App, k: event::KeyEvent, out: &mut Vec<conn::Cmd>) -> bo
             if let Modal::Detail(id) = app.modal {
                 out.push(conn::cmd(
                     "a-revoke",
-                    gk_core::protocol::method::REVOKE,
+                    tethys_core::protocol::method::REVOKE,
                     Some(serde_json::json!({"grant_id": id.to_string()})),
                 ));
                 app.modal = Modal::None;
@@ -299,7 +317,7 @@ fn key_history(app: &mut App, k: event::KeyEvent, out: &mut Vec<conn::Cmd>) {
         KeyCode::Char('r') => {
             out.push(conn::cmd(
                 "c-hist",
-                gk_core::protocol::method::LIST_HISTORY,
+                tethys_core::protocol::method::LIST_HISTORY,
                 Some(serde_json::json!({"limit": 100})),
             ));
         }

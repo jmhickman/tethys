@@ -1,65 +1,66 @@
-# /etc/gatekeeper/config.toml — gatekeeper daemon configuration.
+# /etc/tethys/config.toml — tethysd daemon configuration.
 # Unknown keys are rejected at startup. CLI flags override these values.
 
 # Sockets
-mcp_socket   = "/run/gatekeeper/mcp.sock"   # gk-mcp connects here
-admin_socket = "/run/gatekeeper/admin.sock" # approver clients (TUI); the
+mcp_socket   = "/run/tethys/mcp.sock"   # tethys-mcp connects here
+admin_socket = "/run/tethys/admin.sock" # approver clients (TUI); the
                                              # socket is 0600, so only the
-                                             # account running gatekeeper can
+                                             # account running tethysd can
                                              # connect by default
 
 # Persistence
-db = "/var/lib/gatekeeper/ledger.db"        # SQLite ledger (WAL mode)
+db = "/var/lib/tethys/ledger.db"        # SQLite ledger (WAL mode)
 
 # nftables table the daemon owns. One deployment = one table; only change it
 # to run a second, independent instance (e.g. tests) on the same kernel.
-nft_table = "gatekeeper"
+nft_table = "tethys"
 
 # Policy
 max_ttl = "4h"              # ceiling on any grant, even human-approved
 approver_timeout_secs = 300 # a pending request is auto-denied after this much
                             # time without an approver decision
 
-# Identities — these are usernames; the daemon resolves them to uids at startup.
-agent_user = "hermes-agent" # THE POLICED UID: the baseline's egress drop
-                            # applies only to traffic from this uid (scope
-                            # chain); every other uid on the host
+# Identities — usernames; the daemon resolves them to uids at startup.
+agent_user = "hermes-agent" # THE POLICED ACCOUNT: the baseline's egress drop
+                            # applies only to traffic from this user (scope
+                            # chain); every other account on the host
                             # egresses freely (counted by nft counter
-                            # gk_exempt). Unresolvable user => fail-safe:
-                            # enforcement covers ALL uids (host-wide).
-admin_user = "root"           # uid enforced on admin.sock via SO_PEERCRED, on
-                            # top of the 0600 socket mode (bind is umask-
-                            # guarded so the mode never lags visibility). The
-                            # daemon's own euid is always admitted (dev runs).
-mcp_user   = "gk-mcp-service" # uid accepted on mcp.sock (SO_PEERCRED) and the
-                            # group that owns it. In the standard stdio
-                            # topology the agent harness spawns gk-mcp itself,
-                            # so set this to the HARNESS USER (see
-                            # deploy/README.md). This is plumbing, not a
-                            # security boundary: approval authority is
-                            # admin.sock's 0600. A missing user stops startup
-                            # (a deploy error), unless dev-only
-                            # --allow-missing-users is set.
+                            # tethys_exempt). The same account is what mcp.sock
+                            # accepts peers as (SO_PEERCRED) and what owns
+                            # that socket's group — the harness spawns
+                            # tethys-mcp itself, so the connecting process
+                            # shares this uid by construction. Unresolvable
+                            # user => fail-safe: enforcement covers ALL
+                            # users (host-wide), and the mcp.sock peer pin
+                            # is inactive until the account exists.
+admin_user = "root"         # allowed on admin.sock (SO_PEERCRED checks the
+                            # resolved uid, on top of the 0600 socket mode;
+                            # bind is umask-guarded so the mode never lags
+                            # visibility). The daemon's own euid is always
+                            # admitted (dev runs).
 
 # Operator allow list — egress that is ALWAYS allowed, installed into the
 # baseline's carve sets at startup (kernel state == this list after every
-# restart; removed entries go away). Gatekeeper has no built-in notion of
+# restart; removed entries go away). Tethys has no built-in notion of
 # "cloud provider": what is always-allowed is entirely the deployment's call.
 # Grammar: target[:port[-port]][/(tcp|udp)]; port omitted => all ports,
-# proto omitted => tcp. Targets are host, IP, or CIDR; hostnames are resolved
-# at startup (unresolvable entry = boot failure). CLI --allow (repeatable)
-# replaces this list entirely. Inspect the live list with `list.allow`.
+# proto omitted => tcp. Ports may also be a comma list (e.g. host:80,443 or
+# host:80,443,8000-8100); each element installs as its own rule. Targets are
+# host, IP, or CIDR; hostnames are resolved at startup and re-resolved on
+# daemon restart (unresolvable entry = daemon fails to start). CLI --allow
+# (repeatable) replaces this list entirely. Inspect the live list with
+# `list.allow`.
 #
-# Examples — an LLM-harness deployment might declare its own backends:
-#   allow = [
-#     "192.168.10.165:1234",              # LAN LM Studio instance
+# Uncomment what applies — an LLM-harness deployment might declare its own
+# backends:
+allow = [
+#     "192.168.1.5:1234",                 # local OpenAI-compatible server
 #     "api.anthropic.com:443",            # Anthropic API
 #     "api.openai.com:443",               # OpenAI API
 #     "api.x.ai:443",                     # xAI API
 #     "openrouter.ai:443",                # OpenRouter
 #     "151.101.0.0/16:80-443",            # some CDN CIDR, port range
 #     "time.example.net:123/udp",         # explicit udp
-#   ]
-allow = []
+]
 
 dry_run = false             # true: sockets and ledger only; nftables untouched

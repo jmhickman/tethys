@@ -4,11 +4,11 @@ use std::collections::BTreeMap;
 
 use serde_json::Value;
 
-use gk_core::protocol::{
+use tethys_core::protocol::{
     method, EvDecided, EvError, EvExpired, EvRequestNew, EvStopped, EvTraffic, SubscribeAck,
 };
-use gk_core::types::PortSpec;
-use gk_core::wire::{GrantRow, PendingRowWire};
+use tethys_core::types::PortSpec;
+use tethys_core::wire::{GrantRow, PendingRowWire};
 
 use crate::conn::{cmd, Cmd};
 
@@ -88,14 +88,24 @@ pub enum Modal {
     Detail(i64),
     /// decided history (lazy-loaded)
     History,
+    /// host network interfaces (snapshot taken when opened)
+    Net,
     /// stop-all: must type the word "stop"
     ConfirmStop,
     /// socket lost; retrying in background
     ConnLost,
 }
 
+/// One row of the network modal: interface + its addresses.
+pub struct NetIface {
+    pub name: String,
+    pub addrs: Vec<String>, // "ip/prefix" per address
+    pub default: bool,      // carries the default route
+}
+
 pub struct App {
     pub live: BTreeMap<i64, LiveRow>,
+    pub net: Vec<NetIface>,
     pub pending: BTreeMap<i64, PendingRow>,
     pub history: Vec<GrantRow>,
     pub history_err: Option<String>,
@@ -121,6 +131,7 @@ impl App {
     pub fn new() -> Self {
         Self {
             live: BTreeMap::new(),
+            net: Vec::new(),
             pending: BTreeMap::new(),
             history: Vec::new(),
             history_err: None,
@@ -226,7 +237,7 @@ impl App {
                         ttl_requested: ev.ttl_requested,
                         created_at: ev.created_at,
                     });
-                    if matches!(self.modal, Modal::None | Modal::Detail(_)) {
+                    if matches!(self.modal, Modal::None | Modal::Detail(_) | Modal::History) {
                         self.modal = Modal::Pending(0);
                         self.deny_note = None;
                         self.ttl_edit = None;
@@ -391,6 +402,16 @@ impl App {
                     self.history_err = Some(err_msg(v));
                 }
             },
+            "a-reload" => match v.get("error") {
+                Some(e) => self.set_flash(format!(
+                    "reload failed: {}",
+                    e["message"].as_str().unwrap_or("?")
+                )),
+                None => {
+                    let n = v["result"]["reloaded"].as_u64().unwrap_or(0);
+                    self.set_flash(format!("allow list reloaded ({n} entries)"));
+                }
+            },
             "a-approve" | "a-deny" | "a-revoke" | "a-stop" => {
                 if let Some(e) = v.get("error") {
                     self.set_flash(format!("daemon: {}", e["message"].as_str().unwrap_or("?")));
@@ -486,7 +507,7 @@ pub fn port_text(from: u16, to: u16) -> String {
     }
 }
 
-fn fmt_ports(spec: &PortSpec, proto: gk_core::types::Proto) -> String {
+fn fmt_ports(spec: &PortSpec, proto: tethys_core::types::Proto) -> String {
     if spec.from == 0 && spec.to == 0 {
         format!("* /{proto}")
     } else {
@@ -494,9 +515,9 @@ fn fmt_ports(spec: &PortSpec, proto: gk_core::types::Proto) -> String {
     }
 }
 
-// one canonical spelling, owned by gk-core (the daemon renders ttl text from
+// one canonical spelling, owned by tethys-core (the daemon renders ttl text from
 // the same function — no drift between what is approved and what is shown)
-pub use gk_core::types::fmt_ttl_secs;
+pub use tethys_core::types::fmt_ttl_secs;
 
 pub fn fmt_countdown(s: Option<u64>) -> String {
     match s {

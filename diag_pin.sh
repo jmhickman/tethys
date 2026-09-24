@@ -1,24 +1,23 @@
 #!/usr/bin/env bash
 set -u
-cd /root/gatekeeper
-pgrep -x gatekeeper | xargs -r kill; sleep 0.3
-rm -rf /tmp/gk-pin && mkdir -p /tmp/gk-pin && chmod 755 /tmp/gk-pin
-cat > /tmp/gk-pin/config.toml <<'CFG'
-mcp_socket   = "/tmp/gk-pin/mcp.sock"
-admin_socket = "/tmp/gk-pin/admin.sock"
-db = "/tmp/gk-pin/ledger.db"
+cd "$(dirname "$0")"
+pgrep -x tethysd | xargs -r kill; sleep 0.3
+rm -rf /tmp/tethys-pin && mkdir -p /tmp/tethys-pin && chmod 755 /tmp/tethys-pin
+cat > /tmp/tethys-pin/config.toml <<'CFG'
+mcp_socket   = "/tmp/tethys-pin/mcp.sock"
+admin_socket = "/tmp/tethys-pin/admin.sock"
+db = "/tmp/tethys-pin/ledger.db"
 agent_user = "hermes-agent"
-mcp_user   = "gk-mcp-service"
 CFG
-./target/debug/gatekeeper --config /tmp/gk-pin/config.toml > /tmp/gk-pin/gk.log 2>&1 &
-GK=$!
+./target/debug/tethysd --config /tmp/tethys-pin/config.toml > /tmp/tethys-pin/tethysd.log 2>&1 &
+DAEMON=$!
 sleep 0.8
-ls -l /tmp/gk-pin/*.sock | awk '{print $1, $3, $4, $NF}'
-runuser -u gk-mcp-service -- python3 -c "
+ls -l /tmp/tethys-pin/*.sock | awk '{print $1, $3, $4, $NF}'
+runuser -u hermes-agent -- python3 -c "
 import socket
 try:
-    s=socket.socket(socket.AF_UNIX); s.connect('/tmp/gk-pin/mcp.sock'); print('gk-mcp-service CONNECT OK')
-except Exception as e: print('gk-mcp-service CONNECT FAIL:', type(e).__name__, e)
+    s=socket.socket(socket.AF_UNIX); s.connect('/tmp/tethys-pin/mcp.sock'); print('hermes-agent CONNECT OK')
+except Exception as e: print('hermes-agent CONNECT FAIL:', type(e).__name__, e)
 "
-kill $GK 2>/dev/null
-tail -3 /tmp/gk-pin/gk.log
+kill $DAEMON 2>/dev/null
+tail -3 /tmp/tethys-pin/tethysd.log

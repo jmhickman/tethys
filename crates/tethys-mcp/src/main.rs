@@ -1,6 +1,6 @@
-//! gk-mcp: model-facing MCP server (stdio transport). Exactly ONE tool.
+//! tethys-mcp: model-facing MCP server (stdio transport). Exactly ONE tool.
 //! It is a thin, stateless proxy: schema-validate → forward access.request to
-//! the gatekeeper over the unix socket → return the verdict string. It holds
+//! the tethysd over the unix socket → return the verdict string. It holds
 //! no approval power and no netfilter access.
 
 use std::path::PathBuf;
@@ -16,13 +16,13 @@ use rmcp::{
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 
-use gk_core::protocol::{method, AccessRequestParams, JsonRpcVersion, RpcRequest};
+use tethys_core::protocol::{method, AccessRequestParams, JsonRpcVersion, RpcRequest};
 
 #[derive(Parser, Debug)]
-#[command(name = "gk-mcp")]
+#[command(name = "tethys-mcp", version)]
 struct Args {
-    #[arg(long, default_value = "/run/gatekeeper/mcp.sock")]
-    gatekeeper_socket: PathBuf,
+    #[arg(long, default_value = "/run/tethys/mcp.sock")]
+    daemon_socket: PathBuf,
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
@@ -98,14 +98,14 @@ impl ScopeMcp {
         let resp = self.ask(&rpc).await?;
         tracing::debug!(%resp, "verdict received");
         let v: serde_json::Value = serde_json::from_str(&resp).map_err(|e| {
-            ErrorData::internal_error(format!("gatekeeper reply unparseable: {e}"), None)
+            ErrorData::internal_error(format!("tethysd reply unparseable: {e}"), None)
         })?;
 
         if let Some(err) = v.get("error") {
             return Err(ErrorData::internal_error(
                 err.get("message")
                     .and_then(|m| m.as_str())
-                    .unwrap_or("gatekeeper error")
+                    .unwrap_or("tethysd error")
                     .to_string(),
                 None,
             ));
@@ -117,10 +117,10 @@ impl ScopeMcp {
 
 impl ScopeMcp {
     async fn ask(&self, rpc: &RpcRequest) -> Result<String, ErrorData> {
-        tracing::debug!(id = %rpc.id, "connecting gatekeeper");
+        tracing::debug!(id = %rpc.id, "connecting tethysd");
         let mut stream = UnixStream::connect(&self.sock)
             .await
-            .map_err(|e| ErrorData::internal_error(format!("gatekeeper unavailable: {e}"), None))?;
+            .map_err(|e| ErrorData::internal_error(format!("tethysd unavailable: {e}"), None))?;
         let payload = serde_json::to_string(rpc)
             .map(|s| format!("{s}\n"))
             .map_err(|e| ErrorData::internal_error(format!("serialize request: {e}"), None))?;
@@ -131,18 +131,15 @@ impl ScopeMcp {
         let mut line = String::new();
         let mut reader = BufReader::new(&mut stream);
         let n = tokio::time::timeout(
-            std::time::Duration::from_secs(6 * 60), // gatekeeper denies at its own timeout first
+            std::time::Duration::from_secs(6 * 60), // tethysd denies at its own timeout first
             reader.read_line(&mut line),
         )
         .await
-        .map_err(|_| ErrorData::internal_error("gatekeeper response timed out", None))?
+        .map_err(|_| ErrorData::internal_error("tethysd response timed out", None))?
         .map_err(|e| ErrorData::internal_error(format!("read: {e}"), None))?;
         tracing::debug!(id = %rpc.id, bytes = n, "read reply line");
         if n == 0 {
-            return Err(ErrorData::internal_error(
-                "gatekeeper closed connection",
-                None,
-            ));
+            return Err(ErrorData::internal_error("tethysd closed connection", None));
         }
         Ok(line)
     }
@@ -150,11 +147,11 @@ impl ScopeMcp {
 
 /// One-liner, e.g. "APPROVED: 203.0.113.7 tcp 443 granted for 15m (expires …)".
 fn render_verdict(r: &serde_json::Value) -> String {
-    let v: gk_core::protocol::Verdict = match serde_json::from_value(r.clone()) {
+    let v: tethys_core::protocol::Verdict = match serde_json::from_value(r.clone()) {
         Ok(v) => v,
-        Err(e) => return format!("DENIED (malformed_verdict): gatekeeper reply unparseable: {e}"),
+        Err(e) => return format!("DENIED (malformed_verdict): tethysd reply unparseable: {e}"),
     };
-    use gk_core::protocol::Verdict as V;
+    use tethys_core::protocol::Verdict as V;
     match v {
         V::Approved {
             effective,
@@ -232,7 +229,7 @@ async fn main() -> anyhow::Result<()> {
         )
         .init();
     let args = Args::parse();
-    let server = ScopeMcp::new(args.gatekeeper_socket);
+    let server = ScopeMcp::new(args.daemon_socket);
     let service = server.serve(rmcp::transport::stdio()).await?;
     service.waiting().await?;
     Ok(())

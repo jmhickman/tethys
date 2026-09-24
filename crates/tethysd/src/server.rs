@@ -1,4 +1,4 @@
-//! Gatekeeper runtime core: shared state, startup, accept loops, background
+//! tethysd runtime core: shared state, startup, accept loops, background
 //! reconcilers, and the MCP-side `access.request` pipeline.
 //!
 //! `mcp.sock` accepts requests but cannot approve; approvals arrive on
@@ -6,7 +6,7 @@
 //! immediately; silent past timeout → auto-deny.
 //!
 //! Kernel install/teardown lives in [`crate::install`], boot reconciliation
-//! in [`crate::reconcile`] — the same split gk-tui got in the last round.
+//! in [`crate::reconcile`] — the same split tethys got in the last round.
 
 use std::collections::HashMap;
 use std::os::unix::fs::PermissionsExt;
@@ -17,12 +17,12 @@ use std::time::Duration;
 use tokio::io::AsyncBufRead;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
-use tokio::sync::{broadcast, oneshot, Mutex, Semaphore};
+use tokio::sync::{broadcast, oneshot, Mutex, RwLock, Semaphore};
 
-use gk_core::nft::{counter_in, counter_out, Batch, NftCli};
-use gk_core::protocol::*;
-use gk_core::types::{fmt_ttl, parse_ttl, PortSpec, SpecError, Target};
 use serde::Serialize;
+use tethys_core::nft::{counter_in, counter_out, Batch, NftCli};
+use tethys_core::protocol::*;
+use tethys_core::types::{fmt_ttl, parse_ttl, PortSpec, SpecError, Target};
 
 use crate::admin::handle_admin;
 use crate::install::{
@@ -36,6 +36,16 @@ use crate::Config;
 
 pub struct State {
     pub cfg: Config,
+    /// Operator allow list in force. Seeded from cfg at boot; `reload.allow`
+    /// swaps it after re-reading the config file. RwLock rather than a cfg
+    /// rebuild because install_carves holds it only while building the batch.
+    pub allow: RwLock<
+        Vec<(
+            tethys_core::types::Target,
+            tethys_core::types::PortSpec,
+            tethys_core::types::Proto,
+        )>,
+    >,
     pub ledger: Ledger,
     pub nft: NftCli,
     /// pending requests awaiting a human: id -> decision channel
@@ -83,6 +93,7 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
     let (ledger, _actor) = Ledger::open(&cfg.db)?;
     let st = Arc::new(State {
         cfg: cfg.clone(),
+        allow: RwLock::new(cfg.allow.clone()),
         ledger,
         nft: NftCli::default(),
         pending: Mutex::new(HashMap::new()),
@@ -140,7 +151,7 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
         0o600,
         "admin.sock must be born 0600 (umask-guarded bind)"
     );
-    // mcp.sock: reachable only by mcp_user's group (identity is still checked
+    // mcp.sock: reachable only by agent_user's group (identity is still checked
     // per connection via SO_PEERCRED); with no resolved gid the socket stays
     // owner-only, which in dev means whoever started the daemon.
     if let Some(gid) = st.cfg.mcp_sock_gid {
@@ -172,7 +183,7 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
     tracing::info!(
         mcp = %st.cfg.mcp_socket.display(),
         admin = %st.cfg.admin_socket.display(),
-        "gatekeeper listening"
+        "tethysd listening"
     );
     loop {
         match mcp.accept().await {
@@ -242,7 +253,7 @@ fn spawn_stats_poller(st: Arc<State>) {
                     continue;
                 }
             };
-            let poll = gk_core::nft::parse_poll(
+            let poll = tethys_core::nft::parse_poll(
                 &serde_json::json!({ "nftables": [] }),
                 &counters_json,
                 &st.cfg.nft_table,
@@ -862,7 +873,7 @@ fn rpc_err_str(id: &str, code: i32, msg: impl Into<String>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use gk_core::types::Proto;
+    use tethys_core::types::Proto;
 
     #[test]
     fn unix_ts_to_rfc3339_known_values() {

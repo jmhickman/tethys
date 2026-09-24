@@ -1,6 +1,6 @@
 //! Admin-socket client: owns the unix connection, auto-subscribes and
 //! re-snapshots on (re)connect, never blocks the UI, reconnects forever.
-//! Wire contract is gk-core::protocol over NDJSON JSON-RPC.
+//! Wire contract is tethys-core::protocol over NDJSON JSON-RPC.
 
 use std::path::PathBuf;
 
@@ -9,7 +9,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 use tokio::sync::{mpsc, watch};
 
-use gk_core::protocol::{method, JsonRpcVersion, RpcRequest};
+use tethys_core::protocol::{method, JsonRpcVersion, RpcRequest};
 
 /// A request the app wants written to the daemon. Ids starting `c-` are
 /// client-internal (resync round-trips); everything else is passed through

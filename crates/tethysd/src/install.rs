@@ -6,9 +6,9 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 
-use gk_core::nft::{Batch, Dir, ElemDst, GrantElem, CHAIN_ACCT_IN, CHAIN_ACCT_OUT};
-use gk_core::protocol::EffectiveGrant;
-use gk_core::types::{PortSpec, Proto, Target};
+use tethys_core::nft::{Batch, Dir, ElemDst, GrantElem, CHAIN_ACCT_IN, CHAIN_ACCT_OUT};
+use tethys_core::protocol::EffectiveGrant;
+use tethys_core::types::{PortSpec, Proto, Target};
 
 use crate::ledger::{GrantRow, GrantState};
 use crate::server::State;
@@ -113,7 +113,10 @@ pub(crate) async fn install_carves(st: &Arc<State>) -> anyhow::Result<()> {
     let mut n = 0usize;
     // add-of-existing-element aborts an nft batch: dedupe resolved tuples
     let mut seen: HashSet<(String, u8, u16, u16)> = Default::default();
-    for (target, port, proto) in &st.cfg.allow {
+    // snapshot the in-force list: a concurrent reload must not mutate the
+    // vec mid-loop (leaves kernel state matching one coherent snapshot)
+    let allow = st.allow.read().await.clone();
+    for (target, port, proto) in &allow {
         let dsts = target_elems(target)
             .await
             .map_err(|e| anyhow::anyhow!("allow {}: {e}", target.canonical()))?;
@@ -149,7 +152,7 @@ pub(crate) async fn install_carves(st: &Arc<State>) -> anyhow::Result<()> {
             .map_err(|e| anyhow::anyhow!("carve install failed: {e}"))?;
     }
     tracing::info!(
-        entries = st.cfg.allow.len(),
+        entries = allow.len(),
         elements = n,
         "operator allow list installed"
     );
@@ -248,7 +251,7 @@ pub(crate) async fn rebuild_acct(st: &Arc<State>) -> Result<(), String> {
 /// Run after rebuild_acct so objects are unreferenced. One batch per object
 /// (deletes are not idempotent).
 pub(crate) async fn sweep_grant_objs(st: &Arc<State>, gid: i64) {
-    use gk_core::nft::acct_set;
+    use tethys_core::nft::acct_set;
     if st.cfg.dry_run {
         return;
     }

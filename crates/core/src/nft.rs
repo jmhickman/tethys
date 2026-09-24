@@ -15,7 +15,7 @@ use tokio::process::Command;
 
 use crate::types::{PortSpec, Proto};
 
-pub const TABLE: &str = "gatekeeper";
+pub const TABLE: &str = "tethys";
 pub const SET_V4: &str = "grants_v4";
 pub const SET_V6: &str = "grants_v6";
 /// Operator allow-list tuples (`allow` in config). Flush+reinstall from
@@ -33,21 +33,21 @@ pub const CHAIN_ACCT_IN: &str = "acct_in";
 /// (caller drop continues); everyone else `accept`s.
 pub const CHAIN_SCOPE: &str = "scope";
 /// Counter for unpoliced (exempt) egress.
-pub const COUNTER_EXEMPT: &str = "gk_exempt";
+pub const COUNTER_EXEMPT: &str = "tethys_exempt";
 /// Long default so per-element `expires` is the only thing that reaps grants.
 const SET_DEFAULT_TIMEOUT_SECS: u64 = 24 * 3600;
 
 /// Per-grant accounting object names. These outlive the grant's set element:
 /// counters are swept only when the ledger row leaves the approved state.
 pub fn counter_out(gid: i64) -> String {
-    format!("gk_g{gid}_out")
+    format!("tethys_g{gid}_out")
 }
 pub fn counter_in(gid: i64) -> String {
-    format!("gk_g{gid}_in")
+    format!("tethys_g{gid}_in")
 }
-/// Per-grant match set for one direction+family: gk_m7_out_v4 etc.
+/// Per-grant match set for one direction+family: tethys_m7_out_v4 etc.
 pub fn acct_set(gid: i64, dir: Dir, v6: bool) -> String {
-    format!("gk_m{gid}_{}{}", dir.slug(), if v6 { "_v6" } else { "" })
+    format!("tethys_m{gid}_{}{}", dir.slug(), if v6 { "_v6" } else { "" })
 }
 
 #[derive(Debug, Error)]
@@ -160,7 +160,7 @@ impl GrantElem {
 }
 
 /// JSON command array for `nft --json -f -`. `table` is per deployment
-/// (`nft_table`, default "gatekeeper"); tests use a private table.
+/// (`nft_table`, default "tethys"); tests use a private table.
 #[derive(Clone, Debug)]
 pub struct Batch {
     pub table: String,
@@ -257,13 +257,13 @@ impl Batch {
         }}}));
     }
 
-    /// Add a grant element with kernel TTL and `gk:g<gid>` comment.
+    /// Add a grant element with kernel TTL and `tethys:g<gid>` comment.
     /// Comment persists in the live dump; concat deletes still match.
     pub fn add_grant(&mut self, e: &GrantElem, ttl: Duration, gid: i64) {
         self.cmds.push(json!({"add":{"element":{
             "family":"inet","table":&self.table,"name":e.set_name(),
             "elem":[{"elem":{"val": e.concat(), "expires": ttl.as_secs(),
-                              "comment": format!("gk:g{gid}")}}]
+                              "comment": format!("tethys:g{gid}")}}]
         }}}));
     }
 
@@ -381,7 +381,7 @@ impl Batch {
         let counter = dir.counter(gid);
         self.cmds.push(json!({"add":{"rule":{
             "family":"inet","table":&self.table,"chain":chain,
-            "comment":format!("gk:g{gid}:{}", dir.slug()),
+            "comment":format!("tethys:g{gid}:{}", dir.slug()),
             "expr":[
                 {"match":{"op":"==","left":{"concat":[
                     {"payload":{"protocol":af,"field":addr_field}},
@@ -417,7 +417,7 @@ pub struct LiveElement {
     pub port_from: u16,
     pub port_to: u16,
     pub expires_secs: f64,
-    /// Attribution from add_grant (`gk:g<gid>`), if present. Not a security check.
+    /// Attribution from add_grant (`tethys:g<gid>`), if present. Not a security check.
     pub comment: Option<String>,
 }
 
@@ -751,7 +751,7 @@ mod tests {
         let e0 = &cmds[0]["add"]["element"]["elem"][0];
         assert_eq!(e0["elem"]["expires"], 600);
         assert_eq!(e0["elem"]["val"]["concat"][0], "203.0.113.7");
-        assert_eq!(e0["elem"]["comment"], "gk:g7");
+        assert_eq!(e0["elem"]["comment"], "tethys:g7");
     }
 
     #[test]
@@ -820,7 +820,7 @@ mod tests {
     /// under a non-default nft_table.
     #[test]
     fn every_command_targets_the_batches_table() {
-        let mut b = Batch::with_table("gk_alt");
+        let mut b = Batch::with_table("tethys_alt");
         b.ensure_base();
         b.rebuild_scope(&[990]);
         let e = GrantElem {
@@ -839,7 +839,7 @@ mod tests {
         b.flush_chain(CHAIN_ACCT_OUT);
         b.add_counter("g7_out");
         b.delete_counter("g7_out");
-        b.delete_set("gk_m7_out");
+        b.delete_set("tethys_m7_out");
 
         fn walk(v: &Value, hits: &mut Vec<(String, Value)>) {
             match v {
@@ -871,7 +871,7 @@ mod tests {
             for (k, v) in &hits {
                 assert_eq!(
                     v,
-                    &serde_json::json!("gk_alt"),
+                    &serde_json::json!("tethys_alt"),
                     "command with {k} hit wrong table: {cmd}"
                 );
             }
@@ -900,13 +900,13 @@ mod tests {
 
         assert_eq!(cmds[0]["flush"]["chain"]["name"], CHAIN_ACCT_OUT);
         // In-direction + v6: rule must match ip6 saddr . l4proto . udp sport,
-        // count into gk_g7_in, and carry NO verdict expr.
+        // count into tethys_g7_in, and carry NO verdict expr.
         let r = &cmds[4]["add"]["rule"];
         assert_eq!(r["chain"], CHAIN_ACCT_IN);
-        assert_eq!(r["comment"], "gk:g7:in");
+        assert_eq!(r["comment"], "tethys:g7:in");
         let exprs = r["expr"].as_array().unwrap();
         assert_eq!(exprs.len(), 2, "match + counter only — never a verdict");
-        assert_eq!(exprs[1]["counter"], "gk_g7_in");
+        assert_eq!(exprs[1]["counter"], "tethys_g7_in");
         let lc = exprs[0]["match"]["left"]["concat"].as_array().unwrap();
         assert_eq!(lc[0]["payload"]["protocol"], "ip6");
         assert_eq!(lc[0]["payload"]["field"], "saddr");
@@ -915,11 +915,11 @@ mod tests {
         assert!(exprs[0]["match"]["right"]
             .as_str()
             .unwrap()
-            .starts_with("@gk_m7_in"));
+            .starts_with("@tethys_m7_in"));
         // out-direction set uses daddr/dport keys (cmds[2]); the in-direction
-        // element (cmds[3]) lands in gk_m7_in with the safe prefix encoding.
+        // element (cmds[3]) lands in tethys_m7_in with the safe prefix encoding.
         let s_out = &cmds[2]["add"]["set"];
-        assert_eq!(s_out["name"], "gk_m7_out");
+        assert_eq!(s_out["name"], "tethys_m7_out");
         assert_eq!(
             s_out["type"]["typeof"]["concat"][0]["payload"]["field"],
             "daddr"
@@ -929,7 +929,7 @@ mod tests {
             "dport"
         );
         let e = &cmds[3]["add"]["element"];
-        assert_eq!(e["name"], "gk_m7_in");
+        assert_eq!(e["name"], "tethys_m7_in");
         assert!(e["elem"][0]["concat"][0].get("prefix").is_some());
     }
 
@@ -949,7 +949,7 @@ mod tests {
             {"set":{"name":SET_V4,"family":"inet","table":TABLE,
                 "elem":[{"elem":{"val":{"concat":["1.2.3.4","tcp",53]},"expires":41.9}},
                         {"elem":{"val":{"concat":[{"prefix":{"addr":"10.0.0.0","len":8}},"udp",
-                            {"range":[8000,8100]}]},"expires":12.0,"comment":"gk:g7"}}]}}
+                            {"range":[8000,8100]}]},"expires":12.0,"comment":"tethys:g7"}}]}}
         ]});
         let counters = json!({"nftables":[
             {"counter":{"name":"g7_out","table":TABLE,"packets":3,"bytes":120}},
@@ -964,7 +964,7 @@ mod tests {
             (8000, 8100)
         );
         assert_eq!(st.elements[0].comment, None);
-        assert_eq!(st.elements[1].comment.as_deref(), Some("gk:g7"));
+        assert_eq!(st.elements[1].comment.as_deref(), Some("tethys:g7"));
         assert_eq!(st.counters.get("g7_out"), Some(&(3u64, 120u64)));
         assert!(!st.counters.contains_key("other"));
     }

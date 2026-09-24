@@ -35,6 +35,7 @@ pub fn draw(f: &mut Frame, app: &App, st: ConnStatus) {
         Modal::Pending(i) => draw_pending_modal(f, app, *i),
         Modal::Detail(id) => draw_detail_modal(f, app, *id),
         Modal::History => draw_history_modal(f, app),
+        Modal::Net => draw_net_modal(f, app),
         Modal::ConfirmStop => draw_stop_modal(f, app),
         Modal::ConnLost => draw_conn_modal(f, st),
         Modal::None => {}
@@ -58,10 +59,10 @@ fn draw_header(f: &mut Frame, app: &App, st: ConnStatus, a: Rect) {
     } else {
         Span::styled(" ●conn", Style::default().fg(Color::Green))
     };
-    let net = primary_network();
+    let net = primary_ip();
     let mut l1_parts = vec![
         Span::styled(
-            format!(" gatekeeper @ {host} ─ {net} ─ "),
+            format!(" tethysd @ {host} ─ {net} ─ "),
             Style::default().add_modifier(Modifier::BOLD),
         ),
         Span::styled(
@@ -195,6 +196,26 @@ struct RowCells {
     vals: [String; 8], // id, tool, dst, ports, proto, ttl, left, traffic
     reason: String,
     warn: Style,
+    /// leading status dot: Some(color) once remaining-TTL is known (None
+    /// until the first traffic poll lands — blank cell, column still aligned)
+    dot: Option<Color>,
+}
+
+/// Remaining-vs-total TTL as a traffic-light dot.
+/// green > 50% · yellow >= 25% · orange < 25%.
+fn ttl_dot(left: Option<u64>, ttl_secs: u64) -> Option<Color> {
+    let left = left?;
+    if ttl_secs == 0 {
+        return None;
+    }
+    let frac = left as f64 / ttl_secs as f64;
+    Some(if frac > 0.5 {
+        Color::Green
+    } else if frac >= 0.25 {
+        Color::Yellow
+    } else {
+        Color::LightRed // "orange": ratatui has no plain orange; LightRed reads as it
+    })
 }
 
 fn cells_for(r: &crate::app::LiveRow) -> RowCells {
@@ -220,6 +241,7 @@ fn cells_for(r: &crate::app::LiveRow) -> RowCells {
         }
     );
     RowCells {
+        dot: ttl_dot(r.left, r.ttl_secs),
         vals: [
             r.id.to_string(),
             r.tool.clone(),
@@ -244,8 +266,9 @@ fn natural_widths(rows: &[RowCells]) -> [u16; 8] {
             w[i] = w[i].max(dw(v) as u16);
         }
     }
+    w[0] += 2; // dot reservation (see mk)
     for i in 0..8 {
-        w[i] = w[i].clamp(dw(HEADERS[i]) as u16, 39);
+        w[i] = w[i].clamp(dw(HEADERS[i]) as u16 + if i == 0 { 2 } else { 0 }, 39);
     }
     w
 }
@@ -320,8 +343,32 @@ fn draw_table(f: &mut Frame, app: &App, st: ConnStatus, a: Rect) {
 
     // ---- emit a padded cell row (fixed cols + optional reason) -----------
     let gap_s = " ".repeat(gap_used(inner, gap, wrap) as usize);
-    let mk = |vals: &mut Vec<Span<'_>>, v: &[String; 8], style: Style| {
+    // col 0 carries the row's status dot; "● " (2 cells) is reserved in its
+    // width so ids stay aligned whether or not a dot is known yet
+    const DOT_W: usize = 2;
+    let mk = |vals: &mut Vec<Span<'_>>, v: &[String; 8], style: Style, dot: Option<Color>| {
         for (i, s) in v.iter().take(kept).enumerate() {
+            if i == 0 {
+                vals.push(Span::styled(
+                    match dot {
+                        Some(_) => "● ".to_string(),
+                        None => "  ".to_string(),
+                    },
+                    match dot {
+                        Some(c) => Style::default().fg(c),
+                        None => style,
+                    },
+                ));
+                vals.push(Span::styled(
+                    format!(
+                        "{}{}",
+                        fit(s, fw[i].saturating_sub(DOT_W as u16) as usize),
+                        gap_s.as_str()
+                    ),
+                    style,
+                ));
+                continue;
+            }
             vals.push(Span::styled(
                 format!("{}{}", fit(s, fw[i] as usize), gap_s.as_str()),
                 style,
@@ -335,6 +382,7 @@ fn draw_table(f: &mut Frame, app: &App, st: ConnStatus, a: Rect) {
         &mut hdr,
         &HEADERS.map(|h| h.to_string()).clone(),
         muted(dim),
+        None,
     );
     if !wrap {
         hdr.push(Span::styled(
@@ -358,8 +406,8 @@ fn draw_table(f: &mut Frame, app: &App, st: ConnStatus, a: Rect) {
         } else {
             base
         };
-        let mut spans: Vec<Span> = Vec::with_capacity(9);
-        mk(&mut spans, &c.vals, Style::default());
+        let mut spans: Vec<Span> = Vec::with_capacity(10);
+        mk(&mut spans, &c.vals, Style::default(), c.dot);
         if !wrap {
             spans.push(Span::raw(truncate(&c.reason, reason_w as usize)));
         }
@@ -398,7 +446,9 @@ fn gap_used(_inner: Rect, gap: u16, wrap: bool) -> u16 {
 
 fn draw_keybar(f: &mut Frame, app: &App, a: Rect) {
     let keys = match &app.modal {
-        Modal::None => "j/k select · Enter detail · e revoke · d history · ! stop all · q quit",
+        Modal::None => {
+            "j/k select · Enter detail · e revoke · d history · n interfaces · R reload allow · ! stop all · q quit"
+        }
         Modal::Pending(_) => {
             if app.deny_note.is_some() {
                 "type deny note · Enter send · Esc deny-empty"
@@ -408,6 +458,7 @@ fn draw_keybar(f: &mut Frame, app: &App, a: Rect) {
         }
         Modal::Detail(_) => "e revoke · Esc back",
         Modal::History => "j/k select · r re-load · Esc back",
+        Modal::Net => "Esc back",
         Modal::ConfirmStop => "type `stop` + Enter to confirm · any other key cancels",
         Modal::ConnLost => "retrying automatically · Esc to view stale state",
     };
@@ -598,7 +649,7 @@ fn draw_history_modal(f: &mut Frame, app: &App) {
         .iter()
         .enumerate()
         .map(|(i, g)| {
-            use gk_core::wire::GrantState;
+            use tethys_core::wire::GrantState;
             let state = g.state.as_str();
             let color = match g.state {
                 GrantState::Denied => Color::Red,
@@ -637,6 +688,56 @@ fn draw_history_modal(f: &mut Frame, app: &App) {
     );
 }
 
+fn draw_net_modal(f: &mut Frame, app: &App) {
+    let area = centered(f.area(), 60, 50);
+    f.render_widget(Clear, area);
+    let items: Vec<ListItem> = app
+        .net
+        .iter()
+        .flat_map(|i| {
+            let mut spans = vec![Span::styled(
+                format!("{:<12}", i.name),
+                Style::default().add_modifier(Modifier::BOLD),
+            )];
+            if i.default {
+                spans.push(Span::styled("(default) ", Style::default().fg(Color::Cyan)));
+            }
+            if i.addrs.is_empty() {
+                spans.push(Span::styled("no addresses", muted(true)));
+            }
+            let mut lines = vec![Line::from(spans)];
+            for (k, a) in i.addrs.iter().enumerate() {
+                // indent addresses under their interface name
+                let pad = if k + 1 == i.addrs.len() {
+                    "  └ "
+                } else {
+                    "  ├ "
+                };
+                lines.push(Line::from(vec![
+                    Span::styled(pad, muted(true)),
+                    Span::raw(a.clone()),
+                ]));
+            }
+            lines
+        })
+        .map(ListItem::new)
+        .collect();
+    let body = if app.net.is_empty() {
+        List::new(vec![ListItem::new("  no non-loopback interfaces found")])
+    } else {
+        List::new(items)
+    };
+    f.render_widget(
+        body.block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(" NETWORK INTERFACES ")
+                .title_bottom(" Esc back "),
+        ),
+        area,
+    );
+}
+
 fn draw_stop_modal(f: &mut Frame, app: &App) {
     let area = centered(f.area(), 50, 30);
     f.render_widget(Clear, area);
@@ -666,10 +767,10 @@ fn draw_conn_modal(f: &mut Frame, st: ConnStatus) {
     let body = vec![
         Line::from(""),
         Line::from(Span::styled(
-            " ⚠ lost connection to the gatekeeper daemon.",
+            " ⚠ lost connection to the tethysd daemon.",
             Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
         )),
-        Line::from(" Check its status (systemctl status gatekeeper)."),
+        Line::from(" Check its status (systemctl status tethysd)."),
         Line::from(Span::styled(
             format!(
                 " retrying in background… {}",
@@ -700,56 +801,89 @@ fn hostname() -> &'static str {
     })
 }
 
-/// Default-route interface and its subnet from /proc/net/route (hex LE).
-/// Cached like hostname(); a mid-session interface change is cosmetic here.
-fn primary_network() -> &'static str {
+/// The header shows the host address an operator is talking to: the
+/// default-route interface's address (not its subnet). Cached like
+/// hostname(); a mid-session interface change is cosmetic here.
+fn primary_ip() -> &'static str {
     static NET: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-    NET.get_or_init(compute_primary_network)
+    NET.get_or_init(compute_primary_ip)
 }
 
-fn compute_primary_network() -> String {
-    // /proc/net/route columns: Iface Dst GW Flags RefCnt Use Metric Mask ...
-    // The default route (Dst=0) carries mask 0 — useless. The interface's
-    // subnet lives in the ON-LINK route for the same iface (GW=0, real mask).
-    let rt = match std::fs::read_to_string("/proc/net/route") {
-        Ok(s) => s,
-        Err(_) => return "-".into(),
-    };
-    let lines: Vec<Vec<&str>> = rt
-        .lines()
-        .skip(1)
-        .map(|l| l.split_whitespace().collect())
-        .collect();
-    let def_iface = lines
-        .iter()
-        .find(|c| c.len() >= 8 && c[1] == "00000000")
-        .map(|c| c[0]);
-    let Some(iface) = def_iface else {
+fn compute_primary_ip() -> String {
+    let Some(iface) = default_iface() else {
         return "-".into();
     };
-    for c in &lines {
-        if c.len() >= 8 && c[0] == iface && c[1] != "00000000" && c[2] == "00000000" {
-            let dst = unhex_le(c[1]);
-            let mask = unhex_le(c[7]);
-            if mask != 0 {
-                let ip = |w: u32| {
-                    format!(
-                        "{}.{}.{}.{}",
-                        w >> 24,
-                        (w >> 16) & 255,
-                        (w >> 8) & 255,
-                        w & 255
-                    )
-                };
-                return format!("{} {}/{}", iface, ip(dst & mask), mask.count_ones());
+    // Prefer the default iface's global IPv4; fall back to any address on it,
+    // then to just the name (matches old behavior when enumeration fails).
+    let ifaddrs = match if_addrs::get_if_addrs() {
+        Ok(v) => v,
+        Err(_) => return iface,
+    };
+    let mut fallback: Option<String> = None;
+    for a in &ifaddrs {
+        if a.name != iface {
+            continue;
+        }
+        match a.ip() {
+            std::net::IpAddr::V4(v4) => {
+                if !v4.is_loopback() && !v4.is_link_local() {
+                    return v4.to_string();
+                }
+                fallback.get_or_insert_with(|| v4.to_string());
+            }
+            v6 => {
+                fallback.get_or_insert_with(|| v6.to_string());
             }
         }
     }
-    iface.to_string()
+    fallback.unwrap_or(iface)
 }
 
-fn unhex_le(h: &str) -> u32 {
-    u32::from_str_radix(h, 16).map(u32::from_be).unwrap_or(0)
+/// Interface carrying the default route, from /proc/net/route (hex LE).
+/// Shared by the header and the net modal's "(default)" marker.
+pub fn default_iface() -> Option<String> {
+    // /proc/net/route columns: Iface Dst GW Flags RefCnt Use Metric Mask ...
+    let rt = std::fs::read_to_string("/proc/net/route").ok()?;
+    rt.lines()
+        .skip(1)
+        .map(|l| l.split_whitespace().collect::<Vec<_>>())
+        .find(|c| c.len() >= 8 && c[1] == "00000000")
+        .map(|c| c[0].to_string())
+}
+
+/// All non-loopback interfaces with their addresses, snapshot on open.
+pub fn collect_ifaces() -> Vec<crate::app::NetIface> {
+    let def = default_iface();
+    let mut order: Vec<String> = Vec::new();
+    let mut addrs: std::collections::BTreeMap<String, Vec<String>> = Default::default();
+    if let Ok(list) = if_addrs::get_if_addrs() {
+        for a in list {
+            if a.is_loopback() || a.name == "lo" {
+                continue;
+            }
+            // IfAddr carries the prefix length alongside the address
+            let (ip, bits) = match &a.addr {
+                if_addrs::IfAddr::V4(v4) => (std::net::IpAddr::V4(v4.ip), v4.prefixlen),
+                if_addrs::IfAddr::V6(v6) => (std::net::IpAddr::V6(v6.ip), v6.prefixlen),
+            };
+            if !addrs.contains_key(&a.name) {
+                order.push(a.name.clone());
+            }
+            addrs.entry(a.name.clone()).or_default().push(if bits > 0 {
+                format!("{ip}/{bits}")
+            } else {
+                ip.to_string()
+            });
+        }
+    }
+    order
+        .into_iter()
+        .map(|name| crate::app::NetIface {
+            default: def.as_deref() == Some(name.as_str()),
+            addrs: addrs.remove(&name).unwrap_or_default(),
+            name,
+        })
+        .collect()
 }
 
 // ------------------------------------------------------------------- tests
