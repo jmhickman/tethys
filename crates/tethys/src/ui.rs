@@ -86,7 +86,7 @@ fn draw_header(f: &mut Frame, app: &App, st: ConnStatus, a: Rect) {
     ];
     // subscribe ack carries the daemon version; rendered so TUI/daemon skew is visible
     if let Some(v) = &app.daemon_version {
-        l1_parts.push(Span::styled(format!(" gk v{v}"), muted(true)));
+        l1_parts.push(Span::styled(format!(" tethys v{v}"), muted(true)));
     }
     let l1 = Line::from(l1_parts);
 

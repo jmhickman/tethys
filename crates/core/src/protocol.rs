@@ -302,7 +302,7 @@ pub struct EvTraffic {
     pub grants: Vec<GrantStat>,
 }
 
-/// `gk.error`.
+/// `tethys.error`.
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct EvError {
     pub message: String,
