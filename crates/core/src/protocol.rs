@@ -44,7 +44,7 @@ pub struct RpcError {
 
 impl RpcResponse {
     /// Success reply. A serialization failure degrades to a JSON-RPC internal
-    /// error (-32603) rather than panicking — the daemon outlives any one
+    /// error (-32603) rather than panicking, since the daemon outlives any one
     /// unserializable result.
     pub fn ok(id: impl Into<String>, result: impl Serialize) -> Self {
         let id = id.into();
@@ -246,7 +246,7 @@ pub struct GrantStat {
 // One struct per broadcast so producer (daemon emit()) and consumer (tethys)
 // share a compile-checked contract instead of agreeing on string keys.
 
-/// `grant.request.new` — a request awaits human decision.
+/// `grant.request.new`: a request awaits human decision.
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct EvRequestNew {
     pub grant_id: String,
@@ -260,11 +260,12 @@ pub struct EvRequestNew {
     pub created_at: u64,
 }
 
-/// `grant.decided` — a row left pending/approved. Internally tagged on
+/// `grant.decided`: a row left pending/approved. Internally tagged on
 /// `state`, so each decision carries exactly its own fields: no String state,
-/// no nullable soup, and no `Option<Option<String>>` around `note` (that was
-/// a serde artifact of sharing one struct with the stop broadcast — which is
-/// now its own event, [`EvStopped`], on its own method).
+/// no nullable soup, and no `Option<Option<String>>` around `note`. That
+/// nesting came from serde handling of an earlier version that shared one
+/// struct with the stop broadcast, which is now its own event, [`EvStopped`],
+/// on its own method.
 #[derive(Serialize, Deserialize, Clone, Debug)]
 #[serde(tag = "state", rename_all = "snake_case")]
 pub enum EvDecided {
@@ -284,13 +285,13 @@ pub enum EvDecided {
     },
 }
 
-/// `grants.stopped` — stop.grants swept N grants. Not a per-grant decision.
+/// `grants.stopped`: stop.grants swept N grants. Not a per-grant decision.
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct EvStopped {
     pub grants_removed: usize,
 }
 
-/// `grant.expired` — kernel TTL reaped the element.
+/// `grant.expired`: kernel TTL reaped the element.
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct EvExpired {
     pub grant_id: String,
@@ -320,9 +321,11 @@ pub struct SubscribeAck {
 mod tests {
     use super::*;
 
+    // Each state serializes as its internally tagged variant with only its
+    // own fields, an absent note never becomes a nested null, and the stop
+    // broadcast is its own event with a required count.
     #[test]
     fn ev_decided_is_typed_per_state() {
-        // internally tagged on `state`; each variant carries only its own fields
         let a = EvDecided::Approved {
             grant_id: "7".into(),
             ttl_granted: "10m".into(),
@@ -339,7 +342,6 @@ mod tests {
         };
         let j = serde_json::to_string(&d).unwrap();
         assert!(j.contains("\"state\":\"denied\"") && j.contains("\"note\":\"out of scope\""));
-        // note is Option<String>: absent means absent, never a nested null
         assert!(!j.contains("null"));
 
         let r = EvDecided::Revoked {
@@ -351,15 +353,15 @@ mod tests {
             Ok(EvDecided::Revoked { .. })
         ));
 
-        // stop broadcast is its own event with a required count
         let s = serde_json::to_value(EvStopped { grants_removed: 3 }).unwrap();
         assert_eq!(s["grants_removed"], 3);
         assert!(serde_json::from_value::<EvStopped>(serde_json::json!({})).is_err());
     }
 
+    // grant_id accepts a string (canonical) and a number (hand-rolled echo);
+    // history params default when absent and parse typed states.
     #[test]
     fn admin_params_are_typed() {
-        // grant_id as string (canonical) and as number (hand-rolled echo)
         let a: admin::Approve =
             serde_json::from_value(serde_json::json!({"grant_id": "42"})).unwrap();
         assert_eq!((a.grant_id, a.ttl_secs), (42, None));
@@ -372,7 +374,6 @@ mod tests {
         assert!(
             serde_json::from_value::<admin::GrantId>(serde_json::json!({"grant_id": "x"})).is_err()
         );
-        // history: absent params default; typed state parse; bad state is an error
         let h: admin::History = serde_json::from_value(serde_json::json!({})).unwrap();
         assert_eq!((h.state, h.limit), (None, None));
         let h: admin::History =
@@ -396,9 +397,10 @@ mod tests {
         assert!(back.contains("\"proto\":\"tcp\""));
     }
 
+    // Verdict is internally tagged on `decision`; approved without an
+    // effective grant must fail to parse.
     #[test]
     fn verdict_serde_shape() {
-        // internally tagged on `decision`
         let d = Verdict::Denied {
             reason_code: DenyReason::ApproverOffline,
             grant_id: None,
@@ -423,7 +425,6 @@ mod tests {
         assert!(s.contains("\"decision\":\"approved\""));
         assert_eq!(serde_json::from_str::<Verdict>(&s).unwrap(), a);
 
-        // approved without effective must fail to parse
         let bad = r#"{"decision":"approved","grant_id":"7"}"#;
         assert!(serde_json::from_str::<Verdict>(bad).is_err());
     }

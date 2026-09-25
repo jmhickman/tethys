@@ -106,15 +106,17 @@ pub(crate) async fn install_scope(st: &Arc<State>) -> anyhow::Result<()> {
 }
 
 /// Flush carve sets, resolve hostnames, install the operator allow list.
+/// Adding an existing element aborts an nft batch, so resolved tuples are
+/// deduped first; the in-force allow list is snapshotted under the read lock
+/// so a concurrent reload cannot mutate it mid-loop (kernel state then
+/// matches one coherent snapshot). An entry that resolves to zero addresses
+/// is an error, not a silent skip.
 pub(crate) async fn install_carves(st: &Arc<State>) -> anyhow::Result<()> {
     let mut b = Batch::with_table(&st.cfg.nft_table);
     b.ensure_carve_sets();
     b.flush_carves();
     let mut n = 0usize;
-    // add-of-existing-element aborts an nft batch: dedupe resolved tuples
     let mut seen: HashSet<(String, u8, u16, u16)> = Default::default();
-    // snapshot the in-force list: a concurrent reload must not mutate the
-    // vec mid-loop (leaves kernel state matching one coherent snapshot)
     let allow = st.allow.read().await.clone();
     for (target, port, proto) in &allow {
         let dsts = target_elems(target)
@@ -249,13 +251,14 @@ pub(crate) async fn rebuild_acct(st: &Arc<State>) -> Result<(), String> {
 
 /// Sweep per-grant objects after a grant leaves approved.
 /// Run after rebuild_acct so objects are unreferenced. One batch per object
-/// (deletes are not idempotent).
+/// (deletes are not idempotent); an ENOENT/EBUSY delete is ignored, so a
+/// dead object may linger until the next wipe.
 pub(crate) async fn sweep_grant_objs(st: &Arc<State>, gid: i64) {
     use tethys_core::nft::acct_set;
     if st.cfg.dry_run {
         return;
     }
-    let mut names: Vec<(bool, String)> = Vec::new(); // (is_counter, name)
+    let mut names: Vec<(bool, String)> = Vec::new();
     for dir in [Dir::Out, Dir::In] {
         for v6 in [false, true] {
             names.push((false, acct_set(gid, dir, v6)));
@@ -269,7 +272,6 @@ pub(crate) async fn sweep_grant_objs(st: &Arc<State>, gid: i64) {
         } else {
             b.delete_set(&name);
         }
-        // ENOENT/EBUSY: a dead object may linger until the next wipe.
         if let Err(e) = st.nft.apply(&b).await {
             tracing::debug!(gid, %e, obj = %name, "acct sweep delete (ignored)");
         }

@@ -1,11 +1,11 @@
 # Tethys
 
-Tethys puts an AI agent behind a firewall that a human holds the keys to.
+Tethys puts an AI agent behind a human-controlled firewall.
 It confines one unprivileged account on a Linux host (typically whatever
 user your agent harness runs as) so that every outbound connection is
-dropped at the kernel. You may specify standing exceptions (links to local or cloud models, software repos, etc) Grants expire on their own;
-nothing needs tending. 
-
+dropped at the kernel. You may specify standing exceptions (links to local
+or cloud models, software repos, etc.). Grants expire on their own; nothing
+needs to maintain them.
 
 ## How it works
 
@@ -23,8 +23,8 @@ tool with a destination, a port range, a TTL, and a reason; the call blocks
 while a human decides, and returns the effective verdict. Approved destinations are installed as nftables set elements
 carrying kernel timeouts, so expiry is enforced by netfilter itself.
 
-Enforcement is scoped to one uid, so the human admin on the same machine
-is never ambushed by their own firewall. The approval channel is a 0600
+Enforcement is scoped to one uid, so the policy does not affect the human
+admin on the same machine. The approval channel is a 0600
 unix socket owned by root, which means the policed account can ask but not
 allow.
 
@@ -44,8 +44,8 @@ turning enforcement on. Local and air-gapped installs work too: release
 archives are self-installing, and `install.sh --source` accepts a tarball,
 a directory of assets, or an unpacked tree without touching the network.
 
-The full guide — building from source, configuration reference, systemd
-details, the security model in plain terms — is in
+The full guide covers building from source, the configuration reference,
+systemd details, and the security model in plain terms; it's in
 [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md). The condensed operator checklist
 lives in [deploy/README.md](deploy/README.md), and every configuration knob
 is annotated in [config.example.toml](config.example.toml).
@@ -65,12 +65,14 @@ The daemon reads `/etc/tethys/config.toml`. Each account has a specific role:
 
 The `allow` list holds egress
 that's always permitted (model backends, mirrors, infrastructure) and everything else flows through the approval pipeline with `max_ttl` as the hard ceiling on any grant. Unknown keys in
-the file or a missing configured user aborts startup.
+the file or a missing configured user abort startup.
 
 ## Status
 
-Version 2026.9.1 is a beta-quality release. While the enforcement path has been through a round of
-adversarial security review, the software is unproven in production environments as of now. Use with caution, and apply defense-in-depth principles when containing and regulating agentic workflows.
+**ALPHA**
+
+Version 2026.9.1 is an alpha-quality release. While the enforcement path has been through a round of
+adversarial security review, the software is unproven in production environments. Use with caution, and apply defense-in-depth principles when containing and regulating agentic workflows. In particular, read the Security section of the [DEPLOYMENT](docs/DEPLOYMENT.md) guide, as it contains important considerations.
 
 ## License
 

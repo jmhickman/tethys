@@ -10,7 +10,7 @@ use tethys_core::types::Proto;
 use tokio::sync::mpsc;
 
 /// Ledger/wire vocabulary types live in tethys-core (shared verbatim with tethys
-/// over admin.sock); re-exported so daemon code says `crate::ledger::…`.
+/// over admin.sock); re-exported so daemon code says `crate::ledger::*`.
 pub use tethys_core::wire::{DenyCode, GrantRow, GrantState};
 
 /// New request. State, expiry, and verdict are filled in later.
@@ -117,9 +117,13 @@ pub struct Ledger {
     tx: mpsc::UnboundedSender<LedgerCmd>,
 }
 
+/// Build a GrantRow from a query row. An unknown state or proto means the
+/// row is corrupt: error (skip) rather than inventing a variant. deny_code
+/// parses through serde, the single parse path; the alias covers the
+/// pre-kebab spelling and anything else loads as Unknown instead of
+/// dropping the row.
 fn row_from(r: &rusqlite::Row) -> rusqlite::Result<GrantRow> {
     let state_raw: String = r.get(11)?;
-    // Unknown state is corrupt; skip rather than inventing a variant.
     let Some(state) = GrantState::parse(&state_raw) else {
         tracing::error!(id = ?r.get::<_, i64>(0).ok(), state = %state_raw,
             "ledger row with unknown state skipped");
@@ -153,8 +157,6 @@ fn row_from(r: &rusqlite::Row) -> rusqlite::Result<GrantRow> {
         state,
         created_at: r.get::<_, i64>(12)? as u64,
         expires_at: r.get(13)?,
-        // serde is the single parse path (alias covers the pre-kebab spelling;
-        // anything else loads as Unknown rather than dropping the row).
         deny_code: r.get::<_, Option<String>>(14)?.map(|c| {
             serde_json::from_value::<DenyCode>(serde_json::Value::String(c.clone()))
                 .unwrap_or(DenyCode::Unknown(c))
@@ -167,6 +169,19 @@ const COLS: &str = "id,idem_key,target,dst_json,port_from,port_to,proto,reason,t
      ttl_secs,granted_ttl_secs,state,created_at,expires_at,deny_code,note";
 
 impl Ledger {
+    /// Open (creating if needed) the ledger DB and spawn its actor task.
+    /// WAL + NORMAL synchronous is durable within the last few commits at
+    /// worst on power loss, which is acceptable because grants are reconciled
+    /// against kernel truth at boot; busy_timeout keeps a hot reader from
+    /// erroring out. rusqlite is synchronous, so the whole command loop runs
+    /// under spawn_blocking with blocking_recv (ASYNCBLOCK-001); parking a tokio
+    /// worker for every WAL fsync would stall the runtime. Insert answers
+    /// None on a duplicate idem key: last_insert_rowid keeps the previous
+    /// rowid on UNIQUE failure, so changes()==1 is what proves this insert
+    /// landed. A failed audit INSERT is logged loudly rather than silently
+    /// erasing forensics (RESDISC-001). The decide UPDATE binds 1=id,
+    /// 2=target-state, 3=expires, 4=deny_code, 5=note, then the legal origin
+    /// states at ?6+.
     pub fn open(path: &Path) -> anyhow::Result<(Self, tokio::task::JoinHandle<()>)> {
         if let Some(p) = path.parent() {
             std::fs::create_dir_all(p)
@@ -174,9 +189,6 @@ impl Ledger {
         }
         let conn = Connection::open(path)?;
         conn.execute_batch(
-            // WAL + NORMAL: durable within the last few commits at worst on
-            // power loss — grants are reconciled against kernel truth at
-            // boot anyway. busy_timeout keeps a hot reader from erroring out.
             "PRAGMA journal_mode=WAL;
              PRAGMA synchronous=NORMAL;
              PRAGMA busy_timeout=5000;
@@ -199,10 +211,6 @@ impl Ledger {
                grant_id INTEGER NOT NULL, detail TEXT NOT NULL DEFAULT '');",
         )?;
         let (tx, mut rx) = mpsc::unbounded_channel::<LedgerCmd>();
-        // ASYNCBLOCK-001: rusqlite is synchronous; running the whole command
-        // loop on a tokio worker parks that worker for every WAL fsync under
-        // disk pressure. blocking_recv() + spawn_blocking keeps the async
-        // runtime free and needs no second channel type.
         let h = tokio::task::spawn_blocking(move || {
             while let Some(cmd) = rx.blocking_recv() {
                 match cmd {
@@ -213,8 +221,6 @@ impl Ledger {
                             params![g.idem_key, g.target, g.port_from as i64, g.port_to as i64,
                                     g.proto.to_string(), g.reason, g.tool, g.ttl_secs as i64, g.created_at as i64],
                         );
-                        // last_insert_rowid keeps the previous rowid on UNIQUE
-                        // failure; changes()==1 means this insert landed.
                         match res {
                             Ok(1) => {
                                 let id = conn.last_insert_rowid();
@@ -249,8 +255,6 @@ impl Ledger {
                                 continue;
                             }
                         };
-                        // bind: 1=id, 2=target-state, 3=expires, 4=deny_code, 5=note,
-                        // then legal origin states (?6+).
                         let n =
                             match stmt.execute(rusqlite::params_from_iter(
                                 std::iter::once(rusqlite::types::Value::Integer(id))
@@ -296,7 +300,6 @@ impl Ledger {
                         let _ = reply.send(out);
                     }
                     LedgerCmd::History(state, limit, reply) => {
-                        // Decided rows for the TUI, newest first. Optional state filter.
                         let q = match state {
                             Some(_) => format!(
                                 "SELECT {COLS} FROM grants WHERE state!=?1 AND state=?2 \
@@ -337,9 +340,6 @@ impl Ledger {
                         let _ = reply.send(out);
                     }
                     LedgerCmd::SetDst(id, dst_json, reply) => {
-                        // Persist resolved IPs; revoke uses these, not a fresh
-                        // lookup. RESDISC-002: a DB fault must not masquerade
-                        // as "row not approved" — the caller fail-closes on it.
                         match conn.execute(
                             "UPDATE grants SET dst_json=?2 WHERE id=?1 AND state IN ('pending','approved')",
                             params![id, dst_json],
@@ -367,9 +367,6 @@ impl Ledger {
                         let _ = reply.send(row);
                     }
                     LedgerCmd::Audit(event, detail, grant_id) => {
-                        // RESDISC-001: the approval trail must not fail
-                        // silently — a full DB would otherwise erase forensics
-                        // with zero operator signal while grants keep flowing.
                         if let Err(e) = conn.execute(
                             "INSERT INTO audit(ts,event,grant_id,detail) VALUES(?1,?2,?3,?4)",
                             params![now_secs() as i64, event, grant_id, detail],
@@ -413,8 +410,8 @@ impl Ledger {
     }
     /// Persist resolved dst list for an approved grant. Err distinguishes a
     /// DB fault from "row not approved" (RESDISC-002); both are hard failures
-    /// on the approval path — without the pinned resolution, revoke could
-    /// tear down the wrong elements and leave stale egress until TTL.
+    /// on the approval path, because without the pinned resolution, revoke
+    /// could tear down the wrong elements and leave stale egress until TTL.
     pub async fn set_dst(&self, id: i64, dst_json: String) -> Result<(), String> {
         self.ask(move |reply| LedgerCmd::SetDst(id, dst_json, reply))
             .await
@@ -457,6 +454,8 @@ mod tests {
     }
 
     /// Wrong-origin decisions flip zero rows; right-origin flips exactly one.
+    /// Covers approve/revoke/deny on the happy path, a terminal row
+    /// rejecting further decisions, and the deny path recording code+note.
     #[tokio::test]
     async fn transitions_enforce_origin_state() {
         let dir = std::env::temp_dir().join(format!("tethys-ledger-test-{}", now_secs()));
@@ -485,14 +484,12 @@ mod tests {
                 )
                 .await
         );
-        // terminal: revoked -> anything = false
         assert!(!ledger.decide(gid, Decide::ExpireByKernel).await);
         assert_eq!(
             ledger.find_by_idem("k1").await.unwrap().state,
             GrantState::Revoked
         );
 
-        // separate row: deny path records code+note
         let gid2 = ledger.insert_pending(newg("k2")).await.expect("insert");
         assert!(
             ledger
@@ -509,7 +506,6 @@ mod tests {
         assert_eq!(r.state, GrantState::Denied);
         assert_eq!(r.deny_code, Some(DenyCode::HumanDenied));
         assert_eq!(r.note.as_deref(), Some("out of scope"));
-        // Deny from a denied row: rejected
         assert!(
             !ledger
                 .decide(
@@ -526,12 +522,14 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    // History returns decided rows only, newest first, with an optional
+    /// state filter and a limit that keeps the newest page. Revoke must
+    /// originate from Approved (a pending origin is rejected).
     #[tokio::test]
     async fn history_excludes_pending_filters_and_limits() {
         let dir = std::env::temp_dir().join(format!("tethys-hist-{}", now_secs()));
         let (ledger, actor) = Ledger::open(&dir.join("t.db")).unwrap();
 
-        // 3 decided rows in distinct terminal states + 1 still pending
         let a = ledger.insert_pending(newg("h-a")).await.unwrap();
         ledger
             .decide(
@@ -552,7 +550,6 @@ mod tests {
             )
             .await;
         let c = ledger.insert_pending(newg("h-c")).await.unwrap();
-        // Revoke originates from Approved; pending origin is rejected.
         ledger
             .decide(
                 c,
@@ -570,12 +567,10 @@ mod tests {
                 },
             )
             .await;
-        // flip a approved row to expired via the kernel path
         ledger.decide(a, Decide::ExpireByKernel).await;
         let _d = ledger.insert_pending(newg("h-pending")).await.unwrap();
 
         let all = ledger.history(None, 100).await;
-        // newest first; approved row landed in expired, pending excluded
         assert_eq!(
             all.iter().map(|r| r.state).collect::<Vec<_>>(),
             vec![GrantState::Revoked, GrantState::Denied, GrantState::Expired]
@@ -591,7 +586,6 @@ mod tests {
         assert_eq!(page.len(), 2);
         assert_eq!(page[0].id, c, "limit must keep the NEWEST rows");
 
-        // revoked-only filter proves state narrowing on a second value
         assert_eq!(
             ledger.history(Some(GrantState::Revoked), 100).await.len(),
             1
@@ -601,6 +595,8 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// The UNIQUE idem key rejects a duplicate insert, and find_by_idem
+    /// resolves the row in any state, including after revoke.
     #[tokio::test]
     async fn dup_idem_key_rejected_and_findable_across_states() {
         let dir = std::env::temp_dir().join(format!("tethys-idem-{}", now_secs()));

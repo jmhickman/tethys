@@ -38,6 +38,13 @@ pub struct ConnStatus {
 }
 
 /// Spawn the connection task: (command sender, inbound-line receiver, status).
+/// On every (re)connect the task opens a fresh session by sending subscribe
+/// plus live/pending snapshots; the app replaces its tables on the `c-*`
+/// replies, and the subscribe re-ack marks the daemon-contract handshake
+/// complete (`synced`). Outbound commands and inbound lines are read through
+/// one select loop; EOF or any IO error ends the session and triggers a
+/// reconnect after a pause. The task exits only when the app drops the
+/// command sender or the event receiver.
 pub fn spawn(
     socket: PathBuf,
 ) -> (
@@ -59,7 +66,6 @@ pub fn spawn(
                     let (r, mut w) = stream.into_split();
                     let mut lines = BufReader::new(r).lines();
 
-                    // Fresh session: subscribe + snapshots. App replaces tables on c-* replies.
                     let resync = [
                         cmd("c-sub", method::SUBSCRIBE, None),
                         cmd("c-live", method::LIST_GRANTS, None),
@@ -85,27 +91,24 @@ pub fn spawn(
                                     Some(c) => {
                                         if write_req(&mut w, &c).await.is_err() { break; }
                                     }
-                                    None => return, // app dropped the sender
+                                    None => return,
                                 }
                             }
                             l = lines.next_line() => {
                                 match l {
                                     Ok(Some(line)) => {
                                         if let Ok(v) = serde_json::from_str::<Value>(&line) {
-                                            // subscribe re-ack == daemon-contract
-                                            // handshake complete; snapshots ride
-                                            // down the same stream for the app.
                                             if v.get("id").and_then(|i| i.as_str())
                                                 == Some("c-sub")
                                             {
                                                 st_tx.send(ConnStatus { up: true, synced: true }).ok();
                                             }
                                             if ev_tx.send(v).is_err() {
-                                                return; // app gone
+                                                return;
                                             }
                                         }
                                     }
-                                    _ => break, // EOF / IO error -> reconnect
+                                    _ => break,
                                 }
                             }
                         }

@@ -1,4 +1,4 @@
-//! admin.sock: the human side. Approvals, decisions, snapshots, subscribe —
+//! admin.sock: the human side. Approvals, decisions, snapshots, subscribe,
 //! everything the TUI sends. Reads state through `State`, flips the ledger,
 //! installs/tears down kernel elements via `crate::install`.
 
@@ -20,11 +20,18 @@ use crate::server::{
     emit, peer_cred, read_frame, resp_line, CountGuard, Frame, HumanDecision, State,
 };
 
+/// Serve one admin.sock client: gate on peer credentials, then loop over
+/// broadcast events and request frames until either breaks. The 0600 inode
+/// mode is the primary access gate; the SO_PEERCRED check makes it enforced
+/// rather than assumed (TOCTOU-001). Admitted peers: root (or the configured
+/// admin uid) and the daemon's own euid for dev/test runs where nobody is
+/// root; unreadable creds fail closed, like mcp.sock. The admins_online
+/// guard is RAII because a panic in the loop (e.g. ledger actor death) must
+/// not leave a phantom admin online, which would disable ApproverOffline
+/// forever. Frames share the slow-loris/oversize pattern from mcp.sock even
+/// though this socket is root-only; a lagged or closed broadcast ends the
+/// session.
 pub(crate) async fn handle_admin(stream: UnixStream, st: Arc<State>) {
-    // TOCTOU-001 defense-in-depth: the 0600 inode mode is the primary gate;
-    // SO_PEERCRED makes it enforced rather than assumed. Admitted: root (or
-    // the configured admin uid) and the daemon's own euid (dev/test runs
-    // where nobody is root). Unreadable creds fail closed, like mcp.sock.
     let self_uid = nix::unistd::geteuid().as_raw();
     let ok = match peer_cred(&stream) {
         Some(c) => c.uid() == self_uid || st.cfg.admin_peer_uid == Some(c.uid()),
@@ -40,8 +47,6 @@ pub(crate) async fn handle_admin(stream: UnixStream, st: Arc<State>) {
         return;
     }
     tracing::info!(uid = ?peer_cred(&stream).map(|c| c.uid()), "admin client connected");
-    // RAII: a panic in the loop (e.g. ledger actor death) must not leave a
-    // phantom admin online — that would disable ApproverOffline forever.
     let _online = CountGuard::inc(&st.admins_online);
     let mut sub_rx = st.events.subscribe();
     let (mut r, mut w) = stream.into_split();
@@ -52,11 +57,10 @@ pub(crate) async fn handle_admin(stream: UnixStream, st: Arc<State>) {
             ev = sub_rx.recv() => {
                 match ev {
                     Ok(msg) => { if w.write_all(msg.as_bytes()).await.is_err() { break } }
-                    Err(_) => break, // lagged/closed
+                    Err(_) => break,
                 }
             }
             f = read_frame(&mut reader, &mut buf) => {
-                // root-only socket, but it shares the slow-loris/oversize pattern
                 let line = match f {
                     Frame::Line(s) => s,
                     Frame::TooLong | Frame::Idle | Frame::Eof => break,
@@ -90,7 +94,13 @@ async fn handle_admin_cmd(req: &RpcRequest, st: &Arc<State>) -> RpcResponse {
     admin_cmd(req, st).await.unwrap_or_else(|err| err)
 }
 
-/// Ok = the reply; Err = an already-built error reply (params shape etc.).
+/// Dispatch one admin command. Ok = the reply; Err = an already-built error
+/// reply (params shape etc.). list.pending snapshots rows for TUI reconnect,
+/// marking decidable only those with a live decision channel. list.history
+/// returns decided rows; an unknown state or a pending filter is a client
+/// error, not a silent empty result (serde rejects junk spellings), and limit
+/// must be 1..=1000 (default 100). The subscribe ack carries the approver
+/// timeout for the TUI countdown and the daemon version to detect skew.
 async fn admin_cmd(req: &RpcRequest, st: &Arc<State>) -> Result<RpcResponse, RpcResponse> {
     match req.method.as_str() {
         method::APPROVE => {
@@ -151,7 +161,6 @@ async fn admin_cmd(req: &RpcRequest, st: &Arc<State>) -> Result<RpcResponse, Rpc
             Ok(RpcResponse::ok(&req.id, out))
         }
         method::LIST_PENDING => {
-            // Snapshot for TUI reconnect. Only rows with a live decision channel are decidable.
             let rows = st.ledger.list(GrantState::Pending).await;
             let live = st.pending.lock().await;
             let out: Vec<PendingRowWire> = rows
@@ -164,8 +173,6 @@ async fn admin_cmd(req: &RpcRequest, st: &Arc<State>) -> Result<RpcResponse, Rpc
             Ok(RpcResponse::ok(&req.id, out))
         }
         method::LIST_HISTORY => {
-            // Decided rows. Unknown state or a pending filter is a client
-            // error, not a silent empty (serde rejects junk spellings).
             let h: admin::History = params_as(req)?;
             if h.state == Some(GrantState::Pending) {
                 return Ok(RpcResponse::err(
@@ -197,7 +204,6 @@ async fn admin_cmd(req: &RpcRequest, st: &Arc<State>) -> Result<RpcResponse, Rpc
                 ]
                 .map(String::from)
                 .to_vec(),
-                // TUI countdown needs the timeout; version detects daemon skew.
                 approver_timeout_secs: st.cfg.approver_timeout_secs,
                 version: env!("CARGO_PKG_VERSION").into(),
             },
@@ -206,7 +212,12 @@ async fn admin_cmd(req: &RpcRequest, st: &Arc<State>) -> Result<RpcResponse, Rpc
     }
 }
 
-/// Emergency stop: terminate grants; baseline rules untouched.
+/// Emergency stop: terminate grants; baseline rules untouched. Three
+/// phases: delete kernel elements (one atomic batch; if it hits a missing
+/// element, retry per grant and tolerate ENOENT, since an already-gone
+/// element counts as removed), deny everything pending through its decision
+/// channel, then flip approved rows to revoked. Accounting follows the
+/// ledger: chains flush empty and per-grant objects are swept.
 async fn stop_grants(req: &RpcRequest, st: &Arc<State>) -> RpcResponse {
     tracing::info!("stop.grants invoked");
     let mut n = 0usize;
@@ -234,7 +245,6 @@ async fn stop_grants(req: &RpcRequest, st: &Arc<State>) -> RpcResponse {
     }
     if !st.cfg.dry_run && n > 0 {
         if let Err(e) = st.nft.apply(&b).await {
-            // Atomic batch hit a missing element: retry per grant, tolerate ENOENT.
             tracing::warn!(%e, "stop.grants batch failed; per-grant fallback");
             let mut ok = 0usize;
             for g in &rows {
@@ -254,7 +264,7 @@ async fn stop_grants(req: &RpcRequest, st: &Arc<State>) -> RpcResponse {
                     }
                     match st.nft.apply(&gb).await {
                         Ok(()) => ok += 1,
-                        Err(e2) if e2.to_string().contains("No such file") => ok += 1, // already gone
+                        Err(e2) if e2.to_string().contains("No such file") => ok += 1,
                         Err(e2) => {
                             tracing::error!(id = g.id, %e2, "stop.grants per-grant delete failed")
                         }
@@ -264,7 +274,6 @@ async fn stop_grants(req: &RpcRequest, st: &Arc<State>) -> RpcResponse {
             n = ok;
         }
     }
-    // deny everything currently pending + flip rows
     let pendings: Vec<i64> = st.pending.lock().await.keys().copied().collect();
     for gid in pendings {
         if let Some(tx) = st.pending.lock().await.remove(&gid) {
@@ -274,7 +283,6 @@ async fn stop_grants(req: &RpcRequest, st: &Arc<State>) -> RpcResponse {
             .ok();
         }
     }
-    // flip rows (pending ones were just denied above via their channels)
     for g in &rows {
         st.ledger
             .decide(
@@ -286,7 +294,6 @@ async fn stop_grants(req: &RpcRequest, st: &Arc<State>) -> RpcResponse {
             )
             .await;
     }
-    // accounting follows the ledger: chains flush empty, objects swept.
     if let Err(e) = rebuild_acct(st).await {
         tracing::warn!(%e, "acct rebuild after stop.grants failed");
     }
@@ -299,10 +306,17 @@ async fn stop_grants(req: &RpcRequest, st: &Arc<State>) -> RpcResponse {
 
 /// `reload.allow`: re-read the config file's allow list and reinstall the
 /// carve sets, so operators can adjust to drift mid-engagement without a
-/// daemon restart (which would drop nothing but costs a blip + journal noise).
+/// daemon restart (which would drop nothing but costs a blip + journal
+/// noise). Swap st.allow first, then install: install_carves snapshots
+/// st.allow, so a failure after the swap leaves kernel and state consistent
+/// with each other (both new); failure before it is unreachable since the
+/// parse already passed.
 /// Refused when the daemon started with --allow flags: those replace the file
 /// entirely, and silently switching authority between file and flags is worse
-/// than asking for a restart.
+/// than asking for a restart. The whole file is re-read and re-parsed (not
+/// just `allow`, unknown keys still rejected), so an operator breaking
+/// something else in it gets a refusal rather than a list parsed from a file
+/// that would no longer boot.
 async fn reload_allow(req: &RpcRequest, st: &Arc<State>) -> Result<RpcResponse, RpcResponse> {
     if st.cfg.allow_from_cli {
         return Err(RpcResponse::err(
@@ -311,9 +325,6 @@ async fn reload_allow(req: &RpcRequest, st: &Arc<State>) -> Result<RpcResponse, 
             "allow list came from CLI flags; restart to change it",
         ));
     }
-    // Re-read + re-parse the whole file (not just `allow`): if the operator
-    // broke something else in it, we refuse rather than reload a list parsed
-    // from a file that would no longer boot. Unknown keys still rejected.
     let text = std::fs::read_to_string(&st.cfg.config_path).map_err(|e| {
         RpcResponse::err(
             &req.id,
@@ -341,9 +352,6 @@ async fn reload_allow(req: &RpcRequest, st: &Arc<State>) -> Result<RpcResponse, 
             }
         }
     }
-    // Swap first, then install: install_carves snapshots st.allow, so a
-    // failure after the swap leaves kernel+state consistent with each other
-    // (both new); failure before it is unreachable since parse already passed.
     *st.allow.write().await = fresh;
     crate::install::install_carves(st)
         .await

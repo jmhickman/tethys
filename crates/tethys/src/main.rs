@@ -28,13 +28,14 @@ struct Args {
 
 type Tx = mpsc::UnboundedSender<conn::Cmd>;
 
+/// Enter the alternate screen keyboard-only (mouse capture would steal
+/// terminal text selection), run the loop, and always restore the terminal.
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
 
     enable_raw_mode()?;
     let mut stdout = io::stdout();
-    // Keyboard only: mouse capture would steal terminal text selection.
     execute!(stdout, EnterAlternateScreen)?;
     let backend = CrosstermBackend::new(io::stdout());
     let mut terminal = Terminal::new(backend)?;
@@ -47,6 +48,14 @@ async fn main() -> anyhow::Result<()> {
     res
 }
 
+/// Single select loop over three sources. Ticks refresh the clock, expire
+/// the flash line, sync the conn-lost modal (shown once per outage, not on
+/// every failed poll; cleared when the link returns), and redraw. Inbound
+/// daemon lines fold into app state and may queue follow-up commands. Key
+/// events dispatch through handle_key; event::read() blocks, so a helper
+/// thread shuttles keys to keep the loop live. Any dead channel ends the
+/// loop: flush returning false means the conn task is gone, None from
+/// ev_rx means the conn task ended.
 async fn run(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     socket: PathBuf,
@@ -56,17 +65,15 @@ async fn run(
     let mut tick = tokio::time::interval(std::time::Duration::from_millis(500));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
-    // event::read() blocks; shuttle keys on a thread so the select loop stays live.
     let (key_tx, mut key_rx) = mpsc::unbounded_channel::<Event>();
     std::thread::spawn(move || {
         while let Ok(ev) = event::read() {
             if key_tx.send(ev).is_err() {
-                break; // UI gone
+                break;
             }
         }
     });
 
-    // the conn-lost modal opens once per outage, not on every failed poll
     let mut lost_modal_shown = false;
 
     loop {
@@ -104,7 +111,7 @@ async fn run(
                         let st = *status_rx.borrow();
                         terminal.draw(|f| ui::draw(f, &app, st))?;
                     }
-                    None => break, // conn task ended
+                    None => break,
                 }
             }
             Some(ev) = key_rx.recv() => {
@@ -135,7 +142,9 @@ fn flush(tx: &mut Tx, cmds: Vec<conn::Cmd>) -> bool {
     true
 }
 
-/// Returns true to exit.
+/// Dispatch a key press by modal. Ctrl-C always exits. Dismissing the
+/// conn-lost modal leaves the (stale) table on screen meanwhile; Esc in the
+/// pending modal dismisses it but the request stays queued.
 fn handle_key(app: &mut App, k: event::KeyEvent, out: &mut Vec<conn::Cmd>) -> bool {
     if k.modifiers.contains(KeyModifiers::CONTROL) && matches!(k.code, KeyCode::Char('c')) {
         return true;
@@ -160,13 +169,16 @@ fn handle_key(app: &mut App, k: event::KeyEvent, out: &mut Vec<conn::Cmd>) -> bo
         }
         Modal::ConnLost => {
             if matches!(k.code, KeyCode::Esc) {
-                app.modal = Modal::None; // view stale table meanwhile
+                app.modal = Modal::None;
             }
             false
         }
     }
 }
 
+/// Table-view keys. R reloads the config file's allow list (drift control
+/// without a restart); n snapshots the host interfaces when opened; number
+/// keys pick a sort column and pressing one again flips asc/desc.
 fn key_table(app: &mut App, k: event::KeyEvent, out: &mut Vec<conn::Cmd>) -> bool {
     match k.code {
         KeyCode::Char('q') => return true,
@@ -181,7 +193,6 @@ fn key_table(app: &mut App, k: event::KeyEvent, out: &mut Vec<conn::Cmd>) -> boo
         }
         KeyCode::Char('e') => app.revoke_focused(out),
         KeyCode::Char('d') => app.open_history(out),
-        // reload the config file's allow list (drift control without restart)
         KeyCode::Char('R') => {
             out.push(conn::cmd(
                 "a-reload",
@@ -190,7 +201,7 @@ fn key_table(app: &mut App, k: event::KeyEvent, out: &mut Vec<conn::Cmd>) -> boo
             ));
         }
         KeyCode::Char('n') => {
-            app.net = crate::ui::collect_ifaces(); // snapshot on open
+            app.net = crate::ui::collect_ifaces();
             app.modal = Modal::Net;
         }
         KeyCode::Char('!') => {
@@ -204,7 +215,6 @@ fn key_table(app: &mut App, k: event::KeyEvent, out: &mut Vec<conn::Cmd>) -> boo
                 app.ttl_edit = None;
             }
         }
-        // sort: number key picks column; pressing it again flips asc/desc
         KeyCode::Char(c) if ('1'..='9').contains(&c) => {
             let col = COLS[c as usize - '1' as usize];
             if app.sort == col {
@@ -230,11 +240,15 @@ fn cycle_sort(app: &mut App, back: bool) {
     };
 }
 
+/// Pending-modal keys. While the inline deny-note editor is open it owns
+/// all typing: Enter submits the note and Esc denies with an empty one.
+/// Otherwise Esc only dismisses (the request stays queued), a approves, d
+/// opens the note editor, t toggles the ttl override (digits-only seconds,
+/// mirroring the approve RPC param), n/Tab cycle the queue.
 fn key_pending(app: &mut App, k: event::KeyEvent, out: &mut Vec<conn::Cmd>) -> bool {
-    // inline deny-note editor owns all typing while open
     if app.deny_note.is_some() {
         match k.code {
-            KeyCode::Esc => app.deny_selected(None, out), // Esc denies with empty note
+            KeyCode::Esc => app.deny_selected(None, out),
             KeyCode::Enter => {
                 let note = std::mem::take(&mut app.deny_note);
                 app.deny_selected(note, out);
@@ -255,7 +269,7 @@ fn key_pending(app: &mut App, k: event::KeyEvent, out: &mut Vec<conn::Cmd>) -> b
     }
 
     match k.code {
-        KeyCode::Esc => app.modal = Modal::None, // dismiss; request stays queued
+        KeyCode::Esc => app.modal = Modal::None,
         KeyCode::Char('a') => app.approve_selected(out),
         KeyCode::Char('d') => app.deny_note = Some(String::new()),
         KeyCode::Char('t') => {
@@ -272,7 +286,6 @@ fn key_pending(app: &mut App, k: event::KeyEvent, out: &mut Vec<conn::Cmd>) -> b
             app.deny_note = None;
             app.ttl_edit = None;
         }
-        // ttl edit: seconds, digits only (grammar mirrors approve RPC param)
         KeyCode::Char(c) if app.ttl_edit.is_some() && c.is_ascii_digit() => {
             if let Some(t) = &mut app.ttl_edit {
                 t.push(c);
@@ -288,11 +301,13 @@ fn key_pending(app: &mut App, k: event::KeyEvent, out: &mut Vec<conn::Cmd>) -> b
     false
 }
 
+/// Detail-modal keys. 'e' revokes this detail row itself, wherever the
+/// table cursor happens to sit (unlike key_table's 'e', which targets the
+/// focused row).
 fn key_detail(app: &mut App, k: event::KeyEvent, out: &mut Vec<conn::Cmd>) -> bool {
     match k.code {
         KeyCode::Esc => app.modal = Modal::None,
         KeyCode::Char('e') => {
-            // revoke THIS detail row, wherever the table cursor sits
             if let Modal::Detail(id) = app.modal {
                 out.push(conn::cmd(
                     "a-revoke",
@@ -307,6 +322,7 @@ fn key_detail(app: &mut App, k: event::KeyEvent, out: &mut Vec<conn::Cmd>) -> bo
     false
 }
 
+/// History-modal keys: j/k move, r re-fetches the page.
 fn key_history(app: &mut App, k: event::KeyEvent, out: &mut Vec<conn::Cmd>) {
     match k.code {
         KeyCode::Esc => app.modal = Modal::None,
@@ -325,6 +341,8 @@ fn key_history(app: &mut App, k: event::KeyEvent, out: &mut Vec<conn::Cmd>) {
     }
 }
 
+/// Stop-confirm modal: the word "stop" must be typed exactly; Enter on
+/// wrong text cancels, and a mistyped prefix cancels immediately.
 fn key_stop(app: &mut App, k: event::KeyEvent, out: &mut Vec<conn::Cmd>) {
     match k.code {
         KeyCode::Esc => app.modal = Modal::None,
@@ -332,7 +350,7 @@ fn key_stop(app: &mut App, k: event::KeyEvent, out: &mut Vec<conn::Cmd>) {
             if app.stop_typed == "stop" {
                 app.stop_confirmed(out);
             } else {
-                app.modal = Modal::None; // Enter on wrong text cancels
+                app.modal = Modal::None;
             }
         }
         KeyCode::Backspace => {
@@ -341,7 +359,7 @@ fn key_stop(app: &mut App, k: event::KeyEvent, out: &mut Vec<conn::Cmd>) {
         KeyCode::Char(c) => {
             app.stop_typed.push(c);
             if !"stop".starts_with(&app.stop_typed) {
-                app.modal = Modal::None; // mistyped -> cancel
+                app.modal = Modal::None;
             }
         }
         _ => {}

@@ -1,7 +1,7 @@
-//! tethys-mcp: model-facing MCP server (stdio transport). Exactly ONE tool.
-//! It is a thin, stateless proxy: schema-validate → forward access.request to
-//! the tethysd over the unix socket → return the verdict string. It holds
-//! no approval power and no netfilter access.
+//! tethys-mcp: model-facing MCP server (stdio transport) with exactly one
+//! tool. It is a thin, stateless proxy: it validates against the schema,
+//! forwards access.request to tethysd over the unix socket, and returns the
+//! verdict string. It holds no approval power and no netfilter access.
 
 use std::path::PathBuf;
 
@@ -48,7 +48,7 @@ pub struct GrantRequest {
         description = "Why this traffic is needed for the engagement (shown verbatim to human approver)"
     )]
     pub reason: String,
-    #[schemars(description = "Tool you will use (nmap, sqlmap, ...) — shown to approver")]
+    #[schemars(description = "Tool you will use (nmap, sqlmap, ...); shown to the approver")]
     pub tool: String,
     #[schemars(description = "Requested TTL: Ns/Nm/Nh grammar, e.g. 15m")]
     pub ttl: String,
@@ -67,7 +67,7 @@ impl ScopeMcp {
     #[tool(
         description = "Request temporary network egress for a pentest target. BLOCKS until a human \
                        approver decides (or denies after timeout). Returns the EFFECTIVE grant \
-                       (ttl/port may be reduced) — obey it, not your request."
+                       (ttl/port may be reduced), so obey the return value, not your request."
     )]
     async fn request_traffic_grant(
         &self,
@@ -116,6 +116,10 @@ impl ScopeMcp {
 }
 
 impl ScopeMcp {
+    /// Forward one RPC over the daemon socket and read the single reply
+    /// line. The read deadline (6 minutes) only backstops a wedged daemon:
+    /// tethysd denies at its own approver timeout first, so a normal call
+    /// returns a verdict well before this fires.
     async fn ask(&self, rpc: &RpcRequest) -> Result<String, ErrorData> {
         tracing::debug!(id = %rpc.id, "connecting tethysd");
         let mut stream = UnixStream::connect(&self.sock)
@@ -131,7 +135,7 @@ impl ScopeMcp {
         let mut line = String::new();
         let mut reader = BufReader::new(&mut stream);
         let n = tokio::time::timeout(
-            std::time::Duration::from_secs(6 * 60), // tethysd denies at its own timeout first
+            std::time::Duration::from_secs(6 * 60),
             reader.read_line(&mut line),
         )
         .await
@@ -145,7 +149,7 @@ impl ScopeMcp {
     }
 }
 
-/// One-liner, e.g. "APPROVED: 203.0.113.7 tcp 443 granted for 15m (expires …)".
+/// One-liner, e.g. "APPROVED: 203.0.113.7 tcp 443 granted for 15m (expires ...)".
 fn render_verdict(r: &serde_json::Value) -> String {
     let v: tethys_core::protocol::Verdict = match serde_json::from_value(r.clone()) {
         Ok(v) => v,
@@ -220,10 +224,11 @@ impl ServerHandler for ScopeMcp {
     }
 }
 
+/// Logs go to stderr: stdout is the MCP channel.
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
-        .with_writer(std::io::stderr) // stdout is the MCP channel
+        .with_writer(std::io::stderr)
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
         )

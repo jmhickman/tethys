@@ -23,7 +23,7 @@ pub const SET_V6: &str = "grants_v6";
 pub const SET_CARVE_V4: &str = "carve_v4";
 pub const SET_CARVE_V6: &str = "carve_v6";
 /// Accounting chains (empty in the static baseline; contents owned here).
-/// Rules carry counters only — no verdict — so they cannot bypass egress.
+/// Rules carry counters and no verdict, so they cannot bypass egress.
 pub const CHAIN_ACCT_OUT: &str = "acct_out";
 pub const CHAIN_ACCT_IN: &str = "acct_in";
 /// Enforcement scope chain (empty in the baseline; flush-and-rebuild like
@@ -47,7 +47,11 @@ pub fn counter_in(gid: i64) -> String {
 }
 /// Per-grant match set for one direction+family: tethys_m7_out_v4 etc.
 pub fn acct_set(gid: i64, dir: Dir, v6: bool) -> String {
-    format!("tethys_m{gid}_{}{}", dir.slug(), if v6 { "_v6" } else { "" })
+    format!(
+        "tethys_m{gid}_{}{}",
+        dir.slug(),
+        if v6 { "_v6" } else { "" }
+    )
 }
 
 #[derive(Debug, Error)]
@@ -141,10 +145,11 @@ impl GrantElem {
         }
     }
 
+    /// Build the `[dst, proto, port]` concat key. CIDR destinations use
+    /// `prefix` objects because nft parses a slash string as a hostname.
     fn concat(&self) -> Value {
         let dst = match &self.dst {
             ElemDst::Ip(ip) => json!(ip.to_string()),
-            // Slash strings are parsed as hostnames; use prefix objects.
             ElemDst::Net(n) => {
                 json!({"prefix": {"addr": n.network().to_string(), "len": n.prefix_len()}})
             }
@@ -191,7 +196,7 @@ impl Batch {
         }
     }
 
-    /// Ensure our table exists (idempotent — nft treats add-existing as OK).
+    /// Ensure our table exists (idempotent: nft treats add-existing as OK).
     pub fn ensure_table(&mut self) {
         self.cmds
             .push(json!({"add":{"table":{"family":"inet","name":&self.table}}}));
@@ -212,18 +217,19 @@ impl Batch {
     }
 
     /// Idempotent add of table, grant sets, acct chains, scope, exempt counter.
+    /// The acct chains and scope chain are also declared by the static
+    /// baseline; ensuring them here lets dev runs work without it, and an
+    /// unhooked add is idempotent on this nft build.
     pub fn ensure_base(&mut self) {
         self.ensure_table();
         self.push_grant_set(SET_V4, "ip");
         self.push_grant_set(SET_V6, "ip6");
-        // Also declared by the static baseline; ensure here so dev runs work without it.
         for (chain, hook) in [(CHAIN_ACCT_OUT, "output"), (CHAIN_ACCT_IN, "input")] {
             self.cmds.push(json!({"add":{"chain":{
                 "family":"inet","table":&self.table,"name":chain,
                 "hook":hook,"type":"filter","prio":-10,"policy":"accept"
             }}}));
         }
-        // Unhooked add is idempotent on this nft build.
         self.cmds.push(json!({"add":{"chain":{
             "family":"inet","table":&self.table,"name":CHAIN_SCOPE
         }}}));
@@ -231,8 +237,9 @@ impl Batch {
     }
 
     /// Rebuild scope: policed uids `return` (egress drop continues); others
-    /// are counted and accepted. Empty list = host-wide (every packet faces
-    /// the caller's verdict) — used when `agent_user` cannot be resolved.
+    /// are counted and accepted. An empty list means host-wide (every packet
+    /// faces the caller's verdict), which is what happens when `agent_user`
+    /// cannot be resolved.
     pub fn rebuild_scope(&mut self, policed_uids: &[u32]) {
         self.cmds.push(json!({"flush":{"chain":{
             "family":"inet","table":&self.table,"name":CHAIN_SCOPE
@@ -272,7 +279,7 @@ impl Batch {
     }
 
     /// Allow-list element: same key as a grant, no timeout/comment.
-    /// Callers must `flush_carves()` first — deleting a missing element
+    /// Callers must `flush_carves()` first, because deleting a missing element
     /// aborts the whole nft batch.
     pub fn add_carve(&mut self, e: &GrantElem) {
         self.cmds.push(json!({"add":{"element":{
@@ -319,8 +326,6 @@ impl Batch {
         }}}));
     }
 
-    // Accounting: named counter, no verdict. Chains are flush + re-add.
-
     pub fn flush_chain(&mut self, chain: &str) {
         self.cmds.push(json!({"flush":{"chain":{
             "family":"inet","table":&self.table,"name":chain
@@ -362,6 +367,8 @@ impl Batch {
     }
 
     /// Count-only rule: match @set . proto variant . counter, no verdict.
+    /// Chains are rebuilt by flush + re-add. For the in direction the granted
+    /// host is the source of ingress packets, so address/port fields flip.
     pub fn add_acct_rule(&mut self, gid: i64, dir: Dir, proto: Proto, v6: bool) {
         let (chain, addr_field, port_field, af) = match dir {
             Dir::Out => (
@@ -370,7 +377,6 @@ impl Batch {
                 "dport",
                 if v6 { "ip6" } else { "ip" },
             ),
-            // replies: granted host is the source of ingress packets
             Dir::In => (
                 CHAIN_ACCT_IN,
                 "saddr",
@@ -479,6 +485,14 @@ impl NftCli {
     }
 }
 
+/// Run one JSON batch through the nft CLI on stdin and return stdout.
+/// A failed stdin write means nft never saw the batch, so it is surfaced as
+/// an error rather than letting the child fail or hang on empty stdin (an
+/// apply miss). Stdout/stderr handles are taken before waiting so the
+/// timeout path can still kill the child by &mut; on timeout the readers are
+/// reaped as well (the kill closes their pipes, so they should EOF promptly,
+/// but they are never left detached). Non-zero exit becomes
+/// [`NftError::Failed`] with the captured stderr.
 async fn run_nft_json(
     bin: &std::path::Path,
     payload: &str,
@@ -495,8 +509,6 @@ async fn run_nft_json(
     let mut child = cmd.spawn().map_err(NftError::Spawn)?;
     {
         use tokio::io::AsyncWriteExt;
-        // A failed write means nft never saw the batch: surface it instead of
-        // letting the child fail/hang on an empty stdin (apply miss).
         let mut si = child
             .stdin
             .take()
@@ -507,7 +519,6 @@ async fn run_nft_json(
         si.flush().await.map_err(NftError::Io)?;
         drop(si);
     }
-    // take handles so the timeout path can still kill the child by &mut
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
     let read_out = async move {
@@ -530,8 +541,6 @@ async fn run_nft_json(
         Ok(s) => s.map_err(NftError::Spawn)?,
         Err(_) => {
             let _ = child.start_kill();
-            // Reap the readers too: kill closes the pipes so they should EOF
-            // promptly, but never leave them detached on our own timeout.
             let _ = tokio::time::timeout(timeout, async {
                 let _ = read_out.await;
                 let _ = read_err.await;
@@ -552,6 +561,15 @@ async fn run_nft_json(
 }
 
 /// Parse `nft --json list table` + `list counters` output into PollState.
+/// Live grant elements arrive as `{"elem":{"val":{"concat":[...]},
+/// "expires":f}}` with `expires` and `comment` siblings of `val`; the parser
+/// also tolerates an `expires` nested inside `val`. The kernel echoes proto
+/// numerically in some contexts, so a non-string concat slot 1 maps 6 to tcp
+/// and anything else to udp. A malformed element (bad dst, wrong concat
+/// arity, short or non-array port range) is skipped, never fatal: boot
+/// reconcile and the stats poller share this parser and must survive odd
+/// output rather than panic (OOBIDX-001). Counters are keyed by name,
+/// restricted to the given table.
 pub fn parse_poll(doc: &Value, counters: &Value, tname: &str) -> PollState {
     let mut elements = Vec::new();
     if let Some(arr) = doc.get("nftables").and_then(|v| v.as_array()) {
@@ -569,11 +587,9 @@ pub fn parse_poll(doc: &Value, counters: &Value, tname: &str) -> PollState {
                 continue;
             };
             for el in elems {
-                // live shape: {"elem":{"val":{"concat":[...]},"expires":f}}
                 let wrapper = el.get("elem");
                 let val = wrapper.and_then(|e| e.get("val")).or(el.get("val"));
                 let Some(val) = val else { continue };
-                // expires is a sibling of val (on the elem wrapper); tolerate both
                 let expires = wrapper
                     .and_then(|w| w.get("expires"))
                     .or_else(|| val.get("expires"))
@@ -601,7 +617,6 @@ pub fn parse_poll(doc: &Value, counters: &Value, tname: &str) -> PollState {
                 let proto = match concat[1].as_str() {
                     Some("tcp") => Proto::Tcp,
                     Some("udp") => Proto::Udp,
-                    // kernel echoes proto numerically in some contexts
                     Some(_) | None => {
                         if concat[1].as_u64() == Some(6) {
                             Proto::Tcp
@@ -615,8 +630,6 @@ pub fn parse_poll(doc: &Value, counters: &Value, tname: &str) -> PollState {
                         let p = n.as_u64().unwrap_or(0) as u16;
                         (p, p)
                     }
-                    // OOBIDX-001: nft echoes what we wrote, but a short or
-                    // non-array range must skip the element, not panic boot.
                     v if v.get("range").is_some() => {
                         let Some(r) = v
                             .get("range")
@@ -681,10 +694,11 @@ mod tests {
         s.parse().unwrap()
     }
 
+    // OOBIDX-001: short, non-array, and null ranges must skip the element
+    // rather than panic, since boot reconcile and the stats poller share this
+    // parser. Only the well-formed 2-element range loads.
     #[test]
     fn parse_poll_survives_malformed_ranges() {
-        // OOBIDX-001: short / non-array / null ranges must skip, never panic
-        // (boot reconcile and the stats poller share this parser).
         let doc = serde_json::json!({"nftables": [
             {"set": {"name": "grants_v4", "elem": [
                 {"elem": {"val": {"concat": ["10.0.0.1", "tcp", {"range": [80]}]}}},
@@ -732,6 +746,9 @@ mod tests {
         assert!(s.contains("\"range\":[0,65535]"));
     }
 
+    // serde_json sorts keys, so assert against the parsed structure rather
+    // than substrings. The grant add must carry the elem wrapper with its
+    // expires value and tethys:g7 comment.
     #[test]
     fn grant_add_uses_elem_wrapper() {
         let mut b = Batch::new();
@@ -745,7 +762,6 @@ mod tests {
             7,
         );
         let j: serde_json::Value = serde_json::from_str(&b.to_json()).unwrap();
-        // serde_json sorts keys; check structure, not substrings
         let cmds = j["nftables"].as_array().unwrap();
         assert_eq!(cmds[0]["add"]["element"]["name"], "grants_v4");
         let e0 = &cmds[0]["add"]["element"]["elem"][0];
@@ -754,6 +770,9 @@ mod tests {
         assert_eq!(e0["elem"]["comment"], "tethys:g7");
     }
 
+    // Checks that carve sets carry no timeout flag, that the batch orders
+    // sets, then flushes, then the element, and that the carve element is a
+    // plain concat with no expires/comment wrapper.
     #[test]
     fn carve_batch_shape() {
         let mut b = Batch::new();
@@ -768,15 +787,12 @@ mod tests {
             .as_array()
             .unwrap()
             .clone();
-        // carve sets have no timeout flag
         let s0 = &cmds[0]["add"]["set"];
         assert_eq!(s0["name"], "carve_v4");
         assert_eq!(s0["flags"], json!(["interval"]));
-        // [0,1]=sets, [2,3]=flushes, [4]=elem
         assert!(cmds[2]["flush"]["set"]["name"].as_str() == Some("carve_v4"));
         let e = &cmds[4]["add"]["element"];
         assert_eq!(e["name"], "carve_v4");
-        // plain concat, no expires/comment wrapper
         assert_eq!(e["elem"][0]["concat"][1], json!("tcp"));
         assert!(e["elem"][0]["concat"].is_array());
     }
@@ -807,17 +823,17 @@ mod tests {
     }
 
     #[test]
+    // Flush only: no accept rule, all packets fall through to the drop.
     fn scope_empty_list_means_no_exempt_rule() {
         let mut b = Batch::new();
         b.rebuild_scope(&[]);
-        // flush only: no accept rule, all packets fall through to drop
         assert_eq!(b.cmds.len(), 1);
         assert!(b.cmds[0].get("flush").is_some());
     }
 
     /// Every command must target the batch's table. A missed substitution
-    /// deletes from the wrong table (ENOENT) and used to break revoke/stop
-    /// under a non-default nft_table.
+    /// deletes from the wrong table (ENOENT), which used to break revoke and
+    /// stop runs under a non-default nft_table.
     #[test]
     fn every_command_targets_the_batches_table() {
         let mut b = Batch::with_table("tethys_alt");
@@ -841,13 +857,13 @@ mod tests {
         b.delete_counter("g7_out");
         b.delete_set("tethys_m7_out");
 
+        // Table references come in two shapes: `"table": "name"` inside
+        // element/rule ops, or `"table": {"family":..,"name":..}`.
         fn walk(v: &Value, hits: &mut Vec<(String, Value)>) {
             match v {
                 Value::Object(m) => {
                     for (k, x) in m {
                         if k == "table" {
-                            // two shapes: `"table": "name"` inside element/
-                            // rule ops, or `"table": {"family":..,"name":..}`
                             match x {
                                 Value::String(_) => hits.push((k.clone(), x.clone())),
                                 Value::Object(_) => {
@@ -879,6 +895,10 @@ mod tests {
         assert!(!hits.is_empty(), "batch emitted no table references at all");
     }
 
+    // The in-direction v6 rule must match ip6 saddr . l4proto . udp sport,
+    // count into tethys_g7_in, and carry no verdict expr; the out-direction
+    // set uses daddr/dport keys (cmds[2]) while the in-direction element
+    // (cmds[3]) lands in tethys_m7_in with the prefix encoding.
     #[test]
     fn acct_rule_is_counter_only_with_correct_fields() {
         let mut b = Batch::new();
@@ -899,8 +919,6 @@ mod tests {
         let cmds = j["nftables"].as_array().unwrap();
 
         assert_eq!(cmds[0]["flush"]["chain"]["name"], CHAIN_ACCT_OUT);
-        // In-direction + v6: rule must match ip6 saddr . l4proto . udp sport,
-        // count into tethys_g7_in, and carry NO verdict expr.
         let r = &cmds[4]["add"]["rule"];
         assert_eq!(r["chain"], CHAIN_ACCT_IN);
         assert_eq!(r["comment"], "tethys:g7:in");
@@ -916,8 +934,6 @@ mod tests {
             .as_str()
             .unwrap()
             .starts_with("@tethys_m7_in"));
-        // out-direction set uses daddr/dport keys (cmds[2]); the in-direction
-        // element (cmds[3]) lands in tethys_m7_in with the safe prefix encoding.
         let s_out = &cmds[2]["add"]["set"];
         assert_eq!(s_out["name"], "tethys_m7_out");
         assert_eq!(

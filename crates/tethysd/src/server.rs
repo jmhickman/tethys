@@ -2,11 +2,11 @@
 //! reconcilers, and the MCP-side `access.request` pipeline.
 //!
 //! `mcp.sock` accepts requests but cannot approve; approvals arrive on
-//! `admin.sock` (0600, see [`crate::admin`]). No approver connected → deny
-//! immediately; silent past timeout → auto-deny.
+//! `admin.sock` (0600, see [`crate::admin`]). With no approver connected the
+//! daemon denies immediately; silent past timeout, it auto-denies.
 //!
 //! Kernel install/teardown lives in [`crate::install`], boot reconciliation
-//! in [`crate::reconcile`] — the same split tethys got in the last round.
+//! in [`crate::reconcile`], the same split tethys got in the last round.
 
 use std::collections::HashMap;
 use std::os::unix::fs::PermissionsExt;
@@ -89,6 +89,19 @@ impl Drop for CountGuard {
     }
 }
 
+/// Start the daemon: ledger actor, kernel base install (idempotent; fail
+/// startup if it fails so enforcement is never off), carve and scope
+/// install, boot reconcile, sockets, reconciler tasks, accept loops.
+/// bind() creates a socket inode at 0777&~umask and it is live immediately,
+/// so a connect() before a follow-up chmod would hold a permanent admin
+/// session (socket perms are checked at connect only; TOCTOU-001). The fix
+/// is to tighten umask so both sockets are born owner-rw-only, then restore
+/// via the guard: admin.sock stays 0600, and mcp.sock is widened to
+/// agent_user's group once pinned (identity is still checked per connection
+/// via SO_PEERCRED; with no resolved gid it stays owner-only, which in dev
+/// means whoever started the daemon). The umask helper is the workspace's
+/// only unsafe block (unsafe_code="deny" exception; umask(2) is a plain,
+/// thread-safe libc call).
 pub async fn run(cfg: Config) -> anyhow::Result<()> {
     let (ledger, _actor) = Ledger::open(&cfg.db)?;
     let st = Arc::new(State {
@@ -102,7 +115,6 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
         pending_budget: Arc::new(Semaphore::new(256)),
     });
 
-    // Idempotent; fail startup if install fails so enforcement is never off.
     if !st.cfg.dry_run {
         let mut b = Batch::with_table(&st.cfg.nft_table);
         b.ensure_base();
@@ -121,15 +133,7 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
     for path in [&st.cfg.mcp_socket, &st.cfg.admin_socket] {
         let _ = std::fs::remove_file(path);
     }
-    // TOCTOU-001: bind() creates the inode at 0777&~umask and it is live
-    // immediately; a connect() before the chmod would hold a permanent
-    // admin session (socket perms are checked at connect only). Tighten
-    // umask so both sockets are born owner-rw-only, then restore. admin.sock
-    // stays 0600; mcp.sock is widened to its group below when pinned.
-    //
-    // The workspace unsafe_code="deny" exception: umask(2) is a plain,
-    // thread-safe libc call; audited and scoped to this one helper.
-    #[allow(unsafe_code)] // audited: the only unsafe in the workspace
+    #[allow(unsafe_code)]
     fn set_umask(mask: libc::mode_t) -> libc::mode_t {
         unsafe { libc::umask(mask) }
     }
@@ -151,9 +155,6 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
         0o600,
         "admin.sock must be born 0600 (umask-guarded bind)"
     );
-    // mcp.sock: reachable only by agent_user's group (identity is still checked
-    // per connection via SO_PEERCRED); with no resolved gid the socket stays
-    // owner-only, which in dev means whoever started the daemon.
     if let Some(gid) = st.cfg.mcp_sock_gid {
         use std::os::unix::fs::{chown, PermissionsExt};
         chown(&st.cfg.mcp_socket, None, Some(gid))?;
@@ -197,11 +198,14 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
 }
 
 /// Kernel reaps elements via TTL; this loop flips ledger rows + notifies.
+/// Every 2s it lists Approved (not active(): active() hides the expired rows
+/// this loop is about to flip), marks lapsed rows expired, and once the
+/// kernel has reaped the elements, mirrors the ledger into the accounting
+/// chains and drops dead objects.
 fn spawn_expiry_reconciler(st: Arc<State>) {
     tokio::spawn(async move {
         loop {
             tokio::time::sleep(Duration::from_secs(2)).await;
-            // list(Approved), not active(): active() hides expired rows this loop flips.
             let approved = st.ledger.list(GrantState::Approved).await;
             let now = now_secs() as f64;
             let expired: Vec<i64> = approved
@@ -220,8 +224,6 @@ fn spawn_expiry_reconciler(st: Arc<State>) {
                         },
                     );
                 }
-                // kernel already reaped the elements (TTL); now mirror the
-                // ledger into accounting chains and drop dead objects.
                 if let Err(e) = rebuild_acct(&st).await {
                     tracing::warn!(%e, "acct rebuild after expiry failed");
                 }
@@ -308,7 +310,9 @@ pub(crate) enum Frame {
 
 /// One line from a BufReader: never buffers more than MAX_FRAME bytes and
 /// never waits longer than IDLE_TIMEOUT. Shared by the mcp and admin loops
-/// (admin.sock is root-only, but it shares the slow-loris pattern).
+/// (admin.sock is root-only, but it shares the slow-loris pattern). The
+/// trailing LF/CRLF is trimmed and invalid utf8 degrades lossy, never
+/// panics.
 pub(crate) async fn read_frame<R: AsyncBufRead + Unpin>(r: &mut R, buf: &mut Vec<u8>) -> Frame {
     buf.clear();
     match tokio::time::timeout(IDLE_TIMEOUT, r.read_until(b'\n', buf)).await {
@@ -319,7 +323,6 @@ pub(crate) async fn read_frame<R: AsyncBufRead + Unpin>(r: &mut R, buf: &mut Vec
     if buf.len() > MAX_FRAME {
         return Frame::TooLong;
     }
-    // trim trailing LF/CRLF; invalid utf8 degrades lossy, never panics
     let s = String::from_utf8_lossy(buf)
         .trim_end_matches(['\n', '\r'])
         .to_string();
@@ -328,9 +331,22 @@ pub(crate) async fn read_frame<R: AsyncBufRead + Unpin>(r: &mut R, buf: &mut Vec
 
 // ------------------------------------------------------------------ MCP side
 
+/// Serve one mcp.sock client until EOF or protocol breach. Peer gating fails
+/// CLOSED: with a pinned uid configured, an unreadable credential is grounds
+/// for rejection, never an anonymous pass. Replies flow through a bounded
+/// queue so a client that stops reading throttles its own requests instead
+/// of buffering replies in daemon RAM (RESEXHAUST-001). Each frame is read
+/// with the capped, idle-timed reader (RESEXHAUST-003) and only
+/// access.request is served; excess frames past MAX_INFLIGHT are rejected at
+/// the gate (no task spawned, no ledger row). The in-flight count increments
+/// synchronously so it can never race the EOF drain, and its guard rides into
+/// the task to decrement on drop including panic unwind (ATOMICRACE-002; the
+/// old respond-closure decrement missed panics and wedged this loop). The
+/// connection must outlive in-flight requests because approval can arrive
+/// minutes later, so after EOF the writer channel is dropped (clones live in
+/// the tasks) and the loop drains with a bounded deadline; the guards make
+/// the drain a formality, but it never spins forever.
 async fn handle_mcp(stream: UnixStream, st: Arc<State>) {
-    // Fail CLOSED: with a pinned uid configured, an unreadable peer credential
-    // is grounds for rejection — never an anonymous pass.
     if let Some(want) = st.cfg.mcp_peer_uid {
         match peer_cred(&stream) {
             Some(c) if c.uid() == want => {}
@@ -341,8 +357,6 @@ async fn handle_mcp(stream: UnixStream, st: Arc<State>) {
         }
     }
     let (r, mut w) = stream.into_split();
-    // RESEXHAUST-001: bounded reply queue — a client that stops reading
-    // throttles its own requests instead of buffering replies in daemon RAM.
     let (resp_tx, mut resp_rx) = tokio::sync::mpsc::channel::<String>(64);
     let writer = tokio::spawn(async move {
         while let Some(line) = resp_rx.recv().await {
@@ -353,12 +367,10 @@ async fn handle_mcp(stream: UnixStream, st: Arc<State>) {
         }
         tracing::debug!("mcp writer task exiting (channel closed)");
     });
-    // Connection must outlive in-flight requests; approval can arrive minutes later.
     let inflight = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let mut reader = BufReader::new(r);
     let mut buf: Vec<u8> = Vec::with_capacity(4096);
     loop {
-        // RESEXHAUST-003: capped frame + idle timeout, never unbounded lines()
         let line = match read_frame(&mut reader, &mut buf).await {
             Frame::Line(s) => s,
             Frame::TooLong => {
@@ -391,8 +403,6 @@ async fn handle_mcp(stream: UnixStream, st: Arc<State>) {
                 .await
                 .ok();
         } else {
-            // RESEXHAUST-001: per-connection fan-out cap — excess frames are
-            // rejected at the gate: no task spawned, no ledger row.
             if inflight.load(Ordering::SeqCst) >= MAX_INFLIGHT {
                 resp_tx
                     .send(rpc_err_str(&req.id, -32000, "too many in-flight requests"))
@@ -400,17 +410,12 @@ async fn handle_mcp(stream: UnixStream, st: Arc<State>) {
                     .ok();
                 continue;
             }
-            // ATOMICRACE-002: increment synchronously (can never race the EOF
-            // drain below); the guard rides into the task and decrements on
-            // drop — including panic unwind, which the old respond-closure
-            // decrement missed, wedging this loop forever.
             let guard = CountGuard::inc(&inflight);
             dispatch_access(req, st.clone(), resp_tx.clone(), guard);
         }
     }
     tracing::debug!("mcp client EOF; awaiting in-flight tasks");
-    drop(resp_tx); // our copy goes; clones live in in-flight tasks
-                   // Bounded drain: the guards make this a formality, but never spin forever.
+    drop(resp_tx);
     let deadline =
         tokio::time::Instant::now() + Duration::from_secs(st.cfg.approver_timeout_secs + 30);
     while inflight.load(Ordering::SeqCst) > 0 && tokio::time::Instant::now() < deadline {
@@ -423,7 +428,30 @@ async fn handle_mcp(stream: UnixStream, st: Arc<State>) {
     let _ = writer.await;
 }
 
-/// access.request pipeline: validate → dedup → ledger → human or auto-deny.
+/// access.request pipeline: validate, dedup, ledger, then human approval or
+/// auto-deny. Replies go through the respond! macro with an awaited send on
+/// the bounded queue, so a client that stops reading backpressures this task
+/// rather than daemon RAM (RESEXHAUST-001). An active identical grant
+/// short-circuits as AlreadyGranted before any ledger write. The daemon-wide
+/// pending budget is checked before the insert so an over-budget burst leaves
+/// no rows and no popups; the permit lives for this task, the human
+/// round-trip window. With no approver online the request is denied
+/// immediately rather than queued.
+/// A duplicate idem key means redelivery: no re-popup, the original row's
+/// verdict is replayed instead. On approval the DNS resolution is persisted
+/// BEFORE the approve flip (the row is still pending, so rollback stays a
+/// legal pending->denied). If that write fails, revoke could later re-derive
+/// different IPs and leak the installed elements until TTL, so the grant is
+/// uninstalled and denied (fail closed, RESDISC-002). nft apply failure
+/// keeps the kernel's prior state and denies rather than half-installing.
+/// Accounting rebuilds are best-effort: stats never gate enforcement. A
+/// dropped decision channel (shutdown) and an approver timeout both deny.
+/// Whatever path produced the verdict, the pending map entry is removed
+/// before replying: timed-out requests used to leak map entries forever
+/// (admin removals only covered rows an admin actually decided) and a late
+/// approve on a dead gid replied queued:true for an already-denied grant
+/// (CHANSTARVE-001). Every verdict with a row also emits EV_DECIDED;
+/// offline denies have neither.
 fn dispatch_access(
     req: RpcRequest,
     st: Arc<State>,
@@ -431,11 +459,8 @@ fn dispatch_access(
     inflight_guard: CountGuard,
 ) {
     tokio::spawn(async move {
-        // held for the whole task; releases the connection's count on any exit
         let _inflight = inflight_guard;
         let id = req.id.clone();
-        // awaited send on the bounded queue: a client that stops reading
-        // backpressures this task, not daemon RAM (RESEXHAUST-001)
         macro_rules! respond {
             ($s:expr) => {{
                 tracing::debug!(id = %id, len = $s.len(), "responding on mcp conn");
@@ -469,7 +494,6 @@ fn dispatch_access(
             }
         };
 
-        // dedup: already covered by an active identical grant?
         let active = st.ledger.active().await;
         if let Some(g) = active.iter().find(|g| {
             g.target == target.canonical()
@@ -488,9 +512,6 @@ fn dispatch_access(
             return;
         }
 
-        // RESEXHAUST-001: daemon-wide pending budget, checked before the
-        // ledger insert so an over-budget burst leaves no rows and no popups.
-        // The permit lives for this task — the human round-trip window.
         let _pending_permit = match st.pending_budget.clone().try_acquire_owned() {
             Ok(pr) => pr,
             Err(_) => {
@@ -504,7 +525,6 @@ fn dispatch_access(
             }
         };
 
-        // No approver connected: deny immediately rather than queueing.
         if st.admins_online.load(Ordering::SeqCst) == 0 {
             let resp = RpcResponse::ok(
                 &id,
@@ -537,7 +557,6 @@ fn dispatch_access(
         {
             Some(gid) => gid,
             None => {
-                // UNIQUE idem_key = redelivery. Do not re-popup; return the original row.
                 match st.ledger.find_by_idem(&id).await {
                     Some(orig) => respond!(replay_verdict(&orig)),
                     None => respond!(rpc_err_str(&id, -32001, "duplicate request id")),
@@ -553,7 +572,6 @@ fn dispatch_access(
         emit(
             &st,
             method::EV_REQUEST_NEW,
-            // created_at lets a reconnecting TUI render honest "waiting m:ss"
             EvRequestNew {
                 grant_id: gid.to_string(),
                 target: popup_target,
@@ -578,11 +596,6 @@ fn dispatch_access(
                 {
                     Ok((eff, dsts)) => {
                         let exp = ttl_expires(granted);
-                        // Persist this DNS resolution BEFORE the approve flip
-                        // (row still pending, so rollback is a legal
-                        // pending->denied). RESDISC-002: if the write fails,
-                        // revoke could later re-derive different IPs and leak
-                        // the installed elements until TTL — fail closed.
                         let dst_json = serde_json::to_string(
                             &dsts.iter().map(|d| d.canonical()).collect::<Vec<_>>(),
                         )
@@ -599,8 +612,6 @@ fn dispatch_access(
                                     },
                                 )
                                 .await;
-                            // fall through the shared verdict path (pending
-                            // cleanup + EV_DECIDED + respond happen there)
                             Verdict::Denied {
                                 reason_code: DenyReason::InstallFailed,
                                 grant_id: Some(gid.to_string()),
@@ -618,7 +629,6 @@ fn dispatch_access(
                                 note: Some("ledger state flip failed; retry".into()),
                             }
                         } else {
-                            // Accounting is best-effort; stats never gate enforcement.
                             if let Err(e) = rebuild_acct(&st).await {
                                 tracing::warn!(gid, %e, "acct rebuild failed (stats degraded only)");
                             }
@@ -641,7 +651,6 @@ fn dispatch_access(
                         }
                     }
                     Err(e) => {
-                        // nft apply failed: kernel keeps prior state; deny rather than half-install.
                         tracing::error!(gid, %e, "nft install failed — denying");
                         st.ledger
                             .decide(
@@ -676,7 +685,6 @@ fn dispatch_access(
                     note,
                 }
             }
-            // Err(RecvError)=sender dropped (shutdown) or Elapsed=approver silent → both deny
             Ok(Err(_)) | Err(_) => {
                 st.ledger
                     .decide(
@@ -695,15 +703,9 @@ fn dispatch_access(
             }
         };
 
-        // CHANSTARVE-001: the decision channel is dead weight once a verdict
-        // exists, whatever path produced it. Without this, timed-out requests
-        // leaked map entries forever (admin removals only covered rows an
-        // admin actually decided) and a late approve on a dead gid replied
-        // queued:true for an already-denied grant.
         st.pending.lock().await.remove(&gid);
 
         let resp = RpcResponse::ok(&id, &verdict);
-        // Notify TUI for every verdict that has a row. Offline denies have neither.
         if let Verdict::Denied {
             grant_id: Some(gid),
             reason_code,
@@ -726,6 +728,11 @@ fn dispatch_access(
 
 // ------------------------------------------------------------------- helpers
 
+/// Exactly one target field must be set. Host spellings are validated then
+/// lowercased: DNS identity is case-insensitive, and canonicalizing here
+/// means dedup, the ledger target, and config `allow` (already lowercased)
+/// share one identity, so case-churn can no longer mint duplicate
+/// grants/popups/kernel elements for the same host (STRCMP-001).
 fn pick_target(p: &AccessRequestParams) -> Result<Target, SpecError> {
     let given = [&p.dst_host, &p.dst_ip, &p.dst_net]
         .iter()
@@ -742,10 +749,6 @@ fn pick_target(p: &AccessRequestParams) -> Result<Target, SpecError> {
         if !ok {
             return Err(SpecError::BadHost(h.clone()));
         }
-        // STRCMP-001: DNS identity is case-insensitive; canonicalize now so
-        // dedup, the ledger target, and config `allow` (already lowercased)
-        // share one identity. Case-churn can no longer mint duplicate
-        // grants/popups/kernel elements for the same host.
         return Ok(Target::Host(h.to_ascii_lowercase()));
     }
     if let Some(i) = &p.dst_ip {
@@ -765,12 +768,15 @@ fn cap_ttl(d: Duration, st: &State) -> Duration {
     d.min(max)
 }
 
-/// Verdict for a redelivered request id. No second popup.
+/// Verdict for a redelivered request id. No second popup. A pending
+/// original is not a grant: the replay is denied as AlreadyPending with an
+/// explicit note not to treat it as granted. Expired/revoked originals tell
+/// the caller to re-request under a new id; a denied original replays its
+/// ORIGINAL denial, reason code and human note included.
 fn replay_verdict(orig: &GrantRow) -> String {
     let gid = orig.id.to_string();
     let d = match orig.state {
         GrantState::Pending => Verdict::Denied {
-            // Pending original is not a grant; deny the replay, no second popup.
             reason_code: DenyReason::AlreadyPending,
             grant_id: Some(gid.clone()),
             note: Some(
@@ -795,7 +801,6 @@ fn replay_verdict(orig: &GrantRow) -> String {
             )),
         },
         GrantState::Denied => Verdict::Denied {
-            // replay the ORIGINAL denial, reason and human note included
             reason_code: match orig.deny_code.as_ref() {
                 Some(DenyCode::ApproverOffline) => DenyReason::ApproverOffline,
                 Some(DenyCode::ApproverTimeout) => DenyReason::ApproverTimeout,
@@ -823,7 +828,9 @@ pub fn fmt_unix(secs: f64) -> String {
 }
 
 /// Broadcast one event to connected approvers. Serialization failure is
-/// logged and the event dropped — a daemon never panics on the wire.
+/// logged and the event dropped; a daemon never panics on the wire. The
+/// envelope is a JSON-RPC request minus its id: notifications carry no id
+/// member.
 pub(crate) fn emit(st: &State, method: &str, params: impl Serialize) {
     let params = match serde_json::to_value(params) {
         Ok(v) => v,
@@ -845,7 +852,7 @@ pub(crate) fn emit(st: &State, method: &str, params: impl Serialize) {
         }
     };
     if let Some(m) = o.as_object_mut() {
-        m.remove("id"); // notifications carry no id member
+        m.remove("id");
     }
     match serde_json::to_string(&o) {
         Ok(mut s) => {
@@ -881,6 +888,8 @@ mod tests {
         assert_eq!(fmt_unix(1_757_925_600.0), "2025-09-15T08:40:00Z");
     }
 
+    // TUI-spoofing control sequences (CR/LF/ESC/NUL) are stripped and free
+    // text is truncated to the row budget.
     #[test]
     fn sanitize_strips_control_and_truncates() {
         let evil = "ok\r\n\x1b[31mGK: APPROVE ALL\x00";
@@ -889,6 +898,11 @@ mod tests {
         assert!(sanitize(&"x".repeat(9999)).len() <= 280);
     }
 
+    // Each original state maps to its replay verdict: approved replays as
+    // already_granted, expired/revoked deny with grant_expired, denied
+    // replays the original reason code and note, pending denies as
+    // already_pending. The reply id always equals the replayed request
+    // id (idem key).
     #[test]
     fn replay_verdict_per_state() {
         let row = |state: GrantState, deny: Option<DenyCode>, note: Option<&str>| GrantRow {
@@ -935,13 +949,15 @@ mod tests {
         assert_eq!(v["result"]["reason_code"], "human_denied");
         assert_eq!(v["result"]["note"], "out of scope");
 
-        // reply id must equal the replayed request id (idem key)
         let v = parse(replay_verdict(&row(GrantState::Pending, None, None)));
         assert_eq!(v["id"], "req-abc");
         assert_eq!(v["result"]["decision"], "denied");
         assert_eq!(v["result"]["reason_code"], "already_pending");
     }
 
+    // Zero or two target fields are rejected, shell metacharacters must not
+    // pass the host check, CIDR parses, and case variants canonicalize to
+    // one identity (STRCMP-001).
     #[test]
     fn target_cardinality_enforced() {
         let p = AccessRequestParams {
@@ -984,7 +1000,6 @@ mod tests {
         };
         assert_eq!(pick_target(&p4).unwrap().canonical(), "net:172.16.0.0/12");
 
-        // STRCMP-001: case variants canonicalize to one identity
         let p5 = AccessRequestParams {
             dst_host: Some("Api.X.COM".into()),
             ..p.clone()

@@ -13,11 +13,18 @@ fn grant_gid_of_comment(c: &Option<String>) -> Option<i64> {
 }
 
 /// Reconcile ledger against kernel truth at startup (see policy block above).
+/// If the kernel cannot be read, treat that as no grants (fail closed). An
+/// approved row is adopted iff a live attributed element exists and its expiry
+/// has not passed; every other approved row is reaped. Pending rows cannot
+/// survive restart because their oneshot decision channels died with the
+/// process, so they are denied as orphans. Live elements with no matching
+/// ledger row (a crash between nft apply and ledger flip) are left for the
+/// kernel TTL, and unattributed elements only warn. Accounting is derived
+/// state (counters only) and is rebuilt from the adopted set.
 pub(crate) async fn reconcile_on_boot(st: &Arc<State>) {
     let elements = match st.nft.poll_live(&st.cfg.nft_table).await {
         Ok(p) => p.elements,
         Err(e) => {
-            // Can't read kernel: treat as no grants (fail closed).
             tracing::error!(%e, "reconcile: cannot read nft state; reaping all ledger rows");
             Vec::new()
         }
@@ -27,7 +34,6 @@ pub(crate) async fn reconcile_on_boot(st: &Arc<State>) {
         .filter_map(|el| grant_gid_of_comment(&el.comment))
         .collect();
 
-    // Adopt approved rows iff a live attributed element exists and expiry has not passed.
     let now = now_secs() as f64;
     let mut adopted: HashSet<i64> = HashSet::new();
     for g in st.ledger.list(GrantState::Approved).await {
@@ -57,7 +63,6 @@ pub(crate) async fn reconcile_on_boot(st: &Arc<State>) {
         tracing::info!(gid = g.id, "reconcile: reaped stale approved row");
     }
 
-    // Pending cannot survive restart: oneshot channels died with the process.
     for g in st.ledger.list(GrantState::Pending).await {
         st.ledger
             .decide(
@@ -72,8 +77,6 @@ pub(crate) async fn reconcile_on_boot(st: &Arc<State>) {
             .audit("reconcile", g.id, "pending row denied: orphaned by restart");
     }
 
-    // Orphaned live elements (crash between nft apply and ledger flip): leave
-    // for kernel TTL. Unattributed elements: warn only.
     for el in &elements {
         match grant_gid_of_comment(&el.comment) {
             Some(gid) if !adopted.contains(&gid) => {
@@ -88,7 +91,6 @@ pub(crate) async fn reconcile_on_boot(st: &Arc<State>) {
         }
     }
 
-    // Accounting is derived state (counters only) — rebuild from the adopted set.
     if let Err(e) = crate::install::rebuild_acct(st).await {
         tracing::warn!(%e, "reconcile: acct rebuild failed");
     }

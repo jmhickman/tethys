@@ -346,7 +346,7 @@ The response is the *effective* grant. The request's TTL may have been reduced
 by either the `max_ttl` configuration value or by the approver. The ports may have
 been adjusted as well.
 
-⚠️ Be aware that setting the `agent_user` configuration value incorrectly will cause
+⚠️ Setting the `agent_user` configuration value incorrectly will cause
 loss of connectivity from the MCP server to the grant submission socket. 
 
 ## OPERATIONS
@@ -355,7 +355,7 @@ The approver's console application is the `tethys` binary. It should be run as r
 or via sudo:
 
 The application presents a TUI with a small information bar. Pending
-requests appear as they arrive as a modal dialog. Approving a grant applies the
+requests appear as a modal dialog when they arrive. Approving a grant applies the
 requested attributes to the active firewall rules. The elements are then displayed
 in a row. You may punch into the selected row for more details via Enter. All requests,
 whether approved or denied, are recorded in a sqlite ledger. The ledger is 
@@ -379,8 +379,8 @@ pipes.
 `uninstall.sh` (shipped beside `install.sh` in the release archive) removes
 a host deployment. 
 
-The configuration file and the SQLite ledger survive by default as the ledger 
-is an audting artifact. Pass `--purge` to remove them as well.
+The configuration file and the SQLite ledger survive by default as the ledger
+is an auditing artifact. Pass `--purge` to remove them as well.
 
 ```sh
 sh uninstall.sh            # remove enforcement and binaries, keep config + ledger

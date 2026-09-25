@@ -63,7 +63,7 @@ pub struct LiveRow {
     pub ttl_secs: u64,
     pub reason: String,
     pub tool: String,
-    // kernel truth (traffic.stat); None until first poll covers this grant
+    /// Kernel truth (traffic.stat); None until the first poll covers this grant.
     pub left: Option<u64>,
     pub bytes_up: Option<u64>,
     pub bytes_down: Option<u64>,
@@ -197,8 +197,8 @@ impl App {
         self.sorted_live().get(self.sel).map(|r| r.id)
     }
 
+    /// Oldest first: the blocked model at the head of the queue.
     pub fn pending_ids(&self) -> Vec<i64> {
-        // oldest first: the blocked model at the head of the queue
         let mut ids: Vec<i64> = self.pending.keys().copied().collect();
         ids.sort();
         ids
@@ -219,9 +219,16 @@ impl App {
         }
     }
 
+    /// Fold one daemon event into state. Each event deserializes once into
+    /// its typed payload; anything that fails to parse is a contract
+    /// violation and gets flashed, not silently half-applied. grant.decided
+    /// is a tagged enum: each decision names its own grant, so there is no
+    /// state string to compare and no nullable soup; the affected row is
+    /// dropped from both tables and fresh snapshots are requested. A new
+    /// request opens the pending modal unless some other modal is already
+    /// open; traffic.stat only patches kernel-truth columns on rows that
+    /// already exist.
     fn on_event(&mut self, m: &str, p: Value, out: &mut Vec<Cmd>) {
-        // One typed deserialize per event; a payload that fails to parse is a
-        // contract violation and gets flashed, not silently half-applied.
         let bad = |e: serde_json::Error| format!("daemon sent bad {m} payload: {e}");
         match m {
             method::EV_REQUEST_NEW => match serde_json::from_value::<EvRequestNew>(p) {
@@ -247,8 +254,6 @@ impl App {
             },
             method::EV_DECIDED => match serde_json::from_value::<EvDecided>(p) {
                 Ok(ev) => {
-                    // tagged enum: each decision names its own grant; no
-                    // state string to compare, no nullable soup.
                     let gid = match &ev {
                         EvDecided::Approved { grant_id, .. }
                         | EvDecided::Denied { grant_id, .. }
@@ -306,9 +311,15 @@ impl App {
         }
     }
 
+    /// Fold one response into state, dispatched on the response id. Each
+    /// reply deserializes through its typed payload; errors flash rather
+    /// than silently leaving stale state rendered as fresh. The c-live
+    /// snapshot preserves kernel stats already held for an id (they arrive
+    /// separately via traffic.stat), and c-pend keeps only rows with a live
+    /// decision channel; the rest are not actionable. When a resync lands
+    /// an empty pending queue, a stale modal closes; a non-empty queue while
+    /// no modal is open opens one.
     fn on_response(&mut self, v: &Value, _out: &mut Vec<Cmd>) {
-        // typed deserialize per response id; errors flash rather than silently
-        // leaving stale state rendered as fresh
         let err_msg = |d: &Value| {
             d["error"]["message"]
                 .as_str()
@@ -331,7 +342,6 @@ impl App {
                     Ok(rows) => {
                         let mut fresh = BTreeMap::new();
                         for row in rows.iter().filter_map(live_from_row) {
-                            // preserve kernel stats we already have for this id
                             fresh.insert(
                                 row.id,
                                 match self.live.get(&row.id) {
@@ -359,7 +369,6 @@ impl App {
                     Ok(rows) => {
                         let mut fresh = BTreeMap::new();
                         for pr in rows {
-                            // only rows with a live decision channel are actionable
                             if !pr.waiting {
                                 continue;
                             }
@@ -382,7 +391,6 @@ impl App {
                             );
                         }
                         self.pending = fresh;
-                        // resync landing while the queue is empty should close a stale modal
                         if matches!(self.modal, Modal::Pending(_)) && self.pending.is_empty() {
                             self.modal = Modal::None;
                         }
@@ -445,8 +453,10 @@ impl App {
         }
     }
 
+    /// Optimistic local removal of the decided row; EV_DECIDED plus the
+    /// snapshot resync confirm it. Clears any open editor and lands on the
+    /// next queued request, or closes the modal when the queue drains.
     fn after_decision(&mut self, _out: &mut Vec<Cmd>) {
-        // optimistic local removal; EV_DECIDED + snapshot resync confirm it.
         if let Some(id) = self.modal_pending_id() {
             self.pending.remove(&id);
         }
@@ -515,8 +525,9 @@ fn fmt_ports(spec: &PortSpec, proto: tethys_core::types::Proto) -> String {
     }
 }
 
-// one canonical spelling, owned by tethys-core (the daemon renders ttl text from
-// the same function — no drift between what is approved and what is shown)
+/// One canonical spelling, owned by tethys-core: the daemon renders ttl text
+/// from the same function, so nothing drifts between what is approved and
+/// what is shown.
 pub use tethys_core::types::fmt_ttl_secs;
 
 pub fn fmt_countdown(s: Option<u64>) -> String {

@@ -1,7 +1,8 @@
 //! The shared ledger-row vocabulary. Lives here (not in the daemon) because
 //! the wire contract is exactly these shapes: `list.grants`, `list.pending`
 //! and `list.history` serialize them verbatim, and tethys deserializes them
-//! back — one struct definition, no string-indexed JSON on either side.
+//! back, so there is one struct definition instead of string-indexed JSON on
+//! either side.
 
 use serde::{Deserialize, Serialize};
 
@@ -78,7 +79,8 @@ impl DenyCode {
     }
 }
 
-/// One ledger row, as stored and as served on admin.sock.
+/// One ledger row, as stored and as served on admin.sock. `expires_at` is
+/// unix seconds.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct GrantRow {
     pub id: i64,
@@ -98,7 +100,7 @@ pub struct GrantRow {
     pub state: GrantState,
     pub created_at: u64,
     #[serde(default)]
-    pub expires_at: Option<f64>, // unix seconds
+    pub expires_at: Option<f64>,
     #[serde(default)]
     pub deny_code: Option<DenyCode>,
     #[serde(default)]
@@ -118,8 +120,8 @@ pub struct PendingRowWire {
 mod tests {
     use super::*;
 
-    /// The alloc-free spelling table and serde agree, both directions —
-    /// the drift guard the reviewer asked for.
+    /// The alloc-free spelling table and serde agree in both directions, which
+    /// guards against drift between them.
     #[test]
     fn state_spellings_match_serde() {
         for s in GrantState::ALL.iter().map(|(s, _)| *s) {
@@ -130,6 +132,9 @@ mod tests {
         assert_eq!(GrantState::parse("nope"), None);
     }
 
+    // Checks that known codes round-trip through their snake_case spelling,
+    // that the pre-kebab alias still loads, and that unknown strings pass
+    // through unchanged in both as_str and serde.
     #[test]
     fn deny_code_spellings_match_serde() {
         for c in [
@@ -148,10 +153,8 @@ mod tests {
                 serde_json::from_value(serde_json::Value::String(c.as_str().into())).unwrap();
             assert_eq!(back, c);
         }
-        // pre-kebab spelling still loads
         let back: DenyCode = serde_json::from_value("restart-reconcile".into()).unwrap();
         assert_eq!(back, DenyCode::RestartReconcile);
-        // unknown passes through (as_str and serde both preserve it verbatim)
         let u: DenyCode = serde_json::from_value("zzz".into()).unwrap();
         assert_eq!(u, DenyCode::Unknown("zzz".into()));
         assert_eq!(u.as_str(), "zzz");

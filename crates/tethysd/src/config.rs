@@ -23,17 +23,17 @@ fn default_max_ttl() -> String {
 fn default_approver_timeout() -> u64 {
     300
 }
+/// The username the model-run tooling executes under. Configurable on
+/// purpose: different harnesses ship under different names (hermes-agent
+/// is just the common default here).
 fn default_agent_user() -> String {
-    // The username the model-run tooling executes under. Configurable on
-    // purpose: different harnesses ship under different names
-    // (hermes-agent is just the common default here).
     "hermes-agent".into()
 }
+/// The username allowed to drive admin.sock. The 0600 socket mode is the
+/// primary gate; the SO_PEERCRED uid check (against this account's uid,
+/// resolved at startup) is defense-in-depth against the bind/chmod race and
+/// any deployment that loosens the mode.
 fn default_admin_user() -> String {
-    // The username allowed to drive admin.sock. The 0600 socket mode is the
-    // primary gate; the SO_PEERCRED uid check (against this account's uid,
-    // resolved at startup) is defense-in-depth against the bind/chmod race
-    // and any deployment that loosens the mode.
     "root".into()
 }
 
@@ -83,7 +83,7 @@ impl Default for FileConfig {
     }
 }
 
-/// Parse one `allow` entry. Grammar (same vocabulary as grants — the operator
+/// Parse one `allow` entry. Grammar (same vocabulary as grants: the operator
 /// spells *what*, tethysd resolves and installs):
 ///
 ///   host[:port[-port]][/(tcp|udp)]        e.g. api.anthropic.com:443
@@ -95,7 +95,10 @@ impl Default for FileConfig {
 /// Port omitted => all ports; proto omitted => tcp. A comma-separated port
 /// list expands to one (target, port, proto) triple per element, so
 /// "host:80,443" installs the same two carve elements as writing the host
-/// twice. Returns the parsed triples exactly like access requests carry them.
+/// twice. Only a literal /tcp or /udp suffix is read as a protocol, so a
+/// CIDR's slash leaves the string intact; a bare colon-bearing target that
+/// does not end in a port-shaped suffix is treated whole (v6 without port).
+/// Returns the parsed triples exactly like access requests carry them.
 pub fn parse_allow(
     s: &str,
 ) -> anyhow::Result<
@@ -109,8 +112,6 @@ pub fn parse_allow(
     let s = s.trim();
     anyhow::ensure!(!s.is_empty(), "empty allow entry");
 
-    // split off /proto — only a literal /tcp or /udp suffix is a proto; any
-    // other '/' (CIDR) leaves the string intact.
     let (rest, proto) = match s.rsplit_once('/') {
         Some((r, p)) => match p.to_ascii_lowercase().as_str() {
             "tcp" => (r, Proto::Tcp),
@@ -121,19 +122,15 @@ pub fn parse_allow(
     };
     let rest = rest.trim();
 
-    // Split target from port at the LAST colon — but only if it is not part
-    // of a v6 address/CIDR. For literal v6 we require the bracket form.
     let (target_s, port): (String, &str) = if let Some(inner) = rest.strip_prefix('[') {
         let (host, p) = inner
             .split_once("]:")
             .ok_or_else(|| anyhow::anyhow!("allow {s:?}: bracketed target needs :port"))?;
-        (host.to_string(), p) // brackets are syntax, not part of the address
+        (host.to_string(), p)
     } else if !rest.contains(':') {
-        // bare host/ip/CIDR => all ports
         (rest.to_string(), "")
     } else {
         match rest.rsplit_once(':') {
-            // CIDR or host with explicit port: suffix is digits/dashes
             Some((t, p))
                 if !p.is_empty()
                     && p.chars()
@@ -141,7 +138,6 @@ pub fn parse_allow(
             {
                 (t.to_string(), p)
             }
-            // "fe80::1" style v6 without port: whole string is the target
             _ => (rest.to_string(), ""),
         }
     };
@@ -151,7 +147,6 @@ pub fn parse_allow(
     } else if let Ok(n) = target_s.parse::<ipnet::IpNet>() {
         Target::Net(n)
     } else {
-        // hostname: same validation spirit as access requests
         anyhow::ensure!(
             !target_s.is_empty()
                 && !target_s.contains(char::is_whitespace)
@@ -229,28 +224,27 @@ mod tests {
         assert!(bad.is_err(), "unknown config keys must be rejected");
     }
 
+    // Covers every grammar arm: host:port, ip + udp suffix, CIDR + port
+    // range, bare target (all ports), comma lists expanding to one triple per
+    // port or range, and error cases (empty, inverted range, non-numeric and
+    // empty list elements).
     #[test]
     fn allow_entries_parse() {
         use tethys_core::types::{Proto, Target};
-        // host:port
         let (t, p, proto) = parse_allow("api.anthropic.com:443").unwrap().pop().unwrap();
         assert_eq!(t, Target::Host("api.anthropic.com".into()));
         assert_eq!((p.from, p.to), (443, 443));
         assert_eq!(proto, Proto::Tcp);
-        // ip + udp
         let (t, p, proto) = parse_allow("192.168.1.5:1234/udp").unwrap().pop().unwrap();
         assert!(matches!(t, Target::Ip(_)));
         assert_eq!((p.from, p.to), (1234, 1234));
         assert_eq!(proto, Proto::Udp);
-        // cidr + port range
         let (t, p, _) = parse_allow("151.101.0.0/16:80-443").unwrap().pop().unwrap();
         assert!(matches!(t, Target::Net(_)));
         assert_eq!((p.from, p.to), (80, 443));
-        // bare target = all ports
         let (t, p, _) = parse_allow("198.51.100.7").unwrap().pop().unwrap();
         assert!(p.is_all());
         assert!(matches!(t, Target::Ip(_)));
-        // comma list expands to one triple per port/range, sharing target+proto
         let v = parse_allow("host.example:80,443,8000-8100/tcp").unwrap();
         assert_eq!(v.len(), 3);
         assert!(v
@@ -259,7 +253,6 @@ mod tests {
         assert_eq!((v[0].1.from, v[0].1.to), (80, 80));
         assert_eq!((v[1].1.from, v[1].1.to), (443, 443));
         assert_eq!((v[2].1.from, v[2].1.to), (8000, 8100));
-        // errors: garbage, inverted range, empty
         assert!(parse_allow("").is_err());
         assert!(parse_allow("host:443-80").is_err());
         assert!(parse_allow("host:notaport").is_err());

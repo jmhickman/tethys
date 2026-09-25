@@ -51,8 +51,8 @@ impl fmt::Display for Proto {
 
 impl std::str::FromStr for Proto {
     type Err = SpecError;
-    /// Inverse of [`Proto::nft_key`] — the single spelling shared by the wire,
-    /// the nft JSON, and the ledger column.
+    /// Inverse of [`Proto::nft_key`], using the one spelling shared by the
+    /// wire, the nft JSON, and the ledger column.
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
             "tcp" => Ok(Proto::Tcp),
@@ -111,7 +111,10 @@ impl Target {
     }
 }
 
-/// Parse ttl grammar `Ns | Nm | Nh` (single unit only).
+/// Parse ttl grammar `Ns | Nm | Nh` (single unit only). The multiplier is
+/// attacker-controlled, so a product that overflows returns a bad-ttl error
+/// instead of panicking (debug) or silently wrapping the grant length
+/// (release); ARITHOFL-001.
 pub fn parse_ttl(s: &str) -> Result<Duration, SpecError> {
     let s = s.trim();
     let (num, mult) = match s.as_bytes().last().copied() {
@@ -124,16 +127,14 @@ pub fn parse_ttl(s: &str) -> Result<Duration, SpecError> {
     if n == 0 {
         return Err(SpecError::BadTtl(s.to_string()));
     }
-    // ARITHOFL-001: attacker-controlled multiplier — overflow is a bad ttl,
-    // not a panic (debug) or a silently-wrapped grant (release).
     let secs = n
         .checked_mul(mult)
         .ok_or_else(|| SpecError::BadTtl(s.to_string()))?;
     Ok(Duration::from_secs(secs))
 }
 
-/// Canonical seconds spelling ("1h" / "15m" / "45s"); "-" for zero (the TUI's
-/// "not yet granted" column). fmt_ttl is the Duration-shaped view of this.
+/// Canonical seconds spelling ("1h" / "15m" / "45s"); "-" for zero, which the
+/// TUI shows as "not yet granted". `fmt_ttl` does the same for a `Duration`.
 pub fn fmt_ttl_secs(s: u64) -> String {
     if s == 0 {
         return "-".into();
@@ -155,6 +156,8 @@ pub fn fmt_ttl(d: Duration) -> String {
 mod tests {
     use super::*;
 
+    // Covers all three units, malformed and zero ttls, and huge multipliers
+    // that must error rather than wrap or panic.
     #[test]
     fn ttl_roundtrip() {
         assert_eq!(parse_ttl("15m").unwrap(), Duration::from_secs(900));
@@ -163,7 +166,6 @@ mod tests {
         assert!(parse_ttl("15").is_err());
         assert!(parse_ttl("0m").is_err());
         assert!(parse_ttl("1d").is_err());
-        // overflow arms: huge multipliers are rejected, not wrapped/panicked
         assert!(parse_ttl("9999999999999999999h").is_err());
         assert!(parse_ttl("18446744073709551616s").is_err());
         assert_eq!(fmt_ttl(Duration::from_secs(900)), "15m");

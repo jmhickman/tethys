@@ -83,6 +83,20 @@ pub struct Config {
     pub dry_run: bool,
 }
 
+/// Boot: logging, config (file then CLI overrides), identity resolution,
+/// then the server. A parse error in an existing config file is fatal; a
+/// missing file falls back to defaults with a warning. CLI `--allow` entries
+/// replace the file's list like every other knob and are parsed eagerly, so
+/// an unparseable entry aborts boot. Identity policy: the admin socket's
+/// 0600 mode is the primary gate and the resolved admin uid is enforced per
+/// connection as defense-in-depth (TOCTOU-001); a missing admin user is
+/// fatal unless --allow-missing-users opts out, and the daemon's own euid is
+/// always admitted since it owns the socket inode. The agent user may
+/// legitimately not exist yet at first boot before the harness provisions
+/// it, so that only warns: unresolved means no mcp.sock peer pin (accept
+/// all), mirroring the host-wide fallback on the enforcement side. The pin
+/// works because in the stdio topology the harness spawns tethys-mcp
+/// itself, so the connecting process shares agent_user's uid by construction.
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
@@ -92,8 +106,6 @@ async fn main() -> anyhow::Result<()> {
         .init();
     let cli = Cli::parse();
 
-    // A parse error in an existing config file is fatal; a missing file
-    // falls back to defaults with a warning.
     let file: FileConfig = match std::fs::read_to_string(&cli.config) {
         Ok(s) => toml::from_str(&s)
             .map_err(|e| anyhow::anyhow!("parse {}: {e}", cli.config.display()))?,
@@ -127,9 +139,6 @@ async fn main() -> anyhow::Result<()> {
         dry_run: cli.dry_run || file.dry_run,
     };
 
-    // Allow list: CLI entries replace the file's (same precedence rule as
-    // every other knob). Parse eagerly — an unparseable entry is fatal.
-    // (allow_from_cli was recorded on cfg above; reload.allow reads it there.)
     let allow_src = if cli.allow.is_empty() {
         &file.allow
     } else {
@@ -141,10 +150,6 @@ async fn main() -> anyhow::Result<()> {
         );
     }
 
-    // admin user: the socket's 0600 mode is the primary gate; this uid is
-    // enforced per connection as defense-in-depth (TOCTOU-001). A missing
-    // admin user is fatal unless dev mode opts out; either way the daemon's
-    // own euid is always admitted (it owns the socket inode).
     match config::resolve_uid(&cfg.admin_user) {
         Ok(uid) => cfg.admin_peer_uid = Some(uid),
         Err(e) if cli.allow_missing_users => {
@@ -152,12 +157,6 @@ async fn main() -> anyhow::Result<()> {
         }
         Err(e) => return Err(e),
     }
-    // agent user may legitimately not exist yet at first boot before the
-    // harness provisions it — warn, don't block enforcement plumbing. The
-    // same uid is what mcp.sock pins peers to: in the stdio topology the
-    // harness spawns tethys-mcp itself, so the connecting process shares
-    // agent_user's uid by construction. Unresolved agent => no pin (accept
-    // all), mirroring the host-wide fallback on the enforcement side.
     match config::resolve_uid(&cfg.agent_user) {
         Ok(uid) => {
             cfg.agent_uid = Some(uid);

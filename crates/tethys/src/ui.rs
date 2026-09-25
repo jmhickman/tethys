@@ -21,9 +21,9 @@ pub fn draw(f: &mut Frame, app: &App, st: ConnStatus) {
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(3), // header (2 lines)
-            Constraint::Min(3),    // live table
-            Constraint::Length(1), // keybar
+            Constraint::Length(3),
+            Constraint::Min(3),
+            Constraint::Length(1),
         ])
         .split(f.area());
 
@@ -50,6 +50,9 @@ fn muted(dim: bool) -> Style {
     }
 }
 
+/// Two header lines: identity/counts/connection state (the subscribe ack
+/// carries the daemon version, rendered so TUI/daemon skew is visible), and
+/// the sort indicator, column legend, and any flash message.
 fn draw_header(f: &mut Frame, app: &App, st: ConnStatus, a: Rect) {
     let host = hostname();
     let conn = if !st.up {
@@ -84,7 +87,6 @@ fn draw_header(f: &mut Frame, app: &App, st: ConnStatus, a: Rect) {
         ),
         conn,
     ];
-    // subscribe ack carries the daemon version; rendered so TUI/daemon skew is visible
     if let Some(v) = &app.daemon_version {
         l1_parts.push(Span::styled(format!(" tethys v{v}"), muted(true)));
     }
@@ -121,17 +123,17 @@ fn draw_header(f: &mut Frame, app: &App, st: ConnStatus, a: Rect) {
 // ---------------------------------------------------------------- table
 //
 // Hand-rolled instead of ratatui::Table so a row can span the full width on
-// its second line — Table clamps every cell to its column, which makes true
+// its second line. Table clamps every cell to its column, which makes true
 // two-line rows impossible at narrow widths.
 //
 // Width policy (columns: 8 fixed facts + elastic `reason`). Fixed columns
-// NEVER clip on a single line — `reason` absorbs every pixel of shrinkage:
-//   1. roomy   — fixed cols at natural width (widest value/header); once
+// never clip on a single line; `reason` absorbs every pixel of shrinkage:
+//   1. roomy:   fixed cols at natural width (widest value/header); once
 //      reason has a comfortable slice, surplus grows the inter-column gap
 //      toward GAP_MAX ("ample padding" on big screens), then keeps feeding
 //      reason.
-//   2. tight   — reason gets the remainder and ellipsizes; facts complete.
-//   3. cramped — remainder < REASON_MIN: rows go two lines tall. Line 1 =
+//   2. tight:   reason gets the remainder and ellipsizes; facts complete.
+//   3. cramped: remainder < REASON_MIN, so rows go two lines tall. Line 1 =
 //      fixed cols at natural width, packed greedily (rightmost drop first);
 //      line 2 = `↳ <reason>` across the full inner width.
 
@@ -182,6 +184,8 @@ fn fit(s: &str, w: usize) -> String {
 }
 
 /// First resolved address, plus a count of the rest.
+/// First resolved address plus a count of the rest; "…" until the first
+/// poll lands.
 fn fmt_dst(row: &crate::app::LiveRow) -> String {
     let Some(first) = row.dst.first() else {
         return "…".into(); // not polled yet
@@ -197,12 +201,16 @@ struct RowCells {
     reason: String,
     warn: Style,
     /// leading status dot: Some(color) once remaining-TTL is known (None
-    /// until the first traffic poll lands — blank cell, column still aligned)
+    /// until the first traffic poll lands, leaving a blank cell with the
+    /// column still aligned)
     dot: Option<Color>,
 }
 
 /// Remaining-vs-total TTL as a traffic-light dot.
 /// green > 50% · yellow >= 25% · orange < 25%.
+/// Remaining-vs-total TTL as a traffic-light dot.
+/// green > 50% · yellow >= 25% · orange < 25% (ratatui has no plain orange;
+/// LightRed reads as it).
 fn ttl_dot(left: Option<u64>, ttl_secs: u64) -> Option<Color> {
     let left = left?;
     if ttl_secs == 0 {
@@ -214,7 +222,7 @@ fn ttl_dot(left: Option<u64>, ttl_secs: u64) -> Option<Color> {
     } else if frac >= 0.25 {
         Color::Yellow
     } else {
-        Color::LightRed // "orange": ratatui has no plain orange; LightRed reads as it
+        Color::LightRed
     })
 }
 
@@ -259,6 +267,7 @@ fn cells_for(r: &crate::app::LiveRow) -> RowCells {
 
 /// Fixed-column widths = max(content, header) across visible rows, capped so
 /// one pathological value can't starve `reason`; overflow ellipsizes.
+/// Column 0 gets +2 cells reserved for the row's status dot (see mk).
 fn natural_widths(rows: &[RowCells]) -> [u16; 8] {
     let mut w = HEADERS.map(|h| dw(h) as u16);
     for c in rows {
@@ -266,7 +275,7 @@ fn natural_widths(rows: &[RowCells]) -> [u16; 8] {
             w[i] = w[i].max(dw(v) as u16);
         }
     }
-    w[0] += 2; // dot reservation (see mk)
+    w[0] += 2;
     for i in 0..8 {
         w[i] = w[i].clamp(dw(HEADERS[i]) as u16 + if i == 0 { 2 } else { 0 }, 39);
     }
@@ -293,11 +302,15 @@ fn pack_line1(rows: &[RowCells], w: u16) -> ([u16; 8], usize) {
     (fw, kept)
 }
 
+/// Draw the live table under the width policy above. While the socket is
+/// down the table is stale: rows are real but frozen, rendered dim. Gaps
+/// widen only while every visible reason still fits whole; a reason that
+/// would clip pulls gaps back to GAP_MIN before it loses a character. The
+/// window scrolls to keep the selected row visible.
 fn draw_table(f: &mut Frame, app: &App, st: ConnStatus, a: Rect) {
-    // stale table: rows are real but frozen while the socket is down
     let dim = !st.up;
     let title = if dim {
-        " LIVE (stale — no daemon) "
+        " LIVE (stale, no daemon) "
     } else {
         " LIVE "
     };
@@ -310,17 +323,14 @@ fn draw_table(f: &mut Frame, app: &App, st: ConnStatus, a: Rect) {
     let rows: Vec<RowCells> = app.sorted_live().iter().map(|r| cells_for(r)).collect();
     let sel_row = app.sel.min(app.live.len().saturating_sub(1));
 
-    // ---- width plan ------------------------------------------------------
     let mut fw = natural_widths(&rows);
     let fixed_nat: u16 = fw.iter().sum();
-    // gaps widen only while every visible reason still fits whole; a reason
-    // that would clip pulls gaps back to GAP_MIN before it loses a character
     let need_reason = rows
         .iter()
         .map(|c| dw(&c.reason) as u16)
         .max()
         .unwrap_or(6)
-        .max(6); // "reason" header
+        .max(6);
     let surplus = inner
         .width
         .saturating_sub(fixed_nat + need_reason + GAP_MIN * 8);
@@ -336,29 +346,19 @@ fn draw_table(f: &mut Frame, app: &App, st: ConnStatus, a: Rect) {
     }
 
     let line_h = if wrap { 2 } else { 1 };
-    let body_h = inner.height.saturating_sub(1); // header row
+    let body_h = inner.height.saturating_sub(1);
     let visible = (body_h / line_h).max(1) as usize;
-    // keep the selected row inside the visible window
     let start = sel_row.saturating_sub(visible.saturating_sub(1));
 
-    // ---- emit a padded cell row (fixed cols + optional reason) -----------
     let gap_s = " ".repeat(gap_used(inner, gap, wrap) as usize);
-    // col 0 carries the row's status dot; "● " (2 cells) is reserved in its
-    // width so ids stay aligned whether or not a dot is known yet
     const DOT_W: usize = 2;
     let mk = |vals: &mut Vec<Span<'_>>, v: &[String; 8], style: Style, dot: Option<Color>| {
         for (i, s) in v.iter().take(kept).enumerate() {
             if i == 0 {
-                vals.push(Span::styled(
-                    match dot {
-                        Some(_) => "● ".to_string(),
-                        None => "  ".to_string(),
-                    },
-                    match dot {
-                        Some(c) => Style::default().fg(c),
-                        None => style,
-                    },
-                ));
+                vals.push(match dot {
+                    Some(c) => Span::styled(" ●".to_string(), Style::default().fg(c)),
+                    None => Span::styled("  ".to_string(), style),
+                });
                 vals.push(Span::styled(
                     format!(
                         "{}{}",
@@ -376,7 +376,6 @@ fn draw_table(f: &mut Frame, app: &App, st: ConnStatus, a: Rect) {
         }
     };
 
-    // ---- header ----------------------------------------------------------
     let mut hdr: Vec<Span> = Vec::with_capacity(9);
     mk(
         &mut hdr,
@@ -392,7 +391,6 @@ fn draw_table(f: &mut Frame, app: &App, st: ConnStatus, a: Rect) {
     }
     f.render_widget(Paragraph::new(Line::from(hdr)), inner);
 
-    // ---- body ------------------------------------------------------------
     let body = Rect {
         y: inner.y + 1,
         height: body_h,
@@ -435,7 +433,7 @@ fn draw_table(f: &mut Frame, app: &App, st: ConnStatus, a: Rect) {
     }
 }
 
-/// gap actually used between columns (two-line plan is always GAP_MIN)
+/// Gap used between columns; the two-line plan is always GAP_MIN.
 fn gap_used(_inner: Rect, gap: u16, wrap: bool) -> u16 {
     if wrap {
         GAP_MIN
@@ -480,6 +478,9 @@ fn centered(a: Rect, w_pct: u16, h_pct: u16) -> Rect {
     h[0]
 }
 
+/// Pending request modal. The title carries a countdown to daemon
+/// auto-deny (approver_timeout_secs from the subscribe ack): the bar fills
+/// as the deadline approaches while the number shows time remaining.
 fn draw_pending_modal(f: &mut Frame, app: &App, idx: usize) {
     let ids = app.pending_ids();
     let Some(id) = ids.get(idx).copied() else {
@@ -498,10 +499,8 @@ fn draw_pending_modal(f: &mut Frame, app: &App, idx: usize) {
         waiting / 60,
         waiting % 60
     );
-    // countdown to daemon auto-deny (approver_timeout_secs from subscribe ack)
     if let Some(to) = app.timeout_secs {
         let left = to.saturating_sub(waiting);
-        // bar fills as the deadline approaches; number is time REMAINING
         let filled = (waiting.min(to) as usize * 20 / to.max(1) as usize).min(20);
         title.push_str(&format!(
             "· auto-deny in {:>3}s [{}{}] ",
@@ -572,6 +571,8 @@ fn draw_pending_modal(f: &mut Frame, app: &App, idx: usize) {
     f.render_widget(block, area);
 }
 
+/// Grant detail modal. Wrapping is on so a long installed-address list
+/// cannot clip the "⚠ IP addresses resolved from hostname" annotation.
 fn draw_detail_modal(f: &mut Frame, app: &App, id: i64) {
     let Some(r) = app.live.get(&id) else { return };
     let area = centered(f.area(), 80, 55);
@@ -619,16 +620,12 @@ fn draw_detail_modal(f: &mut Frame, app: &App, id: i64) {
     ];
     lines.push(Line::from(""));
     f.render_widget(
-        Paragraph::new(lines)
-            // long installed-address lists must not clip the "⚠ IP addresses
-            // resolved from hostname" annotation — let lines wrap instead
-            .wrap(Wrap { trim: false })
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .title(format!(" GRANT {id} · {} ", r.tool))
-                    .title_bottom(" e revoke · Esc back "),
-            ),
+        Paragraph::new(lines).wrap(Wrap { trim: false }).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(format!(" GRANT {id} · {} ", r.tool))
+                .title_bottom(" e revoke · Esc back "),
+        ),
         area,
     );
 }
@@ -707,7 +704,6 @@ fn draw_net_modal(f: &mut Frame, app: &App) {
             }
             let mut lines = vec![Line::from(spans)];
             for (k, a) in i.addrs.iter().enumerate() {
-                // indent addresses under their interface name
                 let pad = if k + 1 == i.addrs.len() {
                     "  └ "
                 } else {
@@ -790,8 +786,8 @@ fn draw_conn_modal(f: &mut Frame, st: ConnStatus) {
     );
 }
 
-/// ASYNCBLOCK-002: header identity facts are read once and cached — the
-/// render path must not touch /proc every 500 ms tick/keypress/event.
+/// ASYNCBLOCK-002: header identity facts are read once and cached, because
+/// the render path must not touch /proc every 500 ms tick/keypress/event.
 fn hostname() -> &'static str {
     static HOST: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     HOST.get_or_init(|| {
@@ -802,8 +798,10 @@ fn hostname() -> &'static str {
 }
 
 /// The header shows the host address an operator is talking to: the
-/// default-route interface's address (not its subnet). Cached like
-/// hostname(); a mid-session interface change is cosmetic here.
+/// default-route interface's address (not its subnet), preferring its
+/// global IPv4, falling back to any address on it, then to just the name.
+/// Cached like hostname(); a mid-session interface change is cosmetic
+/// here.
 fn primary_ip() -> &'static str {
     static NET: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     NET.get_or_init(compute_primary_ip)
@@ -813,8 +811,6 @@ fn compute_primary_ip() -> String {
     let Some(iface) = default_iface() else {
         return "-".into();
     };
-    // Prefer the default iface's global IPv4; fall back to any address on it,
-    // then to just the name (matches old behavior when enumeration fails).
     let ifaddrs = match if_addrs::get_if_addrs() {
         Ok(v) => v,
         Err(_) => return iface,
@@ -840,9 +836,10 @@ fn compute_primary_ip() -> String {
 }
 
 /// Interface carrying the default route, from /proc/net/route (hex LE).
-/// Shared by the header and the net modal's "(default)" marker.
+/// Columns: Iface Dst GW Flags RefCnt Use Metric Mask ...; the default
+/// route is the row whose Dst is all zeros. Shared by the header and the
+/// net modal's "(default)" marker.
 pub fn default_iface() -> Option<String> {
-    // /proc/net/route columns: Iface Dst GW Flags RefCnt Use Metric Mask ...
     let rt = std::fs::read_to_string("/proc/net/route").ok()?;
     rt.lines()
         .skip(1)
@@ -861,7 +858,6 @@ pub fn collect_ifaces() -> Vec<crate::app::NetIface> {
             if a.is_loopback() || a.name == "lo" {
                 continue;
             }
-            // IfAddr carries the prefix length alongside the address
             let (ip, bits) = match &a.addr {
                 if_addrs::IfAddr::V4(v4) => (std::net::IpAddr::V4(v4.ip), v4.prefixlen),
                 if_addrs::IfAddr::V6(v6) => (std::net::IpAddr::V6(v6.ip), v6.prefixlen),
@@ -947,43 +943,43 @@ mod tests {
             .collect()
     }
 
+    // At wide sizes every fact renders intact (full first IP, +N for the
+    // rest, no mid-address comma clip) and the reason shows whole.
     #[test]
     fn wide_frame_has_no_clipped_facts_and_roomy_reason() {
         let lines = render(140, 14);
         let body = lines.join("\n");
-        // facts intact: full first IP, +N for the rest, no mid-address comma clip
         assert!(
             body.contains("104.26.10.242 +2"),
             "dst summary missing:\n{body}"
         );
         assert!(body.contains("93.184.216.34"));
-        // reason fully visible at wide size
         assert!(body.contains("restore jina MCP web tools (search/read) for agent session"));
     }
 
+    // At medium width the fixed facts stay complete and the reason
+    // ellipsizes rather than wrapping to a second line.
     #[test]
     fn medium_yields_reason_first() {
         let lines = render(90, 14);
         let body = lines.join("\n");
-        // fixed facts still complete at this width
         assert!(body.contains("104.26.10.242 +2"));
         assert!(body.contains("93.184.216.34"));
         assert!(body.contains("hermes-agent"));
-        // reason is ellipsized, not wrapped away
         let rline = lines.iter().find(|l| l.contains("restore")).unwrap();
         assert!(rline.contains('…'), "reason should ellipsize:\n{rline}");
     }
 
+    // At tiny width rows go two lines tall: fixed columns stay readable and
+    // the reason appears as a full-width continuation line.
     #[test]
     fn tiny_wraps_rows_to_two_lines() {
         let lines = render(40, 14);
         let body = lines.join("\n");
-        // fixed columns still readable
         assert!(
             body.contains("93.184.216.34"),
             "facts must stay complete:\n{body}"
         );
-        // reason appears as full-width continuation lines
         assert!(
             body.contains("↳ fetch payload for analysis"),
             "missing wrap line:\n{body}"
@@ -991,10 +987,12 @@ mod tests {
         assert!(body.contains("↳ restore jina MCP web tools"));
     }
 
+    // The resolved-IPs annotation must wrap into view at narrow widths, not
+    // clip away behind a long installed-address list.
     #[test]
     fn detail_modal_annotation_survives_narrow_width() {
         let mut app = sample_app();
-        app.modal = Modal::Detail(1); // 6-dst-style row: target host, differs
+        app.modal = Modal::Detail(1);
         app.live
             .get_mut(&1)
             .unwrap()
@@ -1019,6 +1017,46 @@ mod tests {
         );
     }
 
+    // The row TTL dot must carry its color as the glyph foreground, never as
+    // a background: even under the selected row's REVERSED + dark-gray line
+    // style (which patches bg/modifiers onto every cell), an fg-only span
+    // keeps the dot itself colored — same mechanism as the header ●conn dot.
+    #[test]
+    fn ttl_dot_is_foreground_colored_including_selected_row() {
+        use ratatui::style::Color;
+        let mut app = sample_app();
+        // sort desc by left => row 2 (left=61, LightRed) is selected first
+        app.sort_asc = false;
+        let mut terminal = Terminal::new(TestBackend::new(140, 14)).unwrap();
+        let st = ConnStatus {
+            up: true,
+            synced: true,
+        };
+        terminal.draw(|f| draw(f, &app, st)).unwrap();
+        let buf = terminal.backend().buffer().clone();
+        let dots: Vec<_> = buf
+            .content()
+            .iter()
+            // both rows have left=61 of ttl 3600 (<25%) => LightRed; the
+            // header's ●conn dot is Green, so color filters it out
+            .filter(|c| c.symbol() == "●" && c.style().fg == Some(Color::LightRed))
+            .collect();
+        assert_eq!(dots.len(), 2, "both live rows carry a status dot");
+        for d in &dots {
+            assert!(
+                matches!(d.style().fg, Some(Color::Green) | Some(Color::LightRed)),
+                "dot glyph must be colorized via fg, got {:?}",
+                d.style()
+            );
+            // the selected row's REVERSED+bg line style may tint cell
+            // backgrounds; the dot span itself never sets a bg — its color
+            // lives entirely in fg (mirrored by the header ●conn dot).
+        }
+        // selected row's dot: still a green-family glyph fg, not greyed out
+        assert_eq!(dots[0].style().fg, Some(Color::LightRed));
+    }
+
+    // Render across a grid of extreme terminal sizes without panicking.
     #[test]
     fn never_panics_at_degenerate_sizes() {
         for w in [8u16, 12, 20, 33, 47, 63, 100, 220] {
