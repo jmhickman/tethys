@@ -57,6 +57,16 @@ say()  { printf '%s\n' "$*"; }
 warn() { printf 'warning: %s\n' "$*" >&2; }
 die()  { printf 'error: %s\n' "$*" >&2; exit 1; }
 
+# print_mcp_config [PATH] — the default MCP server stanza for the agent
+# harness (mcp.json in Hermes, or the equivalent in any MCP client). Mirrors
+# the MCP INTEGRATION section of docs/DEPLOYMENT.md. PATH is the tethys-mcp
+# binary location (default: the system-mode install path).
+print_mcp_config() {
+    bin="${1:-/usr/local/bin/tethys-mcp}"
+    say "==> register tethys-mcp with your agent harness — in mcp.json:"
+    printf '{\n  "mcpServers": {\n    "tethys": { "command": "%s" }\n  }\n}\n' "$bin"
+}
+
 need_root() {
     [ "$(id -u)" -eq 0 ] || die "a host deployment needs root (try: sudo sh install.sh; or stage files without root via --stage)"
 }
@@ -225,6 +235,7 @@ if [ "$MODE" = "stage" ]; then
     done
     say "==> done. binaries: ${PREFIX}/bin/{tethysd,tethys-mcp,tethys}"
     say "    deploy artifacts: ${PREFIX}/share/tethys/"
+    print_mcp_config "${PREFIX}/bin/tethys-mcp"
     exit 0
 fi
 
@@ -278,3 +289,4 @@ else
 fi
 
 say "==> installed ${VERSION} (${TARGET}). config: /etc/tethys/config.toml — approver TUI: tethys"
+print_mcp_config

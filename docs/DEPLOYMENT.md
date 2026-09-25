@@ -245,10 +245,11 @@ that failed.
 
 ```toml
 allow = [
-  "192.168.1.5:1234",          # local OpenAI-compatible server
-  "api.anthropic.com:443",     # Anthropic API
-  "151.101.0.0/16:80-443",     # some CDN CIDR, port range
-  "time.example.net:123/udp",  # explicit udp
+  "192.168.1.5:1234",              # local OpenAI-compatible server
+  "api.anthropic.com:443",         # Anthropic API
+  "151.101.0.0/16:80-443",         # some CDN CIDR, port range
+  "time.example.net:123/udp",      # explicit udp
+  "mirror.example.net:80,443,873", # comma-separated ports, one entry
 ]
 ```
 
