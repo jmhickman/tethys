@@ -8,7 +8,7 @@ use crate::ledger::{now_secs, Decide, DenyCode, GrantState};
 use crate::server::State;
 
 /// Parse a `tethys:g<gid>` attribution comment.
-fn grant_gid_of_comment(c: &Option<String>) -> Option<i64> {
+pub(crate) fn grant_gid_of_comment(c: &Option<String>) -> Option<i64> {
     c.as_deref()?.strip_prefix("tethys:g")?.parse().ok()
 }
 

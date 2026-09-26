@@ -329,6 +329,31 @@ pub(crate) async fn read_frame<R: AsyncBufRead + Unpin>(r: &mut R, buf: &mut Vec
     Frame::Line(s)
 }
 
+/// Cancellation-safe variant of [`read_frame`] for `select!` loops
+/// (CANCELSAFETY-001). Identical semantics except it never clears `buf`:
+/// when tokio drops the future mid-read, bytes already moved out of the
+/// BufReader stay in `buf` and the next call continues appending to them,
+/// so a partial line is resumed instead of silently lost. The caller must
+/// `buf.clear()` once it has consumed a complete line — clearing up front
+/// would strand exactly the prefix this variant exists to preserve.
+pub(crate) async fn read_frame_resumable<R: AsyncBufRead + Unpin>(
+    r: &mut R,
+    buf: &mut Vec<u8>,
+) -> Frame {
+    match tokio::time::timeout(IDLE_TIMEOUT, r.read_until(b'\n', buf)).await {
+        Err(_) => return Frame::Idle,
+        Ok(Err(_)) | Ok(Ok(0)) => return Frame::Eof,
+        Ok(Ok(_)) => {}
+    }
+    if buf.len() > MAX_FRAME {
+        return Frame::TooLong;
+    }
+    let s = String::from_utf8_lossy(buf)
+        .trim_end_matches(['\n', '\r'])
+        .to_string();
+    Frame::Line(s)
+}
+
 // ------------------------------------------------------------------ MCP side
 
 /// Serve one mcp.sock client until EOF or protocol breach. Peer gating fails
@@ -886,6 +911,43 @@ mod tests {
     fn unix_ts_to_rfc3339_known_values() {
         assert_eq!(fmt_unix(0.0), "1970-01-01T00:00:00Z");
         assert_eq!(fmt_unix(1_757_925_600.0), "2025-09-15T08:40:00Z");
+    }
+
+    // CANCELSAFETY-001: dropping the resumable read mid-line (exactly what
+    // select! does when the sibling branch wins) must preserve the bytes
+    // already moved out of the BufReader, and the next call must resume from
+    // them instead of clearing them away.
+    #[tokio::test]
+    async fn resumable_read_survives_cancellation() {
+        use std::future::Future;
+        use tokio::io::duplex;
+        let (mut a, mut b) = duplex(256);
+        let mut reader = BufReader::new(&mut a);
+        let mut buf: Vec<u8> = Vec::new();
+
+        // Partial line in flight, no newline yet.
+        b.write_all(br#"{"id":"1","#).await.unwrap();
+        {
+            let fut = read_frame_resumable(&mut reader, &mut buf);
+            tokio::pin!(fut);
+            let waker = std::task::Waker::noop();
+            let mut cx = std::task::Context::from_waker(waker);
+            // One poll: bytes move into `buf`, then Pending. Now the future
+            // is dropped — the select! cancellation point.
+            assert!(matches!(
+                fut.as_mut().poll(&mut cx),
+                std::task::Poll::Pending
+            ));
+        }
+        assert!(!buf.is_empty(), "partial prefix must survive cancellation");
+
+        // The rest of the line arrives; a fresh call continues appending.
+        b.write_all(br#""method":"subscribe"}"#).await.unwrap();
+        b.write_all(b"\n").await.unwrap();
+        match read_frame_resumable(&mut reader, &mut buf).await {
+            Frame::Line(s) => assert_eq!(s, r#"{"id":"1","method":"subscribe"}"#),
+            _ => panic!("expected a complete resumed line"),
+        }
     }
 
     // TUI-spoofing control sequences (CR/LF/ESC/NUL) are stripped and free

@@ -17,7 +17,7 @@ use tethys_core::wire::{GrantState, PendingRowWire};
 use crate::install::{rebuild_acct, row_elems, sweep_grant_objs};
 use crate::ledger::{now_secs, Decide};
 use crate::server::{
-    emit, peer_cred, read_frame, resp_line, CountGuard, Frame, HumanDecision, State,
+    emit, peer_cred, read_frame_resumable, resp_line, CountGuard, Frame, HumanDecision, State,
 };
 
 /// Serve one admin.sock client: gate on peer credentials, then loop over
@@ -51,6 +51,11 @@ pub(crate) async fn handle_admin(stream: UnixStream, st: Arc<State>) {
     let mut sub_rx = st.events.subscribe();
     let (mut r, mut w) = stream.into_split();
     let mut reader = BufReader::new(&mut r);
+    // CANCELSAFETY-001: this read future is cancelled whenever the sibling
+    // broadcast branch wins the select. Bytes tokio already moved out of the
+    // BufReader live in `buf`, so the read must be resumable (never clears)
+    // and only cleared here, after a complete line has been consumed —
+    // otherwise a partial operator frame is silently stranded and lost.
     let mut buf: Vec<u8> = Vec::with_capacity(4096);
     loop {
         tokio::select! {
@@ -60,11 +65,14 @@ pub(crate) async fn handle_admin(stream: UnixStream, st: Arc<State>) {
                     Err(_) => break,
                 }
             }
-            f = read_frame(&mut reader, &mut buf) => {
+            f = read_frame_resumable(&mut reader, &mut buf) => {
                 let line = match f {
                     Frame::Line(s) => s,
                     Frame::TooLong | Frame::Idle | Frame::Eof => break,
                 };
+                // The complete line now lives in `line`; the buffer is free
+                // for the next frame even if parsing below fails.
+                buf.clear();
                 let req: RpcRequest = match serde_json::from_str(line.trim()) {
                     Ok(r) => r,
                     Err(_) => continue,
@@ -214,10 +222,11 @@ async fn admin_cmd(req: &RpcRequest, st: &Arc<State>) -> Result<RpcResponse, Rpc
 
 /// Emergency stop: terminate grants; baseline rules untouched. Three
 /// phases: delete kernel elements (one atomic batch; if it hits a missing
-/// element, retry per grant and tolerate ENOENT, since an already-gone
-/// element counts as removed), deny everything pending through its decision
-/// channel, then flip approved rows to revoked. Accounting follows the
-/// ledger: chains flush empty and per-grant objects are swept.
+/// element, retry per grant and, on failure, re-poll the kernel — a grant
+/// counts as removed only when no live element attributed to it remains),
+/// deny everything pending through its decision channel, then flip approved
+/// rows to revoked. Accounting follows the ledger: chains flush empty and
+/// per-grant objects are swept.
 async fn stop_grants(req: &RpcRequest, st: &Arc<State>) -> RpcResponse {
     tracing::info!("stop.grants invoked");
     let mut n = 0usize;
@@ -264,9 +273,21 @@ async fn stop_grants(req: &RpcRequest, st: &Arc<State>) -> RpcResponse {
                     }
                     match st.nft.apply(&gb).await {
                         Ok(()) => ok += 1,
-                        Err(e2) if e2.to_string().contains("No such file") => ok += 1,
+                        // STRCMP-001: classify structurally, never by
+                        // substring-matching rendered error text. A failed
+                        // delete counts as removed only if a fresh poll_live
+                        // shows no live element still attributed to this
+                        // grant; anything else is reported as a failure so
+                        // the kill switch never overstates teardown.
                         Err(e2) => {
-                            tracing::error!(id = g.id, %e2, "stop.grants per-grant delete failed")
+                            if grant_elems_gone(st, g.id).await {
+                                tracing::warn!(id = g.id, %e2,
+                                    "stop.grants per-grant delete failed but poll_live shows no live elements; counted removed");
+                                ok += 1;
+                            } else {
+                                tracing::error!(id = g.id, %e2,
+                                    "stop.grants per-grant delete failed; kernel elements may still be live")
+                            }
                         }
                     }
                 }
@@ -302,6 +323,31 @@ async fn stop_grants(req: &RpcRequest, st: &Arc<State>) -> RpcResponse {
     }
     emit(st, method::EV_STOPPED, EvStopped { grants_removed: n });
     RpcResponse::ok(&req.id, serde_json::json!({"revoked": n}))
+}
+
+/// True iff a fresh kernel poll shows no live grant element still
+/// attributed to `gid` (STRCMP-001). Attribution is the `tethys:g<gid>`
+/// comment that `add_grant` stamps — the same convention boot reconcile
+/// uses; unattributed elements belong to nobody provable and are ignored.
+/// A poll failure means kernel truth is unknown, so this fails CLOSED: an
+/// unverifiable delete is never counted as removed.
+async fn grant_elems_gone(st: &Arc<State>, gid: i64) -> bool {
+    match st.nft.poll_live(&st.cfg.nft_table).await {
+        Ok(p) => no_live_elems_for(&p.elements, gid),
+        Err(e) => {
+            tracing::error!(gid, %e, "stop.grants: poll_live after failed delete failed; treating grant as still live");
+            false
+        }
+    }
+}
+
+/// Pure half of [`grant_elems_gone`]: no element in the kernel view carries
+/// this grant's attribution comment. Elements with no (or unparseable)
+/// comment are not attributed to anyone and never keep a grant alive.
+fn no_live_elems_for(elements: &[tethys_core::nft::LiveElement], gid: i64) -> bool {
+    !elements
+        .iter()
+        .any(|el| crate::reconcile::grant_gid_of_comment(&el.comment) == Some(gid))
 }
 
 /// `reload.allow`: re-read the config file's allow list and reinstall the
@@ -421,4 +467,42 @@ async fn revoke(st: &Arc<State>, gid: i64) {
             grant_id: gid.to_string(),
         },
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tethys_core::nft::LiveElement;
+    use tethys_core::types::Proto;
+
+    fn elem(comment: Option<&str>) -> LiveElement {
+        LiveElement {
+            set: "grants_v4".into(),
+            dst: "10.0.0.1".into(),
+            proto: Proto::Tcp,
+            port_from: 443,
+            port_to: 443,
+            expires_secs: 60.0,
+            comment: comment.map(String::from),
+        }
+    }
+
+    // STRCMP-001: only an element attributed to THIS grant keeps it alive.
+    // A live element belonging to another grant (or to nobody) must not make
+    // this one's teardown count as failed, and this grant's own surviving
+    // element must never count as removed.
+    #[test]
+    fn stop_grants_classifies_teardown_by_attribution() {
+        assert!(no_live_elems_for(&[], 7));
+        assert!(no_live_elems_for(&[elem(Some("tethys:g8")), elem(None)], 7));
+        assert!(!no_live_elems_for(
+            &[elem(Some("tethys:g8")), elem(Some("tethys:g7"))],
+            7
+        ));
+        // An unattributed lookalike is not attribution.
+        assert!(no_live_elems_for(
+            &[elem(Some("g7")), elem(Some("tethys:gate7"))],
+            7
+        ));
+    }
 }
