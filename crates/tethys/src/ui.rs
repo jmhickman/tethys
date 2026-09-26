@@ -399,8 +399,12 @@ fn draw_table(f: &mut Frame, app: &App, st: ConnStatus, a: Rect) {
     let mut lines: Vec<Line> = Vec::with_capacity(visible * line_h as usize);
     for (i, c) in rows.iter().skip(start).take(visible).enumerate() {
         let base = c.warn.patch(muted(dim));
+        // Selection highlight is bg-only, deliberately NOT REVERSED: the
+        // TTL dot sets an explicit fg and the line sets an explicit bg, so
+        // a terminal-level fg/bg swap would render the dot as a gray glyph
+        // on a green box (text cells hide the swap by keeping default fg).
         let style = if start + i == sel_row && !dim {
-            base.add_modifier(Modifier::REVERSED).bg(Color::DarkGray)
+            base.bg(Color::DarkGray)
         } else {
             base
         };
@@ -667,8 +671,11 @@ fn draw_history_modal(f: &mut Frame, app: &App) {
                 Span::styled(format!("{state:<8}"), Style::default().fg(color)),
                 Span::raw(extra),
             ]);
+            // Same rule as the live table: selection is a bg patch, not
+            // REVERSED — the state span's explicit fg would swap with the
+            // default bg and paint a colored box around grayed-out text.
             ListItem::new(line).style(if i == app.hist_sel {
-                Style::default().add_modifier(Modifier::REVERSED)
+                Style::default().bg(Color::DarkGray)
             } else {
                 Style::default()
             })
@@ -1017,13 +1024,16 @@ mod tests {
         );
     }
 
-    // The row TTL dot must carry its color as the glyph foreground, never as
-    // a background: even under the selected row's REVERSED + dark-gray line
-    // style (which patches bg/modifiers onto every cell), an fg-only span
-    // keeps the dot itself colored — same mechanism as the header ●conn dot.
+    // The row TTL dot must carry its color as the glyph foreground, and the
+    // selected-row highlight must NOT use REVERSED: the dot span sets an
+    // explicit fg while the selection line sets an explicit bg, so a
+    // terminal-level fg/bg swap would show a gray dot on a green box. The
+    // buffer records patched styles, so asserting "no REVERSED on selected
+    // cells" catches the regression even though the swap itself happens in
+    // the terminal.
     #[test]
     fn ttl_dot_is_foreground_colored_including_selected_row() {
-        use ratatui::style::Color;
+        use ratatui::style::{Color, Modifier};
         let mut app = sample_app();
         // sort desc by left => row 2 (left=61, LightRed) is selected first
         app.sort_asc = false;
@@ -1048,9 +1058,11 @@ mod tests {
                 "dot glyph must be colorized via fg, got {:?}",
                 d.style()
             );
-            // the selected row's REVERSED+bg line style may tint cell
-            // backgrounds; the dot span itself never sets a bg — its color
-            // lives entirely in fg (mirrored by the header ●conn dot).
+            assert!(
+                !d.style().add_modifier.contains(Modifier::REVERSED),
+                "selected-row highlight must not REVERSE (would gray the dot), got {:?}",
+                d.style()
+            );
         }
         // selected row's dot: still a green-family glyph fg, not greyed out
         assert_eq!(dots[0].style().fg, Some(Color::LightRed));

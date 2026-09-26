@@ -20,7 +20,15 @@ use tokio::sync::mpsc;
 use app::{App, Modal, COLS};
 
 #[derive(Parser)]
-#[command(name = "tethys", version, about = "tethysd approver TUI")]
+#[command(
+    name = "tethys",
+    version,
+    about = "tethysd approver TUI",
+    // Shoki, rendered above the help text. Raw passthrough (clap does not
+    // wrap before-help), so the 80-col art survives narrow terminals by
+    // overflowing rather than reflowing into mush.
+    before_help = include_str!("../assets/shoki.txt")
+)]
 struct Args {
     #[arg(long, default_value = "/run/tethys/admin.sock")]
     socket: PathBuf,

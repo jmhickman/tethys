@@ -8,8 +8,8 @@
 # Local artifacts (no network needed):
 #
 #   sh install.sh --source dist/                          # directory of release assets
-#   sh install.sh --source tethys-0.1.0-x86_64-unknown-linux-gnu.tar.gz
-#   sh install.sh --source tethys-0.1.0-x86_64-unknown-linux-gnu/   # unpacked tree
+#   sh install.sh --source tethys-2026.9.1-x86_64-unknown-linux-gnu.tar.gz
+#   sh install.sh --source tethys-2026.9.1-x86_64-unknown-linux-gnu/   # unpacked tree
 #
 # Modes:
 #   (default)    full host deployment: install binaries to /usr/local/bin,

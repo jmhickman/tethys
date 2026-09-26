@@ -3,7 +3,7 @@ resolver = "2"
 members = ["crates/core", "crates/tethysd", "crates/tethys-mcp", "crates/tethys"]
 
 [workspace.package]
-version = "0.1.0"
+version = "2026.9.1"
 edition = "2021"
 license = "Apache-2.0"
 # MSRV-001: floor the code actually needs (u64::is_multiple_of => 1.87).

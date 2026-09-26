@@ -1162,7 +1162,7 @@ dependencies = [
 
 [[package]]
 name = "tethys"
-version = "0.1.0"
+version = "2026.9.1"
 dependencies = [
  "anyhow",
  "clap",
@@ -1177,7 +1177,7 @@ dependencies = [
 
 [[package]]
 name = "tethys-core"
-version = "0.1.0"
+version = "2026.9.1"
 dependencies = [
  "ipnet",
  "serde",
@@ -1188,7 +1188,7 @@ dependencies = [
 
 [[package]]
 name = "tethys-mcp"
-version = "0.1.0"
+version = "2026.9.1"
 dependencies = [
  "anyhow",
  "clap",
@@ -1203,7 +1203,7 @@ dependencies = [
 
 [[package]]
 name = "tethysd"
-version = "0.1.0"
+version = "2026.9.1"
 dependencies = [
  "anyhow",
  "chrono",
