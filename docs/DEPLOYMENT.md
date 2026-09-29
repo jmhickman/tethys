@@ -425,6 +425,11 @@ another identity, it can egress the host.
 * Similarly, if there is a service listening on the loopback address that would 
 provide egress (a SOCKS proxy, etc), the default `nftables` would not block it,
 as it allows loopback connections without approvals.
+* Then there's the matter of remote hosts. Once the agent has remote execution, 
+**it can do anything that remote user can do**, which usually includes internet 
+access. At this point, `tethys` is only going to provide you the means to 'cut
+the cord' and use the kill switch to stop all traffic, including anything used
+by the model as a pivot to the outside world. 
 * DNS is a default allowed protocol and it is possible to egress information 
 via DNS requests. If the agent is compromised, it is highly likely to choose this
 method of egress. DNS resolution monitoring is advised.
