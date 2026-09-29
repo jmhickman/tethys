@@ -432,14 +432,29 @@ impl App {
     // -------------------------------------------------------------- actions
 
     pub fn approve_selected(&mut self, out: &mut Vec<Cmd>) {
-        if let Some(id) = self.modal_pending_id() {
-            let mut params = serde_json::json!({"grant_id": id.to_string()});
-            if let Some(t) = self.ttl_edit.as_deref().and_then(|s| s.parse::<u64>().ok()) {
-                params["ttl_secs"] = serde_json::json!(t);
+        let Some(id) = self.modal_pending_id() else {
+            return;
+        };
+        let mut params = serde_json::json!({"grant_id": id.to_string()});
+        if let Some(raw) = self.ttl_edit.as_deref() {
+            let raw = raw.trim();
+            if !raw.is_empty() {
+                // A malformed override must NOT silently approve at the
+                // requested ttl — that grants time the operator meant to
+                // change. Flash and keep the modal open instead.
+                match parse_ttl_override(raw) {
+                    Some(secs) => params["ttl_secs"] = serde_json::json!(secs),
+                    None => {
+                        self.set_flash(format!(
+                            "bad ttl `{raw}` — type seconds, or end with m/h (e.g. 30s, 45m, 2h)"
+                        ));
+                        return;
+                    }
+                }
             }
-            out.push(cmd("a-approve", method::APPROVE, Some(params)));
-            self.after_decision(out);
         }
+        out.push(cmd("a-approve", method::APPROVE, Some(params)));
+        self.after_decision(out);
     }
 
     pub fn deny_selected(&mut self, note: Option<String>, out: &mut Vec<Cmd>) {
@@ -530,10 +545,35 @@ fn fmt_ports(spec: &PortSpec, proto: tethys_core::types::Proto) -> String {
 /// what is shown.
 pub use tethys_core::types::fmt_ttl_secs;
 
+/// Operator TTL override typed into the pending modal: digits with an
+/// optional unit suffix — `30`/`30s` seconds (default), `45m` minutes, `2h`
+/// hours. None on anything else; overflow is rejected, not wrapped.
+pub fn parse_ttl_override(s: &str) -> Option<u64> {
+    let s = s.trim();
+    let (num, mult): (&str, u64) = match s.chars().last() {
+        Some('s') => (&s[..s.len() - 1], 1),
+        Some('m') => (&s[..s.len() - 1], 60),
+        Some('h') => (&s[..s.len() - 1], 3600),
+        _ => (s, 1),
+    };
+    if num.is_empty() || !num.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let n: u64 = num.parse().ok()?;
+    n.checked_mul(mult).filter(|secs| *secs > 0)
+}
+
+/// Table ttl column: always whole minutes (rounded up), so it reads in
+/// the same unit as the M:SS countdown beside it. The canonical
+/// fmt_ttl_secs stays for modals/history where 15m/2h spellings are fine.
+pub fn fmt_ttl_mins(s: u64) -> String {
+    format!("{}m", s.div_ceil(60))
+}
+
 pub fn fmt_countdown(s: Option<u64>) -> String {
     match s {
         None => "…".into(),
-        Some(x) => format!("{}:{:02}", x / 60, x % 60),
+        Some(x) => format!("{}:{:02}m", x / 60, x % 60),
     }
 }
 

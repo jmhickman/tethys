@@ -251,8 +251,9 @@ fn cycle_sort(app: &mut App, back: bool) {
 /// Pending-modal keys. While the inline deny-note editor is open it owns
 /// all typing: Enter submits the note and Esc denies with an empty one.
 /// Otherwise Esc only dismisses (the request stays queued), a approves, d
-/// opens the note editor, t toggles the ttl override (digits-only seconds,
-/// mirroring the approve RPC param), n/Tab cycle the queue.
+/// opens the note editor, t toggles the ttl override (digits plus an
+/// optional s/m/h unit suffix — bare digits are seconds, mirroring what
+/// parse_ttl_override accepts), n/Tab cycle the queue.
 fn key_pending(app: &mut App, k: event::KeyEvent, out: &mut Vec<conn::Cmd>) -> bool {
     if app.deny_note.is_some() {
         match k.code {
@@ -294,9 +295,16 @@ fn key_pending(app: &mut App, k: event::KeyEvent, out: &mut Vec<conn::Cmd>) -> b
             app.deny_note = None;
             app.ttl_edit = None;
         }
-        KeyCode::Char(c) if app.ttl_edit.is_some() && c.is_ascii_digit() => {
+        KeyCode::Char(c)
+            if app.ttl_edit.is_some() && (c.is_ascii_digit() || matches!(c, 's' | 'm' | 'h')) =>
+        {
             if let Some(t) = &mut app.ttl_edit {
-                t.push(c);
+                // A unit suffix is final: digits after it would only make
+                // the string unparseable, so drop them. 8 chars is plenty
+                // (9999h) and keeps the action row from scrolling off.
+                if !(t.ends_with(['s', 'm', 'h']) && !c.is_ascii_digit()) && t.len() < 8 {
+                    t.push(c);
+                }
             }
         }
         KeyCode::Backspace => {

@@ -14,7 +14,66 @@ fn dw(s: &str) -> usize {
         .sum()
 }
 
-use crate::app::{fmt_bytes, fmt_countdown, fmt_ttl_secs, App, Modal, COLS};
+/// Hard-split one word into pieces no wider than `width` (only used for
+/// words longer than the line; normal text wraps between words instead).
+fn chunk_word(word: &str, width: usize) -> Vec<String> {
+    let mut chunks = Vec::new();
+    let mut cur = String::new();
+    let mut w = 0usize;
+    for ch in word.chars() {
+        let cw = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
+        if w + cw > width && !cur.is_empty() {
+            chunks.push(std::mem::take(&mut cur));
+            w = 0;
+        }
+        cur.push(ch);
+        w += cw;
+    }
+    if !cur.is_empty() {
+        chunks.push(cur);
+    }
+    chunks
+}
+
+/// Word-wrap `s` into lines of at most `width` display cells. Wraps on
+/// whitespace (never mid-word unless a single word cannot fit), honors
+/// embedded newlines, and keeps blank paragraphs as blank lines. ratatui's
+/// own Wrap breaks per character, which is exactly what made model reasons
+/// read like they were being sliced by the modal border.
+fn wrap_words(s: &str, width: usize) -> Vec<String> {
+    let width = width.max(1);
+    let mut out: Vec<String> = Vec::new();
+    for para in s.split('\n') {
+        let mut cur = String::new();
+        let mut curw = 0usize;
+        for word in para.split_whitespace() {
+            for chunk in chunk_word(word, width) {
+                let cw = dw(&chunk);
+                if curw == 0 {
+                    cur = chunk;
+                    curw = cw;
+                } else if curw + 1 + cw <= width {
+                    cur.push(' ');
+                    cur.push_str(&chunk);
+                    curw += 1 + cw;
+                } else {
+                    out.push(std::mem::take(&mut cur));
+                    cur = chunk;
+                    curw = cw;
+                }
+            }
+        }
+        out.push(cur);
+    }
+    if out.is_empty() {
+        out.push(String::new());
+    }
+    out
+}
+
+use crate::app::{
+    fmt_bytes, fmt_countdown, fmt_ttl_mins, fmt_ttl_secs, parse_ttl_override, App, Modal, COLS,
+};
 use crate::conn::ConnStatus;
 
 pub fn draw(f: &mut Frame, app: &App, st: ConnStatus) {
@@ -141,6 +200,8 @@ const GAP_MIN: u16 = 1;
 const GAP_MAX: u16 = 4;
 /// Smallest slice worth giving reason on a single line; below this, wrap.
 const REASON_MIN: u16 = 8;
+/// Extra cells inserted after the ttl column only (see mk/gap_for).
+const TTL_GAP_EXTRA: u16 = 2;
 const HEADERS: [&str; 8] = [
     "id",
     "tool",
@@ -199,7 +260,6 @@ fn fmt_dst(row: &crate::app::LiveRow) -> String {
 struct RowCells {
     vals: [String; 8], // id, tool, dst, ports, proto, ttl, left, traffic
     reason: String,
-    warn: Style,
     /// leading status dot: Some(color) once remaining-TTL is known (None
     /// until the first traffic poll lands, leaving a blank cell with the
     /// column still aligned)
@@ -227,10 +287,6 @@ fn ttl_dot(left: Option<u64>, ttl_secs: u64) -> Option<Color> {
 }
 
 fn cells_for(r: &crate::app::LiveRow) -> RowCells {
-    let warn = match r.left {
-        Some(s) if s <= 60 => Style::default().fg(Color::Yellow),
-        _ => Style::default(),
-    };
     let up = r.bytes_up.unwrap_or(0);
     let down = r.bytes_down.unwrap_or(0);
     let traffic = format!(
@@ -256,12 +312,11 @@ fn cells_for(r: &crate::app::LiveRow) -> RowCells {
             fmt_dst(r),
             r.ports.clone(),
             r.proto.clone(),
-            fmt_ttl_secs(r.ttl_secs),
+            fmt_ttl_mins(r.ttl_secs),
             fmt_countdown(r.left),
             traffic,
         ],
         reason: r.reason.clone(),
-        warn,
     }
 }
 
@@ -291,7 +346,12 @@ fn pack_line1(rows: &[RowCells], w: u16) -> ([u16; 8], usize) {
     let mut used = 0u16;
     let mut kept = 0;
     for i in 0..8 {
-        let need = if kept == 0 { nat[i] } else { nat[i] + GAP_MIN };
+        let extra = if i == 5 { TTL_GAP_EXTRA } else { 0 };
+        let need = if kept == 0 {
+            nat[i] + extra
+        } else {
+            nat[i] + GAP_MIN + extra
+        };
         if used + need > w {
             break;
         }
@@ -333,9 +393,11 @@ fn draw_table(f: &mut Frame, app: &App, st: ConnStatus, a: Rect) {
         .max(6);
     let surplus = inner
         .width
-        .saturating_sub(fixed_nat + need_reason + GAP_MIN * 8);
+        .saturating_sub(fixed_nat + need_reason + GAP_MIN * 8 + TTL_GAP_EXTRA);
     let gap = (GAP_MIN + surplus / 8).clamp(GAP_MIN, GAP_MAX);
-    let reason_w = inner.width.saturating_sub(fixed_nat + gap * 8);
+    let reason_w = inner
+        .width
+        .saturating_sub(fixed_nat + gap * 8 + TTL_GAP_EXTRA);
 
     let wrap = reason_w < REASON_MIN;
     let mut kept = 8usize;
@@ -350,7 +412,14 @@ fn draw_table(f: &mut Frame, app: &App, st: ConnStatus, a: Rect) {
     let visible = (body_h / line_h).max(1) as usize;
     let start = sel_row.saturating_sub(visible.saturating_sub(1));
 
-    let gap_s = " ".repeat(gap_used(inner, gap, wrap) as usize);
+    let gap_base = gap_used(inner, gap, wrap);
+    // One uniform inter-column gap everywhere except after `ttl` (col 5):
+    // its digits and the countdown read as one number when crowded, so ttl
+    // gets two extra cells of separation.
+    let gap_for = |i: usize| {
+        let extra = if i == 5 { TTL_GAP_EXTRA } else { 0 };
+        " ".repeat((gap_base + extra) as usize)
+    };
     const DOT_W: usize = 2;
     let mk = |vals: &mut Vec<Span<'_>>, v: &[String; 8], style: Style, dot: Option<Color>| {
         for (i, s) in v.iter().take(kept).enumerate() {
@@ -363,14 +432,14 @@ fn draw_table(f: &mut Frame, app: &App, st: ConnStatus, a: Rect) {
                     format!(
                         "{}{}",
                         fit(s, fw[i].saturating_sub(DOT_W as u16) as usize),
-                        gap_s.as_str()
+                        gap_for(i)
                     ),
                     style,
                 ));
                 continue;
             }
             vals.push(Span::styled(
-                format!("{}{}", fit(s, fw[i] as usize), gap_s.as_str()),
+                format!("{}{}", fit(s, fw[i] as usize), gap_for(i)),
                 style,
             ));
         }
@@ -398,12 +467,19 @@ fn draw_table(f: &mut Frame, app: &App, st: ConnStatus, a: Rect) {
     };
     let mut lines: Vec<Line> = Vec::with_capacity(visible * line_h as usize);
     for (i, c) in rows.iter().skip(start).take(visible).enumerate() {
-        let base = c.warn.patch(muted(dim));
+        let base = muted(dim);
         // Selection highlight is bg-only, deliberately NOT REVERSED: the
         // TTL dot sets an explicit fg and the line sets an explicit bg, so
         // a terminal-level fg/bg swap would render the dot as a gray glyph
         // on a green box (text cells hide the swap by keeping default fg).
+        // Zebra striping: every other row gets a DarkGray bg so long
+        // rows can be tracked across wide terminals. Selection is Gray
+        // (one step lighter) with black text so it stays distinct from
+        // the stripes; when the socket is down (dim) stripes are skipped
+        // because muted text would vanish into them.
         let style = if start + i == sel_row && !dim {
+            base.bg(Color::Gray).fg(Color::Black)
+        } else if (start + i) % 2 == 1 && !dim {
             base.bg(Color::DarkGray)
         } else {
             base
@@ -455,7 +531,7 @@ fn draw_keybar(f: &mut Frame, app: &App, a: Rect) {
             if app.deny_note.is_some() {
                 "type deny note · Enter send · Esc deny-empty"
             } else {
-                "a approve · d deny+note · t edit ttl · n next pending · Esc dismiss (stays queued)"
+                "a approve · d deny+note · t edit ttl (30s/45m/2h) · n next pending · Esc dismiss (stays queued)"
             }
         }
         Modal::Detail(_) => "e revoke · Esc back",
@@ -485,6 +561,9 @@ fn centered(a: Rect, w_pct: u16, h_pct: u16) -> Rect {
 /// Pending request modal. The title carries a countdown to daemon
 /// auto-deny (approver_timeout_secs from the subscribe ack): the bar fills
 /// as the deadline approaches while the number shows time remaining.
+/// Every grant fact gets its own line; the reason word-wraps (never
+/// mid-word) with continuation lines indented under its label, and the
+/// modal grows to fit rather than clipping it.
 fn draw_pending_modal(f: &mut Frame, app: &App, idx: usize) {
     let ids = app.pending_ids();
     let Some(id) = ids.get(idx).copied() else {
@@ -493,8 +572,11 @@ fn draw_pending_modal(f: &mut Frame, app: &App, idx: usize) {
     let Some(p) = app.pending.get(&id) else {
         return;
     };
-    let area = centered(f.area(), 70, 60);
+    let mut area = centered(f.area(), 70, 60);
     f.render_widget(Clear, area);
+
+    let label = |s: &str| Span::styled(format!("{s:<14}"), muted(true));
+    let wrap_w = (area.width as usize).saturating_sub(2 + 14).max(20);
 
     let waiting = app.now.saturating_sub(p.created_at);
     let mut title = format!(
@@ -514,26 +596,41 @@ fn draw_pending_modal(f: &mut Frame, app: &App, idx: usize) {
         ));
     }
 
-    let lines = vec![
-        Line::from(vec![
-            Span::styled(" requested  ", muted(true)),
-            Span::raw(&p.target),
-        ]),
-        Line::from(vec![
-            Span::styled(" ports       ", muted(true)),
-            Span::raw(p.ports.clone()),
-            Span::styled("     ttl req ", muted(true)),
-            Span::raw(p.ttl_requested.clone()),
-        ]),
-    ];
-    let reason = Paragraph::new(p.reason.clone()).wrap(Wrap { trim: false });
-    let ra = Rect {
-        x: area.x + 2,
-        y: area.y + 4,
-        width: area.width.saturating_sub(4),
-        height: 3,
+    // One labeled block per fact; values longer than the line wrap under
+    // their label instead of colliding with the next field or the border.
+    let field_styled = |name: &str, val: &str, st: Style| -> Vec<Line> {
+        let ws = wrap_words(val, wrap_w);
+        ws.iter()
+            .enumerate()
+            .map(|(i, l)| {
+                Line::from(vec![
+                    if i == 0 {
+                        label(name)
+                    } else {
+                        Span::styled(" ".repeat(14), muted(true))
+                    },
+                    Span::styled(l.clone(), st),
+                ])
+            })
+            .collect()
     };
-    f.render_widget(reason, ra);
+
+    let field = |name: &str, val: &str| field_styled(name, val, Style::default());
+
+    let mut body: Vec<Line> = Vec::new();
+    // The dst (hostname or IP the agent supplied) is THE decision — bold
+    // green so the eye lands on it first even mid-queue.
+    body.extend(field_styled(
+        "requested",
+        &p.target,
+        Style::default()
+            .fg(Color::Green)
+            .add_modifier(Modifier::BOLD),
+    ));
+    body.extend(field("ports", &p.ports));
+    body.extend(field("ttl requested", &p.ttl_requested));
+    body.push(Line::from(""));
+    body.extend(field("reason", &p.reason));
 
     let mut action_spans = vec![
         Span::styled(
@@ -543,10 +640,28 @@ fn draw_pending_modal(f: &mut Frame, app: &App, idx: usize) {
                 .add_modifier(Modifier::BOLD),
         ),
         Span::styled("   [d]eny+note", Style::default().fg(Color::Red)),
-        Span::styled("   [t]tl→__", Style::default().fg(Color::Cyan)),
+        Span::styled("   [t]tl→__ (s|m|h)", Style::default().fg(Color::Cyan)),
     ];
     if let Some(t) = &app.ttl_edit {
-        action_spans.push(Span::raw(format!("  ttl={t}")));
+        // Show the canonical form the daemon will get; unparseable text is
+        // flagged right where it was typed, not just on approve.
+        let t = t.trim();
+        if t.is_empty() {
+            action_spans.push(Span::styled("  ttl→(enter to clear)", muted(true)));
+        } else {
+            match parse_ttl_override(t) {
+                Some(secs) => action_spans.push(Span::styled(
+                    format!("  ttl→{}", fmt_ttl_secs(secs)),
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                )),
+                None => action_spans.push(Span::styled(
+                    format!("  ttl→{t}? (digits + s/m/h)"),
+                    Style::default().fg(Color::LightRed),
+                )),
+            }
+        }
     }
     if ids.len() > 1 {
         action_spans.push(Span::styled(
@@ -556,16 +671,27 @@ fn draw_pending_modal(f: &mut Frame, app: &App, idx: usize) {
     }
     action_spans.push(Span::styled("   [Esc]close", muted(true)));
 
-    let mut body: Vec<Line> = lines;
     body.push(Line::from(""));
-    body.push(Line::from("")); // room for wrapped reason above
     if let Some(note) = &app.deny_note {
         body.push(Line::from(vec![
-            Span::styled(" note  ", Style::default().fg(Color::Red)),
+            Span::styled("note          ", Style::default().fg(Color::Red)),
             Span::raw(format!("{note}▏")),
         ]));
     }
     body.push(Line::from(action_spans));
+
+    // Grow (never shrink below the default slice) so the wrapped reason and
+    // the action row both fit; capped by the screen.
+    let need = (body.len() + 2).min((f.area().height as usize).saturating_sub(1)) as u16;
+    if need > area.height {
+        area = Rect {
+            y: f.area().y + f.area().height.saturating_sub(need) / 2,
+            height: need,
+            ..area
+        };
+        f.render_widget(Clear, area);
+    }
+
     let block = Paragraph::new(body).block(
         Block::default()
             .borders(Borders::ALL)
@@ -585,7 +711,13 @@ fn draw_detail_modal(f: &mut Frame, app: &App, id: i64) {
     let mut lines = vec![
         Line::from(vec![
             Span::styled(" requested   ", muted(true)),
-            Span::raw(r.target.clone()),
+            // same orientation cue as the pending modal: dst is bold green
+            Span::styled(
+                r.target.clone(),
+                Style::default()
+                    .fg(Color::Green)
+                    .add_modifier(Modifier::BOLD),
+            ),
         ]),
         Line::from(vec![
             Span::styled(" installed   ", muted(true)),
@@ -658,13 +790,21 @@ fn draw_history_modal(f: &mut Frame, app: &App) {
                 GrantState::Expired => Color::DarkGray,
                 _ => Color::Green,
             };
+            // dst + ports on every row (the wire row carries them); denied
+            // rows additionally trail their code and note.
+            let dst = format!(
+                "{} {}",
+                g.target,
+                crate::app::port_text(g.port_from, g.port_to)
+            );
             let extra = match g.state {
                 GrantState::Denied => format!(
-                    "{} {}",
+                    "{}  {} {}",
+                    dst,
                     g.deny_code.as_ref().map(|c| c.as_str()).unwrap_or_default(),
                     g.note.clone().unwrap_or_default()
                 ),
-                _ => g.target.clone(),
+                _ => dst,
             };
             let line = Line::from(vec![
                 Span::styled(format!("{:>4} ", g.id), muted(true)),
@@ -1076,5 +1216,249 @@ mod tests {
                 let _ = render(w, h);
             }
         }
+    }
+
+    #[test]
+    fn wrap_words_breaks_at_spaces_never_mid_word() {
+        let l = wrap_words("restore jina MCP web tools for the agent session", 20);
+        assert!(l.iter().all(|s| dw(s) <= 20));
+        assert!(l.join(" ").contains("MCP web tools"));
+        // a single over-long word hard-splits instead of overflowing
+        let l = wrap_words("aaaaaaaaaaaaaaaaaaaa b", 10);
+        assert_eq!(dw(&l[0]), 10);
+        // embedded newlines survive
+        assert_eq!(
+            wrap_words("a\nb", 40),
+            vec!["a".to_string(), "b".to_string()]
+        );
+    }
+
+    // Live table cosmetics: alternating row backgrounds for scanability,
+    // no yellow near-expiry text recolor (it fought the TTL dots), and the
+    // ttl column spelled in whole minutes like the countdown beside it.
+    #[test]
+    fn rows_zebra_stripe_and_ttl_reads_minutes() {
+        use ratatui::style::Color;
+        let mut app = sample_app();
+        for id in 3..=6i64 {
+            app.live.insert(id, row(id, "curl", &["1.2.3.4"], "r"));
+        }
+        // put a row inside the old <=60s warn window; sorted asc by `left`
+        // it lands first, so row 5 is exactly the row the old code painted
+        // yellow.
+        app.live.get_mut(&1).unwrap().left = Some(30);
+        let mut terminal = Terminal::new(TestBackend::new(140, 14)).unwrap();
+        let st = ConnStatus {
+            up: true,
+            synced: true,
+        };
+        terminal.draw(|f| draw(f, &app, st)).unwrap();
+        let buf = terminal.backend().buffer().clone();
+        let w = 140usize;
+        let cell = |x: usize, y: usize| &buf.content()[y * w + x];
+        // rows start at frame row 5 (header block 3 + table border + header line)
+        let bg_of = |row_y: usize| cell(60, row_y).style().bg;
+        // row 5 is under the cursor (selection bg); stripes start below it
+        let clear = |y: usize| matches!(bg_of(y), None | Some(Color::Reset));
+        assert_eq!(bg_of(5), Some(Color::Gray), "selected row highlight");
+        assert_eq!(bg_of(6), Some(Color::DarkGray), "second row stripes");
+        assert!(clear(7), "third row clear again");
+        assert_eq!(bg_of(8), Some(Color::DarkGray), "fourth row stripes");
+        // ttl for the 3600s rows reads in minutes next to the M:SS countdown
+        let line: String = (0..w).map(|x| cell(x, 6).symbol()).collect();
+        assert!(
+            line.contains("60m"),
+            "ttl column should read minutes: {line}"
+        );
+        // no yellow fg text on near-expiry rows anymore (left=30 was inside
+        // the old <=60s warn window; only the dots may be colored)
+        for y in 5..8 {
+            for x in 0..w {
+                assert_ne!(
+                    cell(x, y).style().fg,
+                    Some(Color::Yellow),
+                    "row text must not recolor"
+                );
+            }
+        }
+    }
+
+    // History rows must carry the port spec next to the dst, for both
+    // approved and denied states (the deny case trails code + note).
+    #[test]
+    fn history_rows_show_ports_with_dst() {
+        use tethys_core::wire::{GrantRow, GrantState};
+        let mut app = sample_app();
+        let base = GrantRow {
+            id: 9,
+            idem_key: None,
+            target: "host:api.jina.ai".into(),
+            dst_json: "[\"ip:104.26.10.242\"]".into(),
+            port_from: 443,
+            port_to: 443,
+            proto: tethys_core::types::Proto::Tcp,
+            reason: "r".into(),
+            tool: "curl".into(),
+            ttl_secs: 600,
+            granted_ttl_secs: Some(600),
+            state: GrantState::Expired,
+            created_at: 0,
+            expires_at: None,
+            deny_code: None,
+            note: None,
+        };
+        app.history = vec![
+            base.clone(),
+            GrantRow {
+                id: 10,
+                target: "ip:192.168.10.2".into(),
+                dst_json: "[]".into(),
+                port_from: 22,
+                port_to: 22,
+                state: GrantState::Denied,
+                deny_code: Some(tethys_core::wire::DenyCode::ApproverTimeout),
+                note: Some("nope".into()),
+                ..base.clone()
+            },
+        ];
+        app.modal = Modal::History;
+        let mut terminal = Terminal::new(TestBackend::new(100, 14)).unwrap();
+        let st = ConnStatus {
+            up: true,
+            synced: true,
+        };
+        terminal.draw(|f| draw(f, &app, st)).unwrap();
+        let body: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(
+            body.contains("host:api.jina.ai 443"),
+            "expired row must show dst + port:\n{body}"
+        );
+        assert!(
+            body.contains("ip:192.168.10.2 22"),
+            "denied row must show dst + port:\n{body}"
+        );
+    }
+
+    #[test]
+    fn ttl_override_units() {
+        use crate::app::parse_ttl_override as p;
+        assert_eq!(p("30"), Some(30)); // bare digits = seconds (default)
+        assert_eq!(p("30s"), Some(30));
+        assert_eq!(p("45m"), Some(2700));
+        assert_eq!(p("2h"), Some(7200));
+        assert_eq!(p("999999999999999999999h"), None); // overflow rejected
+        assert_eq!(p(""), None);
+        assert_eq!(p("s"), None);
+        assert_eq!(p("0"), None);
+        assert_eq!(p("5x"), None);
+        assert_eq!(p("5m3"), None);
+    }
+
+    // The pending modal must give each grant fact its own line and wrap the
+    // reason at word boundaries inside the frame — no mid-word slice at the
+    // right border, no fields colliding on one line.
+    #[test]
+    fn pending_modal_separates_fields_and_wraps_reason() {
+        use crate::app::PendingRow;
+        let mut app = sample_app();
+        app.pending.insert(
+            7,
+            PendingRow {
+                target: "host:api.example.com".into(),
+                ports: "443/tcp".into(),
+                reason: "need this long-lived outbound access so the retrieval worker can refresh embeddings for the knowledge base index overnight".into(),
+                tool: "hermes-agent".into(),
+                ttl_requested: "15m".into(),
+                created_at: 0,
+            },
+        );
+        app.modal = Modal::Pending(0);
+        let mut terminal = Terminal::new(TestBackend::new(72, 24)).unwrap();
+        let st = ConnStatus {
+            up: true,
+            synced: true,
+        };
+        terminal.draw(|f| draw(f, &app, st)).unwrap();
+        let lines: Vec<String> = terminal
+            .backend()
+            .buffer()
+            .content()
+            .chunks(72)
+            .map(|r| r.iter().map(|c| c.symbol()).collect::<String>())
+            .collect();
+        let body = lines.join("\n");
+        // The modal is drawn over the live table, so inspect the text
+        // inside its left border: every cell segment after a │.
+        let segs: Vec<&str> = lines.iter().flat_map(|l| l.split('│')).collect();
+        // each label starts its own line
+        for lbl in ["requested", "ports", "ttl requested", "reason"] {
+            assert!(
+                segs.iter().any(|s| s.starts_with(lbl)),
+                "{lbl} should start a line:\n{body}"
+            );
+        }
+        // ports and ttl requested no longer share a line
+        assert!(
+            !segs
+                .iter()
+                .any(|s| s.contains("ports") && s.contains("ttl requested")),
+            "fields must not collide:\n{body}"
+        );
+        // the dst is the orientation cue: bold green text (the target has
+        // three 'a's; no other modal field carries them in green)
+        let dst_green = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .filter(|c| {
+                c.symbol() == "a"
+                    && c.style().fg == Some(Color::Green)
+                    && c.style().add_modifier.contains(Modifier::BOLD)
+            })
+            .count();
+        assert!(dst_green >= 3, "dst must render bold green");
+        // the reason wrapped at spaces inside the frame: continuation lines
+        // are indented under the label, and the tail is visible whole.
+        let ridx = lines
+            .iter()
+            .position(|l| l.split('│').any(|s| s.starts_with("reason")))
+            .unwrap();
+        assert!(lines[ridx].contains("long-lived"));
+        let cont = lines[ridx + 1]
+            .split('│')
+            .find(|s| s.starts_with(" ") && s.trim_start().starts_with("access"))
+            .unwrap_or("");
+        assert!(
+            cont.trim_start().starts_with("access"),
+            "reason continuation must be indented under the label, got {cont:?}:\n{body}"
+        );
+        // no word sliced at the border, nothing clipped: reassembling the
+        // modal's reason block from the buffer must reproduce it exactly.
+        let mut got = String::new();
+        for l in &lines[ridx..] {
+            let inside = l.split('│').nth(2).unwrap_or("").trim();
+            if inside.is_empty() {
+                break;
+            }
+            let val = inside.strip_prefix("reason").unwrap_or(inside).trim();
+            got.push_str(val);
+            got.push(' ');
+        }
+        assert_eq!(
+            got.trim(),
+            "need this long-lived outbound access so the retrieval worker \
+             can refresh embeddings for the knowledge base index overnight"
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" "),
+            "reason must render whole, word-wrapped:\n{body}"
+        );
     }
 }
