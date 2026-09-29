@@ -1,7 +1,8 @@
-//! tethys-mcp: model-facing MCP server (stdio transport) with exactly one
-//! tool. It is a thin, stateless proxy: it validates against the schema,
-//! forwards access.request to tethysd over the unix socket, and returns the
-//! verdict string. It holds no approval power and no netfilter access.
+//! tethys-mcp: model-facing MCP server (stdio transport). It is a thin,
+//! stateless proxy over the daemon's mcp.sock: request_traffic_grant
+//! forwards access.request and returns the verdict string; list_traffic_grants
+//! forwards access.list and renders the live grant table. It holds no
+//! approval power and no netfilter access.
 
 use std::path::PathBuf;
 
@@ -111,7 +112,79 @@ impl ScopeMcp {
             ));
         }
         let r = v.get("result").cloned().unwrap_or_default();
-        Ok(render_verdict(&r))
+        let verdict = render_verdict(&r);
+        // Every decision point is also a map refresh: append the other live
+        // grants so the model keeps current without being told to poll.
+        // Strictly best-effort — a failed digest never corrupts a verdict.
+        if verdict.starts_with("APPROVED") {
+            if let Some(digest) = self.digest().await {
+                return Ok(format!("{verdict}\n{digest}"));
+            }
+        }
+        Ok(verdict)
+    }
+
+    /// One-line-per-other-grant digest for the verdict footer. None on any
+    /// error (the verdict stands alone). Excludes the grant just approved,
+    /// which the verdict line already describes.
+    async fn digest(&self) -> Option<String> {
+        let rpc = RpcRequest {
+            jsonrpc: JsonRpcVersion::V2_0,
+            id: format!("dig-{}", next_id()),
+            method: method::ACCESS_LIST.into(),
+            params: None,
+        };
+        let resp = self.ask(&rpc).await.ok()?;
+        let v: serde_json::Value = serde_json::from_str(&resp).ok()?;
+        let stats: Vec<tethys_core::protocol::GrantStat> =
+            serde_json::from_value(v.get("result")?.clone()).ok()?;
+        if stats.is_empty() {
+            return None;
+        }
+        let items: Vec<String> = stats
+            .iter()
+            .map(|g| {
+                format!(
+                    "{}:{} {}m left",
+                    g.name,
+                    g.dst_port.from,
+                    g.seconds_remaining.div_ceil(60)
+                )
+            })
+            .collect();
+        Some(format!("Other live grants: {}", items.join(", ")))
+    }
+
+    #[tool(
+        description = "List this host's LIVE traffic grants with kernel-truth time \
+                       remaining (M:SS). Call BEFORE relying on egress, and whenever an \
+                       outbound connection fails unexpectedly, to tell 'grant expired' apart \
+                       from 'target is down'. No approval round-trip — returns instantly."
+    )]
+    async fn list_traffic_grants(&self) -> Result<String, ErrorData> {
+        tracing::debug!("list tool call entered");
+        let rpc = RpcRequest {
+            jsonrpc: JsonRpcVersion::V2_0,
+            id: format!("lst-{}", next_id()),
+            method: method::ACCESS_LIST.into(),
+            params: None,
+        };
+        let resp = self.ask(&rpc).await?;
+        let v: serde_json::Value = serde_json::from_str(&resp).map_err(|e| {
+            ErrorData::internal_error(format!("tethysd reply unparseable: {e}"), None)
+        })?;
+        if let Some(err) = v.get("error") {
+            return Err(ErrorData::internal_error(
+                err.get("message")
+                    .and_then(|m| m.as_str())
+                    .unwrap_or("tethysd error")
+                    .to_string(),
+                None,
+            ));
+        }
+        Ok(render_grant_list(
+            &v.get("result").cloned().unwrap_or_default(),
+        ))
     }
 }
 
@@ -147,6 +220,40 @@ impl ScopeMcp {
         }
         Ok(line)
     }
+}
+
+/// Render the agent-side grant table from an access.list reply (array of
+/// GrantStat). One line per grant, kernel-truth countdown; empty table is
+/// stated in words so the model never has to parse "[]".
+fn render_grant_list(r: &serde_json::Value) -> String {
+    let stats: Vec<tethys_core::protocol::GrantStat> = match serde_json::from_value(r.clone()) {
+        Ok(s) => s,
+        Err(e) => return format!("ERROR: tethysd reply unparseable: {e}"),
+    };
+    if stats.is_empty() {
+        return "No live grants. Egress is blocked; request one with \
+                request_traffic_grant."
+            .into();
+    }
+    let mut out = format!("Live grants ({}):\n", stats.len());
+    for g in &stats {
+        let proto = serde_json::to_value(g.proto)
+            .ok()
+            .and_then(|p| p.as_str().map(String::from))
+            .unwrap_or_else(|| "?".into());
+        out.push_str(&format!(
+            "  #{gid} [{tool}] {name} {proto} {from}-{to} · {m}:{s:02} left\n",
+            gid = g.grant_id,
+            tool = if g.tool.is_empty() { "?" } else { &g.tool },
+            name = g.name,
+            m = g.seconds_remaining / 60,
+            s = g.seconds_remaining % 60,
+            from = g.dst_port.from,
+            to = g.dst_port.to,
+        ));
+    }
+    out.push_str("Expiry is kernel truth; re-request before a grant lapses mid-task.");
+    out
 }
 
 /// One-liner, e.g. "APPROVED: 203.0.113.7 tcp 443 granted for 15m (expires ...)".
@@ -219,7 +326,10 @@ impl ServerHandler for ScopeMcp {
         ServerConfig::new(ServerCapabilities::builder().enable_tools().build()).with_instructions(
             "You are sandboxed: ALL egress is blocked by the kernel unless granted. \
              Use request_traffic_grant before any network tool. One target per call; \
-             waits for human approval; may be denied or reduced. Re-request when expired.",
+             waits for human approval; may be denied or reduced. Re-request when expired. \
+             list_traffic_grants shows live grants with kernel-truth time remaining: \
+             call it when an outbound connection fails unexpectedly to tell an expired \
+             grant from a dead target.",
         )
     }
 }
@@ -243,6 +353,41 @@ async fn main() -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn grant_list_rendering() {
+        let empty = serde_json::json!([]);
+        assert!(render_grant_list(&empty).starts_with("No live grants"));
+
+        let two = serde_json::json!([
+            {"grant_id":"9","name":"host:api.jina.ai","tool":"curl",
+             "dst":["ip:104.26.10.242"],"dst_port":{"from":443,"to":443},"proto":"tcp",
+             "seconds_remaining":598,"bytes_sent":10,"bytes_received":20},
+            {"grant_id":"10","name":"ip:192.168.10.2","tool":"ssh",
+             "dst":["ip:192.168.10.2"],"dst_port":{"from":22,"to":22},"proto":"tcp",
+             "seconds_remaining":60,"bytes_sent":0,"bytes_received":0}
+        ]);
+        let s = render_grant_list(&two);
+        assert!(s.contains("Live grants (2)"), "{s}");
+        assert!(
+            s.contains("#9 [curl] host:api.jina.ai tcp 443-443 · 9:58 left"),
+            "{s}"
+        );
+        assert!(s.contains("#10 [ssh] ip:192.168.10.2"), "{s}");
+
+        // older daemon rows without `tool` still deserialize (serde default)
+        let legacy = serde_json::json!([
+            {"grant_id":"1","name":"host:x","dst":[],"dst_port":{"from":80,"to":80},
+             "proto":"tcp","seconds_remaining":5,"bytes_sent":0,"bytes_received":0}
+        ]);
+        assert!(
+            render_grant_list(&legacy).contains("[?]"),
+            "missing tool renders ?"
+        );
+
+        let junk = serde_json::json!({"not": "an array"});
+        assert!(render_grant_list(&junk).starts_with("ERROR:"));
+    }
 
     #[test]
     fn verdict_rendering() {

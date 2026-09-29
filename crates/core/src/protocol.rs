@@ -75,6 +75,10 @@ impl RpcResponse {
 
 pub mod method {
     pub const ACCESS_REQUEST: &str = "access.request";
+    /// Agent-side read-only enumeration of live grants (mcp.sock). Replies
+    /// with a JSON array of GrantStat — same shape traffic.stat carries, so
+    /// the MCP layer has one renderer.
+    pub const ACCESS_LIST: &str = "access.list";
     // TUI -> tethysd
     pub const APPROVE: &str = "approve";
     pub const DENY: &str = "deny";
@@ -233,6 +237,10 @@ pub enum Verdict {
 pub struct GrantStat {
     pub grant_id: String,
     pub name: String,
+    /// Requesting tool label (nmap, curl, ...); #[serde(default)] so older
+    /// daemons still deserialize for newer clients.
+    #[serde(default)]
+    pub tool: String,
     /// installed destinations (post-resolution), as a real array on the wire.
     pub dst: Vec<String>,
     pub dst_port: PortSpec,

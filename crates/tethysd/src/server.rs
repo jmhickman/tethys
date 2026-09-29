@@ -244,54 +244,13 @@ fn spawn_stats_poller(st: Arc<State>) {
             if st.admins_online.load(Ordering::SeqCst) == 0 {
                 continue;
             }
-            let rows = st.ledger.list(GrantState::Approved).await;
-            if rows.is_empty() {
-                continue;
-            }
-            let counters_json = match st.nft.list_json("counters", None).await {
-                Ok(c) => c,
-                Err(e) => {
-                    tracing::warn!(%e, "traffic poll: counter list failed");
-                    continue;
+            match collect_stats(&st).await {
+                Ok(stats) if !stats.is_empty() => {
+                    emit(&st, method::EV_TRAFFIC, EvTraffic { grants: stats })
                 }
-            };
-            let poll = tethys_core::nft::parse_poll(
-                &serde_json::json!({ "nftables": [] }),
-                &counters_json,
-                &st.cfg.nft_table,
-            );
-            let now = now_secs();
-            let mut stats: Vec<GrantStat> = Vec::new();
-            for g in &rows {
-                let b_out = poll
-                    .counters
-                    .get(&counter_out(g.id))
-                    .map(|c| c.1)
-                    .unwrap_or(0);
-                let b_in = poll
-                    .counters
-                    .get(&counter_in(g.id))
-                    .map(|c| c.1)
-                    .unwrap_or(0);
-                let stat = GrantStat {
-                    grant_id: g.id.to_string(),
-                    name: g.target.clone(),
-                    dst: serde_json::from_str(&g.dst_json).unwrap_or_default(),
-                    dst_port: PortSpec {
-                        from: g.port_from,
-                        to: g.port_to,
-                    },
-                    proto: g.proto,
-                    seconds_remaining: g
-                        .expires_at
-                        .map(|e| (e as u64).saturating_sub(now))
-                        .unwrap_or(0),
-                    bytes_sent: b_out,
-                    bytes_received: b_in,
-                };
-                stats.push(stat);
+                Ok(_) => {}
+                Err(e) => tracing::warn!(%e, "traffic poll failed"),
             }
-            emit(&st, method::EV_TRAFFIC, EvTraffic { grants: stats });
         }
     });
 }
@@ -418,15 +377,28 @@ async fn handle_mcp(stream: UnixStream, st: Arc<State>) {
                 continue;
             }
         };
-        if req.method != method::ACCESS_REQUEST {
+        if req.method != method::ACCESS_REQUEST && req.method != method::ACCESS_LIST {
             resp_tx
                 .send(rpc_err_str(
                     &req.id,
                     -32601,
-                    "only access.request is served here",
+                    "only access.request and access.list are served here",
                 ))
                 .await
                 .ok();
+        } else if req.method == method::ACCESS_LIST {
+            // Read-only snapshot: ledger rows + kernel counters. Cheap and
+            // non-blocking (no human round-trip), but rides the same
+            // inflight accounting so one client can't spam nft dumps.
+            if inflight.load(Ordering::SeqCst) >= MAX_INFLIGHT {
+                resp_tx
+                    .send(rpc_err_str(&req.id, -32000, "too many in-flight requests"))
+                    .await
+                    .ok();
+                continue;
+            }
+            let guard = CountGuard::inc(&inflight);
+            dispatch_list(req, st.clone(), resp_tx.clone(), guard);
         } else {
             if inflight.load(Ordering::SeqCst) >= MAX_INFLIGHT {
                 resp_tx
@@ -748,6 +720,79 @@ fn dispatch_access(
             );
         }
         respond!(resp_line(&resp));
+    });
+}
+
+/// Kernel-truth snapshot of live grants: Approved ledger rows for identity
+/// and countdown, named per-grant counters for byte totals. Shared by the
+/// admin stats poller (traffic.stat) and access.list so the agent and the
+/// operator always read the same numbers.
+pub(crate) async fn collect_stats(st: &State) -> Result<Vec<GrantStat>, String> {
+    let rows = st.ledger.list(GrantState::Approved).await;
+    if rows.is_empty() {
+        return Ok(Vec::new());
+    }
+    let counters_json = st
+        .nft
+        .list_json("counters", None)
+        .await
+        .map_err(|e| e.to_string())?;
+    let poll = tethys_core::nft::parse_poll(
+        &serde_json::json!({ "nftables": [] }),
+        &counters_json,
+        &st.cfg.nft_table,
+    );
+    let now = now_secs();
+    Ok(rows
+        .iter()
+        .map(|g| GrantStat {
+            grant_id: g.id.to_string(),
+            name: g.target.clone(),
+            tool: g.tool.clone(),
+            dst: serde_json::from_str(&g.dst_json).unwrap_or_default(),
+            dst_port: PortSpec {
+                from: g.port_from,
+                to: g.port_to,
+            },
+            proto: g.proto,
+            seconds_remaining: g
+                .expires_at
+                .map(|e| (e as u64).saturating_sub(now))
+                .unwrap_or(0),
+            bytes_sent: poll
+                .counters
+                .get(&counter_out(g.id))
+                .map(|c| c.1)
+                .unwrap_or(0),
+            bytes_received: poll
+                .counters
+                .get(&counter_in(g.id))
+                .map(|c| c.1)
+                .unwrap_or(0),
+        })
+        .collect())
+}
+
+/// access.list pipeline: read-only, never blocks on a human, so it answers
+/// inline on the connection task's behalf via one small spawned task (the
+/// nft counter dump is the only await). Errors reply as JSON-RPC errors;
+/// an empty live set replies as an empty array, not an error.
+fn dispatch_list(
+    req: RpcRequest,
+    st: Arc<State>,
+    resp_tx: tokio::sync::mpsc::Sender<String>,
+    inflight_guard: CountGuard,
+) {
+    tokio::spawn(async move {
+        let _inflight = inflight_guard;
+        let resp = match collect_stats(&st).await {
+            Ok(stats) => RpcResponse::ok(&req.id, &stats),
+            Err(e) => {
+                tracing::warn!(%e, "access.list stats collection failed");
+                RpcResponse::err(&req.id, -32603, format!("stats unavailable: {e}"))
+            }
+        };
+        resp_tx.send(resp_line(&resp)).await.ok();
     });
 }
 
