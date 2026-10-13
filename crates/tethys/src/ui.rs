@@ -146,6 +146,26 @@ fn draw_header(f: &mut Frame, app: &App, st: ConnStatus, a: Rect) {
         ),
         conn,
     ];
+    // Enforcement truth, always visible: APPROVED rows mean nothing if
+    // the boundary is down. Until a subscribe ack lands on THIS socket
+    // (synced), any held value is from a previous connection and stays
+    // unknown — a reconnect to a restarted daemon must not show stale
+    // "enforcing" while the new daemon may come up with no boundary.
+    let (etxt, estyle) = if !st.synced {
+        ("enforcement: …".to_string(), muted(true))
+    } else {
+        (
+            app.enforce_text(),
+            match app.enforce_state() {
+                crate::app::Enforce::Active => Style::default().fg(Color::Green),
+                crate::app::Enforce::Inactive => {
+                    Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)
+                }
+                crate::app::Enforce::Unknown => muted(true),
+            },
+        )
+    };
+    l1_parts.push(Span::styled(format!(" ─ {etxt}"), estyle));
     if let Some(v) = &app.daemon_version {
         l1_parts.push(Span::styled(format!(" tethys v{v}"), muted(true)));
     }
@@ -884,15 +904,23 @@ fn draw_net_modal(f: &mut Frame, app: &App) {
 fn draw_stop_modal(f: &mut Frame, app: &App) {
     let area = centered(f.area(), 50, 30);
     f.render_widget(Clear, area);
-    let body = vec![
+    let mut body = vec![
         Line::from(""),
         Line::from(" Remove ALL live grants (baseline rules untouched)."),
-        Line::from(vec![
-            Span::raw(" type "),
-            Span::styled("stop", Style::default().add_modifier(Modifier::BOLD)),
-            Span::raw(format!(" to confirm: {}▏", app.stop_typed)),
-        ]),
     ];
+    // The kill-switch consequence, per the daemon's actual capability.
+    body.push(Line::from(if app.sock_destroy {
+        " Also destroys established TCP flows of those grants."
+    } else if app.enforcement.is_some() {
+        " Established flows fade with conntrack (flow-kill off)."
+    } else {
+        ""
+    }));
+    body.push(Line::from(vec![
+        Span::raw(" type "),
+        Span::styled("stop", Style::default().add_modifier(Modifier::BOLD)),
+        Span::raw(format!(" to confirm: {}▏", app.stop_typed)),
+    ]));
     f.render_widget(
         Paragraph::new(body).block(
             Block::default()
@@ -1074,13 +1102,16 @@ mod tests {
 
     /// Render the whole UI at w×h and return the drawn frame lines.
     fn render(w: u16, h: u16) -> Vec<String> {
-        let app = sample_app();
+        render_app(&sample_app(), w, h)
+    }
+
+    fn render_app(app: &App, w: u16, h: u16) -> Vec<String> {
         let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
         let st = ConnStatus {
             up: true,
             synced: true,
         };
-        terminal.draw(|f| draw(f, &app, st)).unwrap();
+        terminal.draw(|f| draw(f, app, st)).unwrap();
         terminal
             .backend()
             .buffer()
@@ -1088,6 +1119,103 @@ mod tests {
             .chunks(w as usize)
             .map(|row| row.iter().map(|c| c.symbol()).collect::<String>())
             .collect()
+    }
+
+    // The enforcement truth is on the header no matter what the rows
+    // claim: live APPROVED grants under a DOWN boundary must read OFF,
+    // and flow-kill degradation must be visible next to "enforcing".
+    #[test]
+    fn header_shows_enforcement_truth_not_row_state() {
+        use tethys_core::protocol::EnforcementInfo;
+        let mut app = sample_app();
+        assert!(
+            !app.live.is_empty(),
+            "sample rows exist so OFF cannot be inferred from emptiness"
+        );
+        // No ack yet: unknown, never an implied "enforced".
+        let body = render_app(&app, 160, 14).join("\n");
+        assert!(body.contains("enforcement: …"), "{body}");
+
+        app.enforcement = Some(EnforcementInfo {
+            boundary: "netns:/run/netns/agent".into(),
+            active: true,
+        });
+        app.sock_destroy = true;
+        let body = render_app(&app, 160, 14).join("\n");
+        assert!(body.contains("enforcing netns:/run/netns/agent"), "{body}");
+        assert!(!body.contains("flow-kill off"));
+
+        app.sock_destroy = false;
+        let body = render_app(&app, 160, 14).join("\n");
+        assert!(body.contains("flow-kill off"), "{body}");
+
+        app.enforcement = Some(EnforcementInfo {
+            boundary: "netns:/run/netns/agent".into(),
+            active: false,
+        });
+        let body = render_app(&app, 160, 14).join("\n");
+        assert!(
+            body.contains("ENFORCEMENT OFF — netns:/run/netns/agent"),
+            "{body}"
+        );
+    }
+
+    // A reconnect re-subscribes; until the NEW ack lands, held
+    // enforcement is from a previous daemon and must not render as
+    // truth (the restarted daemon may come up with no boundary).
+    #[test]
+    fn unsynced_socket_hides_stale_enforcement() {
+        use tethys_core::protocol::EnforcementInfo;
+        let mut app = sample_app();
+        app.enforcement = Some(EnforcementInfo {
+            boundary: "netns:/run/netns/agent".into(),
+            active: true,
+        });
+        app.sock_destroy = true;
+        let mut terminal = Terminal::new(TestBackend::new(160, 14)).unwrap();
+        terminal
+            .draw(|f| {
+                draw(
+                    f,
+                    &app,
+                    ConnStatus {
+                        up: true,
+                        synced: false,
+                    },
+                )
+            })
+            .unwrap();
+        let body = terminal
+            .backend()
+            .buffer()
+            .content()
+            .chunks(160)
+            .map(|row| row.iter().map(|c| c.symbol()).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(body.contains("enforcement: …"), "{body}");
+        assert!(!body.contains("enforcing netns"), "{body}");
+    }
+
+    // The stop modal states the flow-kill consequence matching the
+    // daemon's capability, so the typed confirmation is informed.
+    #[test]
+    fn stop_modal_states_flow_consequence() {
+        use tethys_core::protocol::EnforcementInfo;
+        let mut app = sample_app();
+        app.modal = crate::app::Modal::ConfirmStop;
+        app.enforcement = Some(EnforcementInfo {
+            boundary: "netns:/run/netns/agent".into(),
+            active: true,
+        });
+        app.sock_destroy = true;
+        // 120 cols -> modal is centered(50%) = 60 wide; both sentences
+        // must fit without clipping or the operator confirms blind.
+        let body = render_app(&app, 120, 20).join("\n");
+        assert!(body.contains("destroys established TCP flows"), "{body}");
+        app.sock_destroy = false;
+        let body = render_app(&app, 120, 20).join("\n");
+        assert!(body.contains("flow-kill off"), "{body}");
     }
 
     // At wide sizes every fact renders intact (full first IP, +N for the

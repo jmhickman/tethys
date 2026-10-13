@@ -312,6 +312,10 @@ pub enum EvDecided {
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct EvStopped {
     pub grants_removed: usize,
+    /// Established TCP flows destroyed alongside the grants (step 4).
+    /// Zero when no flow matched or the kernel lacks SOCK_DESTROY —
+    /// the subscribe ack's `sock_destroy` separates those cases.
+    pub killed: usize,
 }
 
 /// `grant.expired`: kernel TTL reaped the element.
@@ -456,9 +460,18 @@ mod tests {
             Ok(EvDecided::Revoked { .. })
         ));
 
-        let s = serde_json::to_value(EvStopped { grants_removed: 3 }).unwrap();
+        let s = serde_json::to_value(EvStopped {
+            grants_removed: 3,
+            killed: 2,
+        })
+        .unwrap();
         assert_eq!(s["grants_removed"], 3);
+        assert_eq!(s["killed"], 2);
+        // Both fields required: no version shims on daemon-sent payloads.
         assert!(serde_json::from_value::<EvStopped>(serde_json::json!({})).is_err());
+        assert!(
+            serde_json::from_value::<EvStopped>(serde_json::json!({"grants_removed": 1})).is_err()
+        );
     }
 
     // grant_id accepts a string (canonical) and a number (hand-rolled echo);

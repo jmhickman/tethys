@@ -5,7 +5,8 @@ use std::collections::BTreeMap;
 use serde_json::Value;
 
 use tethys_core::protocol::{
-    method, EvDecided, EvError, EvExpired, EvRequestNew, EvStopped, EvTraffic, SubscribeAck,
+    method, EnforcementInfo, EvDecided, EvError, EvExpired, EvRequestNew, EvStopped, EvTraffic,
+    SubscribeAck,
 };
 use tethys_core::types::PortSpec;
 use tethys_core::wire::{GrantRow, PendingRowWire};
@@ -79,6 +80,17 @@ pub struct PendingRow {
     pub created_at: u64,
 }
 
+/// Enforcement-boundary truth as last reported by the daemon. The whole
+/// point of surfacing this: a row reading APPROVED must never be mistaken
+/// for traffic actually being filtered.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Enforce {
+    /// No subscribe ack yet (or the socket dropped before one arrived).
+    Unknown,
+    Active,
+    Inactive,
+}
+
 #[derive(PartialEq)]
 pub enum Modal {
     None,
@@ -124,6 +136,13 @@ pub struct App {
     pub now: u64,
     pub timeout_secs: Option<u64>, // from subscribe ack
     pub daemon_version: Option<String>,
+    /// Enforcement boundary as the daemon saw it at subscribe time. None
+    /// until the ack lands: the header must never imply "enforced" from
+    /// the mere presence of APPROVED rows.
+    pub enforcement: Option<EnforcementInfo>,
+    /// Kernel supports SOCK_DESTROY (subscribe ack). False until the ack
+    /// and on degraded daemons: revoke/stop then remove elements only.
+    pub sock_destroy: bool,
     pub flash: Option<(String, std::time::Instant)>, // transient status line
 }
 
@@ -146,6 +165,8 @@ impl App {
             now: 0,
             timeout_secs: None,
             daemon_version: None,
+            enforcement: None,
+            sock_destroy: false,
             flash: None,
         }
     }
@@ -185,6 +206,27 @@ impl App {
             }
         });
         v
+    }
+
+    pub fn enforce_state(&self) -> Enforce {
+        match &self.enforcement {
+            Some(e) if e.active => Enforce::Active,
+            Some(_) => Enforce::Inactive,
+            None => Enforce::Unknown,
+        }
+    }
+
+    /// Canonical header spelling of the enforcement truth, boundary path
+    /// included. `flow-kill off` flags a daemon whose kernel lacks
+    /// SOCK_DESTROY: grants gate new connections but revoke/stop leave
+    /// established flows to conntrack timeouts.
+    pub fn enforce_text(&self) -> String {
+        match (&self.enforcement, self.sock_destroy) {
+            (None, _) => "enforcement: …".into(),
+            (Some(e), true) if e.active => format!("enforcing {}", e.boundary),
+            (Some(e), false) if e.active => format!("enforcing {} · flow-kill off", e.boundary),
+            (Some(e), _) => format!("ENFORCEMENT OFF — {}", e.boundary),
+        }
     }
 
     pub fn clamp_sel(&mut self) {
@@ -276,7 +318,10 @@ impl App {
                     self.live.clear();
                     self.pending.clear();
                     self.modal = Modal::None;
-                    self.set_flash(format!("stop.grants: {} grants removed", ev.grants_removed));
+                    self.set_flash(format!(
+                        "stop.grants: {} grants removed, {} flows killed",
+                        ev.grants_removed, ev.killed
+                    ));
                 }
                 Err(e) => self.set_flash(bad(e)),
             },
@@ -326,11 +371,14 @@ impl App {
                 .unwrap_or("daemon error")
                 .to_string()
         };
-        match v.get("id").and_then(|i| i.as_str()).unwrap_or("") {
+        let id = v.get("id").and_then(|i| i.as_str()).unwrap_or("");
+        match id {
             "c-sub" => match serde_json::from_value::<SubscribeAck>(v["result"].clone()) {
                 Ok(ack) => {
                     self.timeout_secs = Some(ack.approver_timeout_secs);
                     self.daemon_version = Some(ack.version);
+                    self.enforcement = Some(ack.enforcement);
+                    self.sock_destroy = ack.sock_destroy;
                 }
                 Err(e) => self.set_flash(format!("bad subscribe ack: {e}")),
             },
@@ -423,6 +471,13 @@ impl App {
             "a-approve" | "a-deny" | "a-revoke" | "a-stop" => {
                 if let Some(e) = v.get("error") {
                     self.set_flash(format!("daemon: {}", e["message"].as_str().unwrap_or("?")));
+                } else if id == "a-revoke" {
+                    // The kill count is the point of a revoke: APPROVED
+                    // rows that vanished without this flash still had
+                    // their elements removed, but flows may linger if
+                    // the daemon runs degraded (see header status).
+                    let killed = v["result"]["killed"].as_u64().unwrap_or(0);
+                    self.set_flash(format!("revoked, {killed} flows killed"));
                 }
             }
             _ => {}
@@ -605,4 +660,103 @@ fn live_from_row(g: &GrantRow) -> Option<LiveRow> {
         bytes_up: None,
         bytes_down: None,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn line(json: serde_json::Value) -> (App, Vec<Cmd>) {
+        let mut app = App::new();
+        let mut out = Vec::new();
+        app.on_line(&json, &mut out);
+        (app, out)
+    }
+
+    fn sub_ack(active: bool, sock_destroy: bool) -> serde_json::Value {
+        serde_json::json!({
+            "id": "c-sub",
+            "result": {
+                "events": ["grant.request_new"],
+                "approver_timeout_secs": 300,
+                "version": "2026.10.1",
+                "enforcement": {"boundary": "netns:/run/netns/agent", "active": active},
+                "sock_destroy": sock_destroy
+            }
+        })
+    }
+
+    #[test]
+    fn subscribe_ack_folds_enforcement_truth_into_state() {
+        // Before the ack: unknown — the header must not imply enforcement.
+        let app = App::new();
+        assert_eq!(app.enforce_state(), Enforce::Unknown);
+        assert!(app.enforce_text().contains("…"));
+
+        let (app, _) = line(sub_ack(true, true));
+        assert_eq!(app.enforce_state(), Enforce::Active);
+        assert_eq!(app.enforce_text(), "enforcing netns:/run/netns/agent");
+
+        // Active boundary but kernel cannot destroy flows: flagged.
+        let (app, _) = line(sub_ack(true, false));
+        assert_eq!(
+            app.enforce_text(),
+            "enforcing netns:/run/netns/agent · flow-kill off"
+        );
+
+        // Boundary down: APPROVED rows would be unenforced — loud text.
+        let (app, _) = line(sub_ack(false, true));
+        assert_eq!(app.enforce_state(), Enforce::Inactive);
+        assert_eq!(
+            app.enforce_text(),
+            "ENFORCEMENT OFF — netns:/run/netns/agent"
+        );
+    }
+
+    #[test]
+    fn stop_and_revoke_flashes_carry_kill_counts() {
+        let (app, _) = line(serde_json::json!({
+            "method": "grants.stopped",
+            "params": {"grants_removed": 3, "killed": 2}
+        }));
+        let flash = app.flash.clone().unwrap().0;
+        assert_eq!(flash, "stop.grants: 3 grants removed, 2 flows killed");
+
+        let (app, _) = line(serde_json::json!({
+            "id": "a-revoke",
+            "result": {"revoked": "7", "killed": 1}
+        }));
+        assert_eq!(app.flash.clone().unwrap().0, "revoked, 1 flows killed");
+
+        // Degraded daemon: zero is shown, not hidden — silence would be
+        // indistinguishable from "no flows existed".
+        let (app, _) = line(serde_json::json!({
+            "id": "a-revoke",
+            "result": {"revoked": "7", "killed": 0}
+        }));
+        assert_eq!(app.flash.clone().unwrap().0, "revoked, 0 flows killed");
+
+        // Errors still flash the daemon message, not a bogus count.
+        let (app, _) = line(serde_json::json!({
+            "id": "a-revoke",
+            "error": {"code": -32000, "message": "grant not found"}
+        }));
+        assert_eq!(app.flash.clone().unwrap().0, "daemon: grant not found");
+    }
+
+    #[test]
+    fn bad_events_and_missing_fields_still_flash() {
+        // EvStopped now REQUIRES killed: an old-shaped broadcast is a
+        // contract violation, flashed rather than silently mis-rendered.
+        let (app, _) = line(serde_json::json!({
+            "method": "grants.stopped",
+            "params": {"grants_removed": 3}
+        }));
+        assert!(app
+            .flash
+            .clone()
+            .unwrap()
+            .0
+            .contains("bad grants.stopped payload"));
+    }
 }

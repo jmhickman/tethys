@@ -351,7 +351,14 @@ async fn stop_grants(req: &RpcRequest, st: &Arc<State>) -> RpcResponse {
     if let Err(e) = crate::install::project_delegated(st).await {
         tracing::error!(%e, "delegation projection after stop.grants failed");
     }
-    emit(st, method::EV_STOPPED, EvStopped { grants_removed: n });
+    emit(
+        st,
+        method::EV_STOPPED,
+        EvStopped {
+            grants_removed: n,
+            killed,
+        },
+    );
     RpcResponse::ok(&req.id, serde_json::json!({"revoked": n, "killed": killed}))
 }
 
