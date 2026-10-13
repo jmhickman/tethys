@@ -8,7 +8,7 @@ use tethys_core::protocol::{
     method, EnforcementInfo, EvDecided, EvError, EvExpired, EvRequestNew, EvStopped, EvTraffic,
     SubscribeAck,
 };
-use tethys_core::types::PortSpec;
+use tethys_core::types::{Direction, PortSpec};
 use tethys_core::wire::{GrantRow, PendingRowWire};
 
 use crate::conn::{cmd, Cmd};
@@ -64,6 +64,8 @@ pub struct LiveRow {
     pub ttl_secs: u64,
     pub reason: String,
     pub tool: String,
+    /// Grant direction; ingress rows render with a ← marker.
+    pub dir: Direction,
     /// Kernel truth (traffic.stat); None until the first poll covers this grant.
     pub left: Option<u64>,
     pub bytes_up: Option<u64>,
@@ -76,6 +78,9 @@ pub struct PendingRow {
     pub ports: String,
     pub reason: String,
     pub tool: String,
+    /// Inbound requests get an explicit INBOUND line in the popup — an
+    /// approver reading only "target + ports" would assume egress.
+    pub dir: Direction,
     pub ttl_requested: String,
     pub created_at: u64,
 }
@@ -283,6 +288,7 @@ impl App {
                         ports: fmt_ports(&ev.dst_port, ev.proto),
                         reason: ev.reason,
                         tool: ev.tool,
+                        dir: ev.dir,
                         ttl_requested: ev.ttl_requested,
                         created_at: ev.created_at,
                     });
@@ -433,6 +439,7 @@ impl App {
                                     ),
                                     reason: pr.row.reason,
                                     tool: pr.row.tool,
+                                    dir: pr.row.dir,
                                     ttl_requested: fmt_ttl_secs(pr.row.ttl_secs),
                                     created_at: pr.row.created_at,
                                 },
@@ -656,6 +663,7 @@ fn live_from_row(g: &GrantRow) -> Option<LiveRow> {
         ttl_secs: g.granted_ttl_secs.unwrap_or(g.ttl_secs),
         reason: g.reason.clone(),
         tool: g.tool.clone(),
+        dir: g.dir,
         left: None,
         bytes_up: None,
         bytes_down: None,

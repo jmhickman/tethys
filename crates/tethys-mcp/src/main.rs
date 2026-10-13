@@ -53,6 +53,11 @@ pub struct GrantRequest {
     pub tool: String,
     #[schemars(description = "Requested TTL: Ns/Nm/Nh grammar, e.g. 15m")]
     pub ttl: String,
+    #[schemars(
+        description = r#""egress" (default) = this host connecting OUT to the target; "ingress" = allow packets IN from the target source address to the listed LOCAL ports (dst_host/dst_ip/dst_net then name the SOURCE; dst_port the local service ports). Inbound grants still need human approval, and gate only while the daemon's netns enforcement boundary is active."#
+    )]
+    #[serde(default)]
+    pub direction: Option<String>,
 }
 
 pub struct ScopeMcp {
@@ -66,21 +71,43 @@ impl ScopeMcp {
     }
 
     #[tool(
-        description = "Request temporary network egress for a pentest target. BLOCKS until a human \
-                       approver decides (or denies after timeout). Returns the EFFECTIVE grant \
-                       (ttl/port may be reduced), so obey the return value, not your request."
+        description = "Request temporary network access for a pentest target. Egress by default; \
+                       direction=\"ingress\" opens inbound to LOCAL ports from a source address \
+                       (inbound gates only exist inside the netns enforcement boundary). BLOCKS \
+                       until a human approver decides (or denies after timeout). Returns the \
+                       EFFECTIVE grant (ttl/port may be reduced), so obey the return value, not \
+                       your request. A revoked or expired grant also DESTROYS its established TCP \
+                       flows: reconnect after revoke; never assume a live socket survives it."
     )]
     async fn request_traffic_grant(
         &self,
         Parameters(req): Parameters<GrantRequest>,
     ) -> Result<String, ErrorData> {
         tracing::debug!("tool call entered");
+        // Direction is validated here (not just by the daemon) so a typo
+        // is an instant -32602 instead of a 5-minute popup gamble. Absent
+        // means egress — the wire grammar, same as the daemon's.
+        let dir = match req.direction.as_deref() {
+            None | Some("") => "egress".to_string(),
+            Some(d) => {
+                let d = d.to_ascii_lowercase();
+                if d == "egress" || d == "ingress" {
+                    d
+                } else {
+                    return Err(ErrorData::invalid_params(
+                        format!("direction must be \"egress\" or \"ingress\", got {d:?}"),
+                        None,
+                    ));
+                }
+            }
+        };
         let params = serde_json::json!({
             "dst_host": req.dst_host,
             "dst_ip": req.dst_ip,
             "dst_net": req.dst_net,
             "dst_port": req.dst_port,
             "proto": req.proto,
+            "dir": dir,
             "reason": req.reason,
             "tool": req.tool,
             "ttl_requested": req.ttl,
@@ -144,8 +171,14 @@ impl ScopeMcp {
         let items: Vec<String> = stats
             .iter()
             .map(|g| {
+                // ingress reads as an opening FROM the named source
+                let arrow = if g.dir == tethys_core::types::Direction::Ingress {
+                    "←"
+                } else {
+                    ""
+                };
                 format!(
-                    "{}:{} {}m left",
+                    "{arrow}{}:{} {}m left",
                     g.name,
                     g.dst_port.from,
                     g.seconds_remaining.div_ceil(60)
@@ -241,8 +274,13 @@ fn render_grant_list(r: &serde_json::Value) -> String {
             .ok()
             .and_then(|p| p.as_str().map(String::from))
             .unwrap_or_else(|| "?".into());
+        let dir_tag = if g.dir == tethys_core::types::Direction::Ingress {
+            " INBOUND"
+        } else {
+            ""
+        };
         out.push_str(&format!(
-            "  #{gid} [{tool}] {name} {proto} {from}-{to} · {m}:{s:02} left\n",
+            "  #{gid} [{tool}] {name}{dir_tag} {proto} {from}-{to} · {m}:{s:02} left\n",
             gid = g.grant_id,
             tool = if g.tool.is_empty() { "?" } else { &g.tool },
             name = g.name,
@@ -253,6 +291,15 @@ fn render_grant_list(r: &serde_json::Value) -> String {
         ));
     }
     out.push_str("Expiry is kernel truth; re-request before a grant lapses mid-task.");
+    if stats
+        .iter()
+        .any(|g| g.dir == tethys_core::types::Direction::Ingress)
+    {
+        out.push_str(
+            "\nINBOUND grants gate packets only while the daemon's netns enforcement \
+             boundary is active; egress is always enforced.",
+        );
+    }
     out
 }
 
@@ -268,10 +315,16 @@ fn render_verdict(r: &serde_json::Value) -> String {
             effective,
             ttl_granted,
             expires_at,
+            dir,
             ..
         } => {
+            let inbound = if dir == tethys_core::types::Direction::Ingress {
+                " INBOUND"
+            } else {
+                ""
+            };
             format!(
-                "APPROVED: {} {} {}-{} granted for {ttl_granted} (expires {expires_at})",
+                "APPROVED{inbound}: {} {} {}-{} granted for {ttl_granted} (expires {expires_at})",
                 effective.dst,
                 serde_json::to_value(effective.proto)
                     .ok()
@@ -298,10 +351,22 @@ fn render_verdict(r: &serde_json::Value) -> String {
         V::Denied {
             reason_code, note, ..
         } => {
+            // The one deny the model can misread as "try again": with the
+            // boundary down, no grant can gate anything, so say what to do.
+            let boundary_down = reason_code == tethys_core::protocol::DenyReason::BoundaryInactive;
             let code = serde_json::to_value(reason_code)
                 .ok()
                 .and_then(|c| c.as_str().map(String::from))
                 .unwrap_or_else(|| "denied".into());
+            if boundary_down {
+                let advice = "the netns enforcement boundary is not active, so nothing can \
+                              be gated right now; ask the operator to restore it \
+                              (systemctl status tethysd)";
+                return match note {
+                    Some(n) => format!("DENIED ({code}): {n} — {advice}"),
+                    None => format!("DENIED ({code}): {advice}"),
+                };
+            }
             match note {
                 Some(n) => format!("DENIED ({code}): {n}"),
                 None => format!("DENIED ({code})"),
@@ -324,9 +389,16 @@ fn next_id() -> String {
 impl ServerHandler for ScopeMcp {
     fn get_info(&self) -> ServerConfig {
         ServerConfig::new(ServerCapabilities::builder().enable_tools().build()).with_instructions(
-            "You are sandboxed: ALL egress is blocked by the kernel unless granted. \
-             Use request_traffic_grant before any network tool. One target per call; \
-             waits for human approval; may be denied or reduced. Re-request when expired. \
+            "You are sandboxed: ALL traffic is blocked by the kernel unless granted. \
+             Egress is the default; direction='ingress' opens inbound packets FROM the \
+             target TO local ports (for testing services on this host) — inbound gates \
+             exist only inside the netns enforcement boundary, so they are active only \
+             while the daemon reports one; a deny with reason 'boundary_inactive' means \
+             enforcement is down and no request can succeed until the operator restores \
+             it. Use request_traffic_grant before any network tool. One target per call; \
+             waits for human approval; may be denied or reduced. Revocation and expiry \
+             also destroy established TCP flows of the grant: reconnect after revoke, \
+             never assume a live socket survives it. Re-request when expired. \
              list_traffic_grants shows live grants with kernel-truth time remaining: \
              call it when an outbound connection fails unexpectedly to tell an expired \
              grant from a dead target.",
@@ -373,7 +445,9 @@ mod tests {
             s.contains("#9 [curl] host:api.jina.ai tcp 443-443 · 9:58 left"),
             "{s}"
         );
-        assert!(s.contains("#10 [ssh] ip:192.168.10.2"), "{s}");
+        // ingress row is marked, and its presence adds the boundary note
+        assert!(s.contains("#10 [ssh] ip:192.168.10.2 INBOUND"), "{s}");
+        assert!(s.contains("netns enforcement boundary is active"), "{s}");
 
         // rows without `tool` still deserialize (serde default)
         let legacy = serde_json::json!([
@@ -412,5 +486,81 @@ mod tests {
 
         let bad = serde_json::json!({"decision":"approved","grant_id":"7"});
         assert!(render_verdict(&bad).starts_with("DENIED (malformed_verdict)"));
+
+        // dir is REQUIRED on approved verdicts (no version shims): the
+        // model must always learn which way a gate opens.
+        let ing = serde_json::json!({
+            "decision":"approved",
+            "grant_id":"8",
+            "effective":{"dst":"203.0.113.7","proto":"tcp","dst_port":{"from":4444,"to":4444}},
+            "ttl_granted":"5m","expires_at":"2026-09-15T02:41:00Z",
+            "dir":"ingress"});
+        assert!(
+            render_verdict(&ing).starts_with("APPROVED INBOUND:"),
+            "{}",
+            render_verdict(&ing)
+        );
+        let nodir = serde_json::json!({
+            "decision":"approved","grant_id":"8",
+            "effective":{"dst":"1.2.3.4","proto":"tcp","dst_port":{"from":80,"to":80}},
+            "ttl_granted":"5m","expires_at":"x"});
+        assert!(render_verdict(&nodir).starts_with("DENIED (malformed_verdict)"));
+
+        // boundary_inactive carries operator guidance, not just a code:
+        // retrying against a down boundary is futile and the model must
+        // be able to say why.
+        let bi = serde_json::json!({"decision":"denied","reason_code":"boundary_inactive"});
+        let s = render_verdict(&bi);
+        assert!(s.contains("DENIED (boundary_inactive)"), "{s}");
+        assert!(s.contains("not active") && s.contains("operator"), "{s}");
+    }
+
+    #[test]
+    fn direction_arg_is_optional_egress_default() {
+        let r: GrantRequest = serde_json::from_value(serde_json::json!({
+            "dst_ip":"1.2.3.4","dst_port":{"from":0,"to":0},"proto":"tcp",
+            "reason":"","tool":"","ttl":"5m"}))
+        .unwrap();
+        assert_eq!(r.direction, None);
+        let r: GrantRequest = serde_json::from_value(serde_json::json!({
+            "dst_ip":"1.2.3.4","dst_port":{"from":0,"to":0},"proto":"tcp",
+            "reason":"","tool":"","ttl":"5m","direction":"ingress"}))
+        .unwrap();
+        assert_eq!(r.direction.as_deref(), Some("ingress"));
+    }
+
+    // Direction validation is client-side and happens BEFORE the daemon
+    // is touched: a typo is an instant -32602, not a 5-minute popup
+    // gamble. A valid direction gets past validation and fails only at
+    // the (deliberately nonexistent) socket.
+    #[tokio::test]
+    async fn bad_direction_rejected_before_touching_daemon() {
+        let mcp = ScopeMcp::new(PathBuf::from("/nonexistent-tethys-test.sock"));
+        let base = serde_json::json!({
+            "dst_ip":"1.2.3.4","dst_port":{"from":443,"to":443},"proto":"tcp",
+            "reason":"r","tool":"curl","ttl":"5m"});
+        let mut req: GrantRequest = serde_json::from_value(base.clone()).unwrap();
+        req.direction = Some("intress".into()); // typo
+        let e = mcp
+            .request_traffic_grant(Parameters(req))
+            .await
+            .expect_err("typo must be rejected");
+        // Assert the client-side validator's own wording: the typed
+        // AccessRequestParams check downstream would also reject it with
+        // a serde message, so a looser assert could not tell the two
+        // layers apart (mutation-tested).
+        assert!(e.message.starts_with("direction must be"), "{e:?}");
+        assert!(
+            !e.message.contains("unavailable"),
+            "must fail at validation, not the socket"
+        );
+
+        let mut req: GrantRequest = serde_json::from_value(base).unwrap();
+        req.direction = Some("Ingress".into()); // case-insensitive, passes
+        let e = mcp
+            .request_traffic_grant(Parameters(req))
+            .await
+            .expect_err("no daemon behind the test socket");
+        assert!(e.message.contains("unavailable"), "{e:?}");
     }
 }

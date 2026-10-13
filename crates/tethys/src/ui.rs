@@ -4,7 +4,7 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap},
+    widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap},
     Frame,
 };
 /// Display width in terminal cells (CJK-safe via per-char widths).
@@ -329,7 +329,12 @@ fn cells_for(r: &crate::app::LiveRow) -> RowCells {
         vals: [
             r.id.to_string(),
             r.tool.clone(),
-            fmt_dst(r),
+            // ingress rows read as an opening FROM the named address
+            if r.dir == tethys_core::types::Direction::Ingress {
+                format!("←{}", fmt_dst(r))
+            } else {
+                fmt_dst(r)
+            },
             r.ports.clone(),
             r.proto.clone(),
             fmt_ttl_mins(r.ttl_secs),
@@ -648,6 +653,15 @@ fn draw_pending_modal(f: &mut Frame, app: &App, idx: usize) {
             .add_modifier(Modifier::BOLD),
     ));
     body.extend(field("ports", &p.ports));
+    if p.dir == tethys_core::types::Direction::Ingress {
+        body.extend(field_styled(
+            "direction",
+            "INBOUND — packets FROM this source INTO the local ports above",
+            Style::default()
+                .fg(Color::LightYellow)
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
     body.extend(field("ttl requested", &p.ttl_requested));
     body.push(Line::from(""));
     body.extend(field("reason", &p.reason));
@@ -738,6 +752,16 @@ fn draw_detail_modal(f: &mut Frame, app: &App, id: i64) {
                     .fg(Color::Green)
                     .add_modifier(Modifier::BOLD),
             ),
+            if r.dir == tethys_core::types::Direction::Ingress {
+                Span::styled(
+                    "   ← INBOUND (source -> local ports)",
+                    Style::default()
+                        .fg(Color::LightYellow)
+                        .add_modifier(Modifier::BOLD),
+                )
+            } else {
+                Span::raw("")
+            },
         ]),
         Line::from(vec![
             Span::styled(" installed   ", muted(true)),
@@ -813,7 +837,12 @@ fn draw_history_modal(f: &mut Frame, app: &App) {
             // dst + ports on every row (the wire row carries them); denied
             // rows additionally trail their code and note.
             let dst = format!(
-                "{} {}",
+                "{}{} {}",
+                if g.dir == tethys_core::types::Direction::Ingress {
+                    "←"
+                } else {
+                    ""
+                },
                 g.target,
                 crate::app::port_text(g.port_from, g.port_to)
             );
@@ -841,7 +870,13 @@ fn draw_history_modal(f: &mut Frame, app: &App) {
             })
         })
         .collect();
-    f.render_widget(
+    // Same minimal-scroll window as the live table: offset only grows enough
+    // to keep the selected row on screen (it rides the bottom edge when
+    // moving down, the top edge's list item when moving back up past it).
+    let visible = area.height.saturating_sub(2) as usize;
+    let mut state =
+        ListState::default().with_offset(app.hist_sel.saturating_sub(visible.saturating_sub(1)));
+    f.render_stateful_widget(
         List::new(items).block(
             Block::default()
                 .borders(Borders::ALL)
@@ -849,6 +884,7 @@ fn draw_history_modal(f: &mut Frame, app: &App) {
                 .title_bottom(" j/k select · Esc back "),
         ),
         area,
+        &mut state,
     );
 }
 
@@ -1075,6 +1111,7 @@ mod tests {
             ttl_secs: 3600,
             reason: reason.into(),
             tool: tool.into(),
+            dir: Default::default(),
             left: Some(61),
             bytes_up: Some(1234),
             bytes_down: Some(98765),
@@ -1158,6 +1195,122 @@ mod tests {
             body.contains("ENFORCEMENT OFF — netns:/run/netns/agent"),
             "{body}"
         );
+    }
+
+    // Direction is a grant fact an approver can misread as destination:
+    // ingress rows must be marked in the live table, the pending popup,
+    // and the detail modal (markers shipped with 2026.10.1, re-ported
+    // after that commit's revert).
+    #[test]
+    fn ingress_rows_are_marked_everywhere() {
+        use tethys_core::types::Direction;
+        let mut app = sample_app();
+        app.live.get_mut(&2).unwrap().dir = Direction::Ingress;
+        let body = render_app(&app, 140, 14).join("\n");
+        assert!(
+            body.contains("←93.184.216.34"),
+            "live table marker:\n{body}"
+        );
+        assert!(
+            !body.contains("←104.26.10.242"),
+            "egress row stays unmarked:\n{body}"
+        );
+
+        app.modal = crate::app::Modal::Detail(2);
+        let body = render_app(&app, 100, 20).join("\n");
+        assert!(body.contains("INBOUND (source -> local ports)"), "{body}");
+    }
+
+    #[test]
+    fn pending_modal_flags_inbound_requests() {
+        use crate::app::PendingRow;
+        use tethys_core::types::Direction;
+        let mut app = App::new();
+        app.pending.insert(
+            3,
+            PendingRow {
+                target: "ip:203.0.113.7".into(),
+                ports: "22/tcp".into(),
+                reason: "reverse ssh for engagement".into(),
+                tool: "ssh".into(),
+                dir: Direction::Ingress,
+                ttl_requested: "30m".into(),
+                created_at: 0,
+            },
+        );
+        app.modal = crate::app::Modal::Pending(0);
+        let body = render_app(&app, 100, 24).join("\n");
+        assert!(
+            body.contains("INBOUND — packets FROM this source"),
+            "{body}"
+        );
+    }
+
+    // The history list must scroll with the cursor: with more rows than fit
+    // the modal, selecting a deep row keeps it visible (it used to walk off
+    // the bottom of an unoffset List while only the newest N stayed drawn).
+    #[test]
+    fn history_modal_scrolls_to_keep_selection_visible() {
+        use tethys_core::wire::{GrantRow, GrantState};
+        let mut app = sample_app();
+        app.history = (1..=30i64)
+            .map(|id| GrantRow {
+                id,
+                idem_key: None,
+                target: format!("ip:10.0.0.{id}"),
+                dst_json: "[]".into(),
+                port_from: 443,
+                port_to: 443,
+                proto: tethys_core::types::Proto::Tcp,
+                dir: Default::default(),
+                reason: "r".into(),
+                tool: "curl".into(),
+                ttl_secs: 600,
+                granted_ttl_secs: Some(600),
+                state: GrantState::Expired,
+                created_at: 0,
+                expires_at: None,
+                deny_code: None,
+                note: None,
+            })
+            .collect();
+        app.modal = Modal::History;
+        // 14 rows tall -> modal is ~11 rows (80%), inner list ~9. Move the
+        // cursor to the last row, far below the initial viewport.
+        let mut terminal = Terminal::new(TestBackend::new(100, 14)).unwrap();
+        let st = ConnStatus {
+            up: true,
+            synced: true,
+        };
+        app.hist_sel = 29;
+        terminal.draw(|f| draw(f, &app, st)).unwrap();
+        let body: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(
+            body.contains("ip:10.0.0.30"),
+            "selected deep row must be scrolled into view:\n{body}"
+        );
+        assert!(
+            !body.contains("ip:10.0.0.1 "),
+            "row 0 must have scrolled out of the window:\n{body}"
+        );
+        // Moving back up scrolls with it: first row visible again, last not.
+        app.hist_sel = 0;
+        terminal.draw(|f| draw(f, &app, st)).unwrap();
+        let body: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(body.contains("ip:10.0.0.1 "), "row 0 back in view");
+        assert!(!body.contains("ip:10.0.0.30"), "row 30 out of view again");
     }
 
     // A reconnect re-subscribes; until the NEW ack lands, held
@@ -1503,6 +1656,7 @@ mod tests {
                 ports: "443/tcp".into(),
                 reason: "need this long-lived outbound access so the retrieval worker can refresh embeddings for the knowledge base index overnight".into(),
                 tool: "hermes-agent".into(),
+                dir: Default::default(),
                 ttl_requested: "15m".into(),
                 created_at: 0,
             },
