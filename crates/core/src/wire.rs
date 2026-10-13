@@ -6,7 +6,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::types::Proto;
+use crate::types::{Direction, Proto};
 
 /// Grant states. Wire/DB spelling is snake_case (serde is the authority);
 /// [`GrantState::ALL`] is the alloc-free spelling table behind `as_str`/`parse`,
@@ -59,6 +59,9 @@ pub enum DenyCode {
     /// Alias keeps rows written by the pre-kebab spelling loadable.
     #[serde(alias = "restart-reconcile")]
     RestartReconcile,
+    /// Install refused because the enforcement boundary (netns) is not
+    /// active — nothing would filter this grant (step 3 fail-closed rule).
+    BoundaryInactive,
     #[serde(untagged)]
     Unknown(String),
 }
@@ -74,6 +77,7 @@ impl DenyCode {
             DenyCode::InstallFailed => "install_failed",
             DenyCode::RestartOrphan => "restart_orphan",
             DenyCode::RestartReconcile => "restart_reconcile",
+            DenyCode::BoundaryInactive => "boundary_inactive",
             DenyCode::Unknown(s) => s,
         }
     }
@@ -98,6 +102,9 @@ pub struct GrantRow {
     #[serde(default)]
     pub granted_ttl_secs: Option<u64>,
     pub state: GrantState,
+    /// Grant direction. Always present on the wire; stored rows written
+    /// before the column existed carry 'egress' via the ALTER TABLE default.
+    pub dir: Direction,
     pub created_at: u64,
     #[serde(default)]
     pub expires_at: Option<f64>,
@@ -163,6 +170,7 @@ mod tests {
     #[test]
     fn pending_row_flattens() {
         let row = GrantRow {
+            dir: Default::default(),
             id: 7,
             idem_key: None,
             target: "ip:192.0.2.1".into(),

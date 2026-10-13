@@ -92,6 +92,16 @@ pub struct Config {
         tethys_core::types::PortSpec,
         tethys_core::types::Proto,
     )>,
+    /// Operator INBOUND allow list ([netns]-independent; carve_in sets).
+    pub allow_in: Vec<(
+        tethys_core::types::Target,
+        tethys_core::types::PortSpec,
+        tethys_core::types::Proto,
+    )>,
+    /// Validated `[netns]` spec: the enforcement boundary every state
+    /// machine batch writes into. Required unless --dry-run (netns mode is
+    /// the only mode; a missing or malformed section aborts startup).
+    pub netns: Option<provision::Spec>,
     pub dry_run: bool,
 }
 
@@ -138,13 +148,34 @@ async fn main() -> anyhow::Result<()> {
         return provision::run_spec(&spec).await;
     }
 
+    // netns mode is the only mode: the section is required and strictly
+    // validated (mode-aware keys, addresses, ifnames) before anything else
+    // runs, so a bad value aborts startup rather than degrading enforcement.
+    // --dry-run is the sole exception: dev state-machine runs touch no
+    // kernel and need no boundary. Resolved before `file` is destructured
+    // below, and against the same final table name the daemon will use.
+    let nft_table = cli
+        .nft_table
+        .clone()
+        .unwrap_or_else(|| file.nft_table.clone());
+    let netns_spec = match &file.netns {
+        Some(nf) => Some(provision::Spec::from_netns(nf, &nft_table)?),
+        None if !(cli.dry_run || file.dry_run) => {
+            anyhow::bail!(
+                "[netns] section is required: enforcement lives in the agent \
+                 namespace; add [netns] (or --dry-run for dev state-machine runs)"
+            );
+        }
+        None => None,
+    };
+
     let mut cfg = Config {
         config_path: cli.config.clone(),
         allow_from_cli: !cli.allow.is_empty(),
         mcp_socket: cli.mcp_socket.unwrap_or(file.mcp_socket),
         admin_socket: cli.admin_socket.unwrap_or(file.admin_socket),
         db: cli.db.unwrap_or(file.db),
-        nft_table: cli.nft_table.unwrap_or(file.nft_table),
+        nft_table,
         max_ttl: cli.max_ttl.unwrap_or(file.max_ttl),
         approver_timeout_secs: cli
             .approver_timeout_secs
@@ -156,6 +187,8 @@ async fn main() -> anyhow::Result<()> {
         mcp_peer_uid: None,
         mcp_sock_gid: None,
         allow: Vec::new(),
+        allow_in: Vec::new(),
+        netns: netns_spec,
         dry_run: cli.dry_run || file.dry_run,
     };
 
@@ -167,6 +200,11 @@ async fn main() -> anyhow::Result<()> {
     for entry in allow_src {
         cfg.allow.extend(
             config::parse_allow(entry).map_err(|e| anyhow::anyhow!("config `allow`: {e}"))?,
+        );
+    }
+    for entry in &file.allow_in {
+        cfg.allow_in.extend(
+            config::parse_allow(entry).map_err(|e| anyhow::anyhow!("config `allow_in`: {e}"))?,
         );
     }
 

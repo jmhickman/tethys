@@ -4,7 +4,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::types::{PortSpec, Proto};
+use crate::types::{Direction, PortSpec, Proto};
 use crate::wire::GrantState;
 
 /// JSON-RPC 2.0 request envelope (client -> server).
@@ -172,6 +172,12 @@ pub struct AccessRequestParams {
     pub dst_net: Option<String>,
     pub dst_port: PortSpec,
     pub proto: Proto,
+    /// Grant direction. Absent means egress: that is the wire grammar,
+    /// not a version shim (same convention as `allow`'s omitted proto).
+    /// Ingress grants gate NEW inbound connections to the namespace's
+    /// listeners.
+    #[serde(default)]
+    pub dir: Direction,
     pub reason: String,
     pub tool: String,
     /// ttl grammar: "15m"
@@ -197,6 +203,9 @@ pub enum DenyReason {
     GrantExpired,
     /// The nftables install failed; the kernel keeps its prior state.
     InstallFailed,
+    /// The enforcement boundary (netns) is not active: nothing would filter
+    /// this grant, so it is refused rather than APPROVED-but-unenforced.
+    BoundaryInactive,
     /// Replay of a request whose original is still awaiting a human decision:
     /// pending is not a grant, and the replay does not create a second popup.
     AlreadyPending,
@@ -213,6 +222,8 @@ pub enum Verdict {
         ttl_granted: String,
         /// RFC3339 UTC expiry.
         expires_at: String,
+        /// Direction this grant was installed for.
+        dir: Direction,
     },
     /// Covered by an existing request/grant; no human round-trip.
     /// `expires_at` is absent only while the original is still pending.
@@ -245,6 +256,8 @@ pub struct GrantStat {
     pub dst: Vec<String>,
     pub dst_port: PortSpec,
     pub proto: Proto,
+    /// Grant direction.
+    pub dir: Direction,
     pub seconds_remaining: u64,
     pub bytes_sent: u64,
     pub bytes_received: u64,
@@ -261,6 +274,8 @@ pub struct EvRequestNew {
     pub target: String,
     pub dst_port: PortSpec,
     pub proto: Proto,
+    /// Popup must never let an approver mistake direction for destination.
+    pub dir: Direction,
     pub reason: String,
     pub tool: String,
     pub ttl_requested: String,
@@ -317,17 +332,89 @@ pub struct EvError {
     pub message: String,
 }
 
+/// Live enforcement-boundary state, carried on the subscribe ack so the
+/// approver can never read APPROVED as ENFORCED without looking (step 5
+/// renders it). `boundary` names the netns path; `active` is the probe
+/// verdict (both grant families referenced by live rules).
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+pub struct EnforcementInfo {
+    pub boundary: String,
+    pub active: bool,
+}
+
 /// `subscribe` ack.
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct SubscribeAck {
     pub events: Vec<String>,
     pub approver_timeout_secs: u64,
     pub version: String,
+    /// Daemon's enforcement-boundary view at subscribe time.
+    pub enforcement: EnforcementInfo,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Wire grammar: an absent `dir` on a request means egress (same
+    // convention as `allow`'s omitted proto), "ingress" round-trips, and
+    // the boundary-inactive verdict has a stable spelling. Everything the
+    // daemon SENDS is required — no version-skew shims.
+    #[test]
+    fn direction_wire_grammar() {
+        let base = serde_json::json!({
+            "dst_port": {"from": 443, "to": 443}, "proto": "tcp",
+            "reason": "r", "tool": "t", "ttl_requested": "1m"
+        });
+        let p: AccessRequestParams = serde_json::from_value(base.clone()).unwrap();
+        assert_eq!(p.dir, Direction::Egress);
+        let mut with = base.clone();
+        with["dir"] = serde_json::json!("ingress");
+        let p2: AccessRequestParams = serde_json::from_value(with).unwrap();
+        assert_eq!(p2.dir, Direction::Ingress);
+
+        let approved = Verdict::Approved {
+            grant_id: "7".into(),
+            effective: EffectiveGrant {
+                dst: "1.2.3.4".into(),
+                dst_port: PortSpec { from: 443, to: 443 },
+                proto: Proto::Tcp,
+            },
+            ttl_granted: "10m".into(),
+            expires_at: "2026-10-13T00:00:00Z".into(),
+            dir: Direction::Ingress,
+        };
+        let line = serde_json::to_string(&approved).unwrap();
+        assert!(line.contains(r#""dir":"ingress""#), "{line}");
+        let back: Verdict = serde_json::from_str(&line).unwrap();
+        assert_eq!(back, approved);
+        // dir is REQUIRED on replies: a stripped Approved must not load.
+        let stripped = line.replace(r#","dir":"ingress""#, "");
+        assert!(serde_json::from_str::<Verdict>(&stripped).is_err());
+
+        let denied = Verdict::Denied {
+            reason_code: DenyReason::BoundaryInactive,
+            grant_id: None,
+            note: None,
+        };
+        let line = serde_json::to_string(&denied).unwrap();
+        assert!(
+            line.contains(r#""reason_code":"boundary_inactive""#),
+            "{line}"
+        );
+
+        // enforcement is REQUIRED on the subscribe ack.
+        let ack: SubscribeAck = serde_json::from_value(serde_json::json!({
+            "events": [], "approver_timeout_secs": 300, "version": "x",
+            "enforcement": {"boundary": "netns:/run/netns/agent", "active": true}
+        }))
+        .unwrap();
+        assert!(ack.enforcement.active);
+        let bare = serde_json::json!({
+            "events": [], "approver_timeout_secs": 300, "version": "x"
+        });
+        assert!(serde_json::from_value::<SubscribeAck>(bare).is_err());
+    }
 
     // Each state serializes as its internally tagged variant with only its
     // own fields, an absent note never becomes a nested null, and the stop
@@ -420,6 +507,7 @@ mod tests {
         assert!(!j.contains("effective"));
 
         let a = Verdict::Approved {
+            dir: Default::default(),
             grant_id: "7".into(),
             effective: EffectiveGrant {
                 dst: "203.0.113.7".into(),

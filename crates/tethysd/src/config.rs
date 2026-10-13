@@ -38,9 +38,10 @@ fn default_admin_user() -> String {
 }
 
 /// `[netns]` — the enforcement namespace provisioning operates on. Parsed
-/// leniently here (the daemon proper only requires it from step 3's runtime
-/// rewiring); `provision::Spec::from_config` does the strict, mode-aware
-/// validation and derives addresses.
+/// leniently here (shape only); `provision::Spec::from_netns` does the
+/// strict, mode-aware validation and derives addresses. The daemon
+/// REQUIRES the section (netns mode is the only mode); `tethysd` run-mode
+/// startup aborts without it, --dry-run excepted.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct NetnsFile {
@@ -118,6 +119,11 @@ pub struct FileConfig {
     /// Operator allow list (see parse_allow). Installed into carve sets at startup.
     #[serde(default)]
     pub allow: Vec<String>,
+    /// Operator INBOUND allow list, same grammar. Installed into the
+    /// carve_in sets; in routed mode its ports are permanently delegated
+    /// on the host (DNAT). No CLI flag by design (step 2026.10.1 decision).
+    #[serde(default)]
+    pub allow_in: Vec<String>,
     /// dry-run: never touch nftables (state machine + sockets only)
     #[serde(default)]
     pub dry_run: bool,
@@ -138,6 +144,7 @@ impl Default for FileConfig {
             agent_user: default_agent_user(),
             admin_user: default_admin_user(),
             allow: Vec::new(),
+            allow_in: Vec::new(),
             dry_run: false,
             netns: None,
         }

@@ -202,6 +202,7 @@ async fn admin_cmd(req: &RpcRequest, st: &Arc<State>) -> Result<RpcResponse, Rpc
         method::SUBSCRIBE => Ok(RpcResponse::ok(
             &req.id,
             SubscribeAck {
+                enforcement: st.enforcement.read().await.clone(),
                 events: [
                     method::EV_REQUEST_NEW,
                     method::EV_DECIDED,
@@ -247,7 +248,7 @@ async fn stop_grants(req: &RpcRequest, st: &Arc<State>) -> RpcResponse {
                             proto,
                             port,
                         },
-                        tethys_core::types::Direction::Egress,
+                        g.dir,
                     );
                 }
                 n += 1;
@@ -274,7 +275,7 @@ async fn stop_grants(req: &RpcRequest, st: &Arc<State>) -> RpcResponse {
                                 proto,
                                 port,
                             },
-                            tethys_core::types::Direction::Egress,
+                            g.dir,
                         );
                     }
                     match st.nft.apply(&gb).await {
@@ -326,6 +327,10 @@ async fn stop_grants(req: &RpcRequest, st: &Arc<State>) -> RpcResponse {
     }
     for g in &rows {
         sweep_grant_objs(st, g.id).await;
+    }
+    // Rows are revoked now: the projection converges to allow_in only.
+    if let Err(e) = crate::install::project_delegated(st).await {
+        tracing::error!(%e, "delegation projection after stop.grants failed");
     }
     emit(st, method::EV_STOPPED, EvStopped { grants_removed: n });
     RpcResponse::ok(&req.id, serde_json::json!({"revoked": n}))
@@ -404,12 +409,40 @@ async fn reload_allow(req: &RpcRequest, st: &Arc<State>) -> Result<RpcResponse, 
             }
         }
     }
+    let mut fresh_in = Vec::with_capacity(file.allow_in.len());
+    for entry in &file.allow_in {
+        match crate::config::parse_allow(entry) {
+            Ok(v) => fresh_in.extend(v),
+            Err(e) => {
+                return Err(RpcResponse::err(
+                    &req.id,
+                    -32001,
+                    format!("config `allow_in`: {e}"),
+                ))
+            }
+        }
+    }
+    // Swap both lists first, then reinstall: install_carves snapshots both
+    // under the read lock, so kernel and state converge on one coherent
+    // pair (or stay on the old pair if parsing failed above).
     *st.allow.write().await = fresh;
+    *st.allow_in.write().await = fresh_in;
     crate::install::install_carves(st)
         .await
         .map_err(|e| RpcResponse::err(&req.id, -32001, format!("carve reinstall failed: {e}")))?;
-    let n = st.allow.read().await.len();
-    tracing::info!(entries = n, "reload.allow: operator allow list reinstalled");
+    // allow_in changed, so the delegated-port mirror must converge too.
+    crate::install::project_delegated(st).await.map_err(|e| {
+        RpcResponse::err(
+            &req.id,
+            -32001,
+            format!("delegation projection failed: {e}"),
+        )
+    })?;
+    let n = st.allow.read().await.len() + st.allow_in.read().await.len();
+    tracing::info!(
+        entries = n,
+        "reload.allow: operator allow lists reinstalled"
+    );
     Ok(RpcResponse::ok(&req.id, serde_json::json!({"reloaded": n})))
 }
 
@@ -423,6 +456,7 @@ async fn revoke(st: &Arc<State>, gid: i64) {
     let rows = st.ledger.list(GrantState::Approved).await;
     if let Some(g) = rows.iter().find(|g| g.id == gid) {
         let proto = g.proto;
+        let dir = g.dir;
         let port = PortSpec {
             from: g.port_from,
             to: g.port_to,
@@ -430,6 +464,11 @@ async fn revoke(st: &Arc<State>, gid: i64) {
         if !st.cfg.dry_run {
             match row_elems(g).await {
                 Ok(dsts) => {
+                    // Delegation never outlives the ns rule: host port
+                    // first, then the elements.
+                    if dir.is_ingress() {
+                        crate::install::delegated_remove(st, &dsts, port).await;
+                    }
                     let mut b = Batch::with_table(&st.cfg.nft_table);
                     for d in dsts {
                         b.delete_grant(
@@ -438,7 +477,7 @@ async fn revoke(st: &Arc<State>, gid: i64) {
                                 proto,
                                 port,
                             },
-                            tethys_core::types::Direction::Egress,
+                            dir,
                         );
                     }
                     if let Err(e) = st.nft.apply(&b).await {

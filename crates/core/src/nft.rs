@@ -575,6 +575,35 @@ impl Batch {
         }
     }
 
+    /// Add a port (or range) element to an `inet_service` interval set —
+    /// routed mode's host-stack delegated-port sets. `nft_range` maps the
+    /// all-ports wildcard to the full space.
+    pub fn add_port(&mut self, set: &str, port: &PortSpec) {
+        let (lo, hi) = port.nft_range();
+        let elem = if lo == hi {
+            lo.to_string()
+        } else {
+            format!("{lo}-{hi}")
+        };
+        self.cmds.push(json!({"add":{"element":{
+            "family":"inet","table":&self.table,"name":set,"elem":[elem]
+        }}}));
+    }
+
+    /// Delete a port element (not idempotent: deleting a missing element
+    /// aborts the batch, so callers diff against `NftCli::set_ports`).
+    pub fn delete_port(&mut self, set: &str, port: &PortSpec) {
+        let (lo, hi) = port.nft_range();
+        let elem = if lo == hi {
+            lo.to_string()
+        } else {
+            format!("{lo}-{hi}")
+        };
+        self.cmds.push(json!({"delete":{"element":{
+            "family":"inet","table":&self.table,"name":set,"elem":[elem]
+        }}}));
+    }
+
     /// Ensure carve sets exist. Ingress carves are saddr-keyed like the
     /// igrant sets.
     pub fn ensure_carve_sets(&mut self) {
@@ -805,6 +834,51 @@ pub fn parse_enforcement(doc: &Value, tname: &str) -> EnforcementStatus {
     st
 }
 
+/// Extract the live port intervals of one `inet_service` set from
+/// `nft --json list set` output: plain numbers become (p,p), two-element
+/// arrays are intervals. Well-known-service annotations (`service` keys)
+/// ride along with numeric `val`s, so only numbers are read; anything else
+/// (strings, odd shapes) is skipped — this parser must never be fatal.
+pub fn parse_set_ports(doc: &Value, tname: &str, sname: &str) -> Vec<(u16, u16)> {
+    let mut out = Vec::new();
+    let Some(arr) = doc.get("nftables").and_then(|v| v.as_array()) else {
+        return out;
+    };
+    for item in arr {
+        let Some(set) = item.get("set") else { continue };
+        if set.get("name").and_then(|v| v.as_str()) != Some(sname)
+            || set.get("table").and_then(|v| v.as_str()) != Some(tname)
+        {
+            continue;
+        }
+        let Some(elems) = set.get("elem").and_then(|v| v.as_array()) else {
+            continue;
+        };
+        for el in elems {
+            // Accept both the direct {"val":N} shape and an {"elem":{...}}
+            // wrapper; some nft versions nest element metadata one level in.
+            let val = el
+                .get("val")
+                .or_else(|| el.get("elem").and_then(|e| e.get("val")));
+            let Some(val) = val else { continue };
+            if let Some(p) = val.as_u64() {
+                if p <= 65535 {
+                    out.push((p as u16, p as u16));
+                }
+            } else if let Some(pair) = val.as_array() {
+                if pair.len() == 2 {
+                    if let (Some(lo), Some(hi)) = (pair[0].as_u64(), pair[1].as_u64()) {
+                        if lo <= 65535 && hi <= 65535 {
+                            out.push((lo as u16, hi as u16));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
 /// `nft` CLI backend: argv-pinned, env-cleared, JSON on stdin. Every spawn
 /// funnels through [`NftCli::run_json`] so the [`ExecTarget`] (host stack or
 /// setns into the agent netns) is applied uniformly — no call site spawns
@@ -877,6 +951,16 @@ impl NftCli {
     pub async fn enforcement_status(&self, table: &str) -> Result<EnforcementStatus, NftError> {
         let doc = self.list_json("ruleset", None).await?;
         Ok(parse_enforcement(&doc, table))
+    }
+
+    /// Live port intervals of one `inet_service` set (the delegated-port
+    /// sets live on the host stack in routed mode). Pure read; callers diff
+    /// against this before add/delete (nft element ops are not idempotent).
+    pub async fn set_ports(&self, table: &str, set: &str) -> Result<Vec<(u16, u16)>, NftError> {
+        let doc = self
+            .list_json("set", Some(json!({"family": "inet", "name": table})))
+            .await?;
+        Ok(parse_set_ports(&doc, table, set))
     }
 
     /// The one spawn helper: every `nft` subprocess starts here. Namespaced
@@ -1109,6 +1193,55 @@ pub fn parse_poll(doc: &Value, counters: &Value, tname: &str) -> PollState {
 
 #[cfg(test)]
 mod tests {
+
+    // Delegated-port polling must read plain numbers, intervals, and the
+    // wrapped element shape; service annotations ride on numeric vals;
+    // strings, out-of-range numbers, and other tables/sets never leak in.
+    #[test]
+    fn parses_set_port_elements() {
+        let doc = serde_json::json!({"nftables": [
+            {"set": {"family":"inet","table":"tethys","name":"delegated_v4",
+                "elem": [{"val":443}, {"val":[8000,8100],"service":"alt-redirect"},
+                         {"val":"http"}, {"val":70000}]}},
+            {"set": {"family":"inet","table":"other","name":"delegated_v4",
+                "elem": [{"val":1}]}},
+            {"set": {"family":"inet","table":"tethys","name":"delegated_v6",
+                "elem": [{"elem":{"val":993}}]}},
+        ]});
+        assert_eq!(
+            parse_set_ports(&doc, "tethys", "delegated_v4"),
+            vec![(443, 443), (8000, 8100)]
+        );
+        assert_eq!(
+            parse_set_ports(&doc, "tethys", "delegated_v6"),
+            vec![(993, 993)]
+        );
+        assert!(parse_set_ports(&doc, "other2", "delegated_v4").is_empty());
+        assert!(parse_set_ports(&doc, "tethys", "missing").is_empty());
+    }
+
+    // Port elements normalize through nft_range: single ports bare, ranges
+    // dashed, the all-ports wildcard as the full space.
+    #[test]
+    fn port_elements_use_normalized_ranges() {
+        let mut b = Batch::with_table("tethys");
+        b.add_port("delegated_v4", &PortSpec { from: 443, to: 443 });
+        b.add_port(
+            "delegated_v4",
+            &PortSpec {
+                from: 8000,
+                to: 8100,
+            },
+        );
+        b.delete_port("delegated_v6", &PortSpec { from: 0, to: 0 });
+        let cmds = b.to_json();
+        assert!(cmds.contains(r#""elem":["443"]"#), "{cmds}");
+        assert!(cmds.contains(r#""elem":["8000-8100"]"#), "{cmds}");
+        assert!(
+            cmds.contains(r#""delete""#) && cmds.contains(r#""elem":["0-65535"]"#),
+            "{cmds}"
+        );
+    }
     use super::*;
 
     fn ip(s: &str) -> IpAddr {

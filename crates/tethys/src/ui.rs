@@ -1297,6 +1297,7 @@ mod tests {
             port_from: 443,
             port_to: 443,
             proto: tethys_core::types::Proto::Tcp,
+            dir: Default::default(),
             reason: "r".into(),
             tool: "curl".into(),
             ttl_secs: 600,

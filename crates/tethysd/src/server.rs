@@ -47,7 +47,24 @@ pub struct State {
         )>,
     >,
     pub ledger: Ledger,
+    /// Kernel grant state INSIDE the enforcement netns: every state-machine
+    /// batch (install, revoke, carves, acct, reconcile, poll) goes through
+    /// this backend, so "the kernel" always means "the namespace".
     pub nft: NftCli,
+    /// Host-stack backend: routed mode's delegated-port sets only. Never
+    /// carries verdicts; provisioning owns the rest of the host chains.
+    pub host_nft: NftCli,
+    /// Operator INBOUND allow list (carve_in + delegated-port mirror).
+    pub allow_in: RwLock<
+        Vec<(
+            tethys_core::types::Target,
+            tethys_core::types::PortSpec,
+            tethys_core::types::Proto,
+        )>,
+    >,
+    /// Enforcement truth: the netns boundary and the probe verdict. All
+    /// installs (both directions) are refused while inactive.
+    pub enforcement: RwLock<EnforcementInfo>,
     /// pending requests awaiting a human: id -> decision channel
     pub pending: Mutex<HashMap<i64, oneshot::Sender<HumanDecision>>>,
     /// fire-and-forget events for all admin clients
@@ -104,11 +121,29 @@ impl Drop for CountGuard {
 /// thread-safe libc call).
 pub async fn run(cfg: Config) -> anyhow::Result<()> {
     let (ledger, _actor) = Ledger::open(&cfg.db)?;
+    // All enforcement lives in the namespace: pin the nft backend there at
+    // construction so no call site can accidentally act on the host stack.
+    // Dry-run keeps a host-targeted backend (nothing is applied anyway).
+    let boundary = match &cfg.netns {
+        Some(spec) => format!("netns:{}", spec.path.display()),
+        None => "dry-run (no boundary)".into(),
+    };
+    let nft = match &cfg.netns {
+        Some(spec) if !cfg.dry_run => NftCli::in_netns(&spec.path)
+            .map_err(|e| anyhow::anyhow!("open enforcement netns {}: {e}", spec.path.display()))?,
+        _ => NftCli::default(),
+    };
     let st = Arc::new(State {
         cfg: cfg.clone(),
         allow: RwLock::new(cfg.allow.clone()),
+        allow_in: RwLock::new(cfg.allow_in.clone()),
+        enforcement: RwLock::new(EnforcementInfo {
+            boundary,
+            active: false,
+        }),
         ledger,
-        nft: NftCli::default(),
+        nft,
+        host_nft: NftCli::default(),
         pending: Mutex::new(HashMap::new()),
         events: broadcast::channel(256).0,
         admins_online: Arc::new(AtomicUsize::new(0)),
@@ -125,6 +160,24 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
         tracing::info!("nft base table ready");
         install_carves(&st).await?;
         reconcile_on_boot(&st).await;
+        // Enforcement truth: probe inside the ns before serving, then keep
+        // the delegated-port projection mirrored (live ingress grants union
+        // allow_in). A projection failure leaves ingress installs refusing
+        // at their uniqueness poll — fail closed, log loudly.
+        match st.nft.enforcement_status(&st.cfg.nft_table).await {
+            Ok(s) => {
+                let active = s.active();
+                st.enforcement.write().await.active = active;
+                tracing::info!(active, boundary = %st.enforcement.read().await.boundary,
+                    "enforcement boundary probed");
+            }
+            Err(e) => {
+                tracing::error!(%e, "enforcement probe failed at boot; boundary INACTIVE (installs refused)")
+            }
+        }
+        if let Err(e) = crate::install::project_delegated(&st).await {
+            tracing::error!(%e, "delegated-port projection failed at boot");
+        }
     } else {
         tracing::warn!("--dry-run: nft objects not installed (dev mode)");
     }
@@ -163,6 +216,7 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
     spawn_expiry_reconciler(st.clone());
     if !st.cfg.dry_run {
         spawn_stats_poller(st.clone());
+        spawn_enforcement_probe(st.clone());
     }
 
     {
@@ -213,6 +267,24 @@ fn spawn_expiry_reconciler(st: Arc<State>) {
                 .map(|g| g.id)
                 .collect();
             if !expired.is_empty() {
+                // The kernel reaper took the ns elements with their TTL; the
+                // host delegation must not outlive them, so it goes first.
+                for g in approved
+                    .iter()
+                    .filter(|g| expired.contains(&g.id) && g.dir.is_ingress())
+                {
+                    if let Ok(dsts) = crate::install::row_elems(g).await {
+                        crate::install::delegated_remove(
+                            &st,
+                            &dsts,
+                            tethys_core::types::PortSpec {
+                                from: g.port_from,
+                                to: g.port_to,
+                            },
+                        )
+                        .await;
+                    }
+                }
                 for id in &expired {
                     st.ledger.decide(*id, Decide::ExpireByKernel).await;
                     emit(
@@ -310,6 +382,39 @@ pub(crate) async fn read_frame_resumable<R: AsyncBufRead + Unpin>(
         .trim_end_matches(['\n', '\r'])
         .to_string();
     Frame::Line(s)
+}
+
+/// Enforcement probe loop (~5s). The ruleset can drift under a running
+/// daemon (operator nft edits, half-provisioned reloads); APPROVED must
+/// never mean "elements loaded but nothing filtering", so a failed probe —
+/// or a read error — flips the boundary inactive and installs start being
+/// refused until it recovers. Transitions are logged at warn/error.
+fn spawn_enforcement_probe(st: Arc<State>) {
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            match st.nft.enforcement_status(&st.cfg.nft_table).await {
+                Ok(s) => {
+                    let active = s.active();
+                    let mut cur = st.enforcement.write().await;
+                    if cur.active != active {
+                        tracing::warn!(active, boundary = %cur.boundary,
+                            "enforcement boundary state changed");
+                        cur.active = active;
+                    }
+                }
+                Err(e) => {
+                    let mut cur = st.enforcement.write().await;
+                    if cur.active {
+                        tracing::error!(%e, "enforcement probe failed; boundary INACTIVE (installs refused)");
+                        cur.active = false;
+                    } else {
+                        tracing::debug!(%e, "enforcement probe still failing");
+                    }
+                }
+            }
+        }
+    });
 }
 
 // ------------------------------------------------------------------ MCP side
@@ -494,6 +599,7 @@ fn dispatch_access(
         if let Some(g) = active.iter().find(|g| {
             g.target == target.canonical()
                 && g.proto == params.proto
+                && g.dir == params.dir
                 && (g.port_from, g.port_to) == (params.dst_port.from, params.dst_port.to)
         }) {
             let resp = RpcResponse::ok(
@@ -506,6 +612,27 @@ fn dispatch_access(
             );
             respond!(resp_line(&resp));
             return;
+        }
+
+        // Fail closed on the boundary: with nothing filtering in the netns,
+        // APPROVED would be a lie for either direction. Checked before the
+        // pending budget so a dead boundary never pops a human.
+        if !st.cfg.dry_run {
+            let enf = st.enforcement.read().await;
+            if !enf.active {
+                respond!(resp_line(&RpcResponse::ok(
+                    &id,
+                    Verdict::Denied {
+                        reason_code: DenyReason::BoundaryInactive,
+                        grant_id: None,
+                        note: Some(format!(
+                            "enforcement boundary inactive ({}); installs refused",
+                            enf.boundary
+                        )),
+                    },
+                )));
+                return;
+            }
         }
 
         let _pending_permit = match st.pending_budget.clone().try_acquire_owned() {
@@ -544,6 +671,7 @@ fn dispatch_access(
                 port_from: params.dst_port.from,
                 port_to: params.dst_port.to,
                 proto: params.proto,
+                dir: params.dir,
                 reason: reason.clone(),
                 tool: tool.clone(),
                 ttl_secs: ttl.as_secs(),
@@ -573,6 +701,7 @@ fn dispatch_access(
                 target: popup_target,
                 dst_port: params.dst_port,
                 proto: params.proto,
+                dir: params.dir,
                 reason,
                 tool,
                 ttl_requested: params.ttl_requested,
@@ -588,7 +717,16 @@ fn dispatch_access(
         {
             Ok(Ok(HumanDecision::Approve { ttl_secs })) => {
                 let granted = cap_ttl(ttl_secs.map(Duration::from_secs).unwrap_or(ttl), &st);
-                match install_grant(&st, &target, params.dst_port, gid, params.proto, granted).await
+                match install_grant(
+                    &st,
+                    &target,
+                    params.dst_port,
+                    gid,
+                    params.proto,
+                    granted,
+                    params.dir,
+                )
+                .await
                 {
                     Ok((eff, dsts)) => {
                         let exp = ttl_expires(granted);
@@ -598,7 +736,8 @@ fn dispatch_access(
                         .unwrap_or_else(|_| "[]".into());
                         if let Err(e) = st.ledger.set_dst(gid, dst_json).await {
                             tracing::error!(gid, %e, "set_dst failed — uninstalling grant, denying");
-                            uninstall_grant(&st, &dsts, params.proto, params.dst_port).await;
+                            uninstall_grant(&st, &dsts, params.proto, params.dst_port, params.dir)
+                                .await;
                             st.ledger
                                 .decide(
                                     gid,
@@ -643,6 +782,7 @@ fn dispatch_access(
                                 effective: eff,
                                 ttl_granted: fmt_ttl(granted),
                                 expires_at: fmt_unix(exp),
+                                dir: params.dir,
                             }
                         }
                     }
@@ -748,6 +888,7 @@ pub(crate) async fn collect_stats(st: &State) -> Result<Vec<GrantStat>, String> 
             grant_id: g.id.to_string(),
             name: g.target.clone(),
             tool: g.tool.clone(),
+            dir: g.dir,
             dst: serde_json::from_str(&g.dst_json).unwrap_or_default(),
             dst_port: PortSpec {
                 from: g.port_from,
@@ -1019,6 +1160,7 @@ mod tests {
             port_from: 80,
             port_to: 80,
             proto: Proto::Tcp,
+            dir: Default::default(),
             reason: String::new(),
             tool: String::new(),
             ttl_secs: 60,
@@ -1072,6 +1214,7 @@ mod tests {
             dst_net: None,
             dst_port: PortSpec { from: 80, to: 80 },
             proto: Proto::Tcp,
+            dir: Default::default(),
             reason: String::new(),
             tool: String::new(),
             ttl_requested: "1m".into(),

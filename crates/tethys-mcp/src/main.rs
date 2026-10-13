@@ -362,10 +362,10 @@ mod tests {
         let two = serde_json::json!([
             {"grant_id":"9","name":"host:api.jina.ai","tool":"curl",
              "dst":["ip:104.26.10.242"],"dst_port":{"from":443,"to":443},"proto":"tcp",
-             "seconds_remaining":598,"bytes_sent":10,"bytes_received":20},
+             "dir":"egress","seconds_remaining":598,"bytes_sent":10,"bytes_received":20},
             {"grant_id":"10","name":"ip:192.168.10.2","tool":"ssh",
              "dst":["ip:192.168.10.2"],"dst_port":{"from":22,"to":22},"proto":"tcp",
-             "seconds_remaining":60,"bytes_sent":0,"bytes_received":0}
+             "dir":"ingress","seconds_remaining":60,"bytes_sent":0,"bytes_received":0}
         ]);
         let s = render_grant_list(&two);
         assert!(s.contains("Live grants (2)"), "{s}");
@@ -375,10 +375,10 @@ mod tests {
         );
         assert!(s.contains("#10 [ssh] ip:192.168.10.2"), "{s}");
 
-        // older daemon rows without `tool` still deserialize (serde default)
+        // rows without `tool` still deserialize (serde default)
         let legacy = serde_json::json!([
             {"grant_id":"1","name":"host:x","dst":[],"dst_port":{"from":80,"to":80},
-             "proto":"tcp","seconds_remaining":5,"bytes_sent":0,"bytes_received":0}
+             "proto":"tcp","dir":"egress","seconds_remaining":5,"bytes_sent":0,"bytes_received":0}
         ]);
         assert!(
             render_grant_list(&legacy).contains("[?]"),
@@ -395,7 +395,7 @@ mod tests {
             "decision":"approved",
             "grant_id":"7",
             "effective":{"dst":"203.0.113.7","proto":"tcp","dst_port":{"from":443,"to":443}},
-            "ttl_granted":"10m","expires_at":"2026-09-15T02:41:00Z"});
+            "ttl_granted":"10m","expires_at":"2026-09-15T02:41:00Z","dir":"egress"});
         let s = render_verdict(&v);
         assert!(s.contains("APPROVED") && s.contains("203.0.113.7") && s.contains("10m"));
 

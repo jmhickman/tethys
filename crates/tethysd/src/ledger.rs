@@ -22,6 +22,8 @@ pub struct NewGrant {
     pub port_from: u16,
     pub port_to: u16,
     pub proto: Proto,
+    /// Egress (outbound) or ingress (inbound). Default egress.
+    pub dir: tethys_core::types::Direction,
     pub reason: String,
     pub tool: String,
     pub ttl_secs: u64,
@@ -162,11 +164,26 @@ fn row_from(r: &rusqlite::Row) -> rusqlite::Result<GrantRow> {
                 .unwrap_or(DenyCode::Unknown(c))
         }),
         note: r.get(15)?,
+        dir: parse_row_dir(r)?,
     })
 }
 
+/// Row column 16: the grant direction. An unknown spelling means the row is
+/// corrupt: error (skip) rather than invent a direction.
+fn parse_row_dir(r: &rusqlite::Row) -> rusqlite::Result<tethys_core::types::Direction> {
+    let s: String = r.get(16)?;
+    match tethys_core::types::Direction::parse(&s) {
+        Some(d) => Ok(d),
+        None => {
+            tracing::error!(id = ?r.get::<_, i64>(0).ok(), dir = %s,
+                "ledger row with unknown dir skipped");
+            Err(rusqlite::Error::InvalidParameterName("unknown_dir".into()))
+        }
+    }
+}
+
 const COLS: &str = "id,idem_key,target,dst_json,port_from,port_to,proto,reason,tool,\
-     ttl_secs,granted_ttl_secs,state,created_at,expires_at,deny_code,note";
+     ttl_secs,granted_ttl_secs,state,created_at,expires_at,deny_code,note,dir";
 
 impl Ledger {
     /// Open (creating if needed) the ledger DB and spawn its actor task.
@@ -205,11 +222,24 @@ impl Ledger {
                state TEXT NOT NULL,
                created_at INTEGER NOT NULL,
                expires_at REAL,
-               deny_code TEXT, note TEXT);
+               deny_code TEXT, note TEXT,
+               dir TEXT NOT NULL DEFAULT 'egress');
              CREATE TABLE IF NOT EXISTS audit(
                ts INTEGER NOT NULL, event TEXT NOT NULL,
                grant_id INTEGER NOT NULL, detail TEXT NOT NULL DEFAULT '');",
         )?;
+        // Pre-dir databases gain the column in place; existing rows take
+        // the 'egress' default (they were all egress). The Err arm is the
+        // expected "duplicate column name" on current databases.
+        if let Err(e) = conn.execute(
+            "ALTER TABLE grants ADD COLUMN dir TEXT NOT NULL DEFAULT 'egress'",
+            [],
+        ) {
+            let msg = e.to_string();
+            if !msg.contains("duplicate column") {
+                anyhow::bail!("ledger migration (dir column): {e}");
+            }
+        }
         let (tx, mut rx) = mpsc::unbounded_channel::<LedgerCmd>();
         let h = tokio::task::spawn_blocking(move || {
             while let Some(cmd) = rx.blocking_recv() {
@@ -217,9 +247,10 @@ impl Ledger {
                     LedgerCmd::Insert(g, reply) => {
                         let res = conn.execute(
                             "INSERT INTO grants(idem_key,target,dst_json,port_from,port_to,proto,\
-                             reason,tool,ttl_secs,state,created_at) VALUES(?1,?2,'[]',?3,?4,?5,?6,?7,?8,'pending',?9)",
+                             reason,tool,ttl_secs,state,created_at,dir) VALUES(?1,?2,'[]',?3,?4,?5,?6,?7,?8,'pending',?9,?10)",
                             params![g.idem_key, g.target, g.port_from as i64, g.port_to as i64,
-                                    g.proto.to_string(), g.reason, g.tool, g.ttl_secs as i64, g.created_at as i64],
+                                    g.proto.to_string(), g.reason, g.tool, g.ttl_secs as i64, g.created_at as i64,
+                                    g.dir.as_str()],
                         );
                         match res {
                             Ok(1) => {
@@ -446,11 +477,81 @@ mod tests {
             port_from: 80,
             port_to: 80,
             proto: Proto::Tcp,
+            dir: Default::default(),
             reason: "r".into(),
             tool: "t".into(),
             ttl_secs: 60,
             created_at: now_secs(),
         }
+    }
+
+    // Direction persists per row, and a pre-dir database migrates in
+    // place: old rows load as egress, an unknown spelling skips the row
+    // rather than inventing a direction.
+    #[tokio::test]
+    async fn dir_persists_and_legacy_schema_migrates() {
+        let dir = std::env::temp_dir().join(format!("tethys-dir-{}", now_secs()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("t.db");
+
+        // Legacy database: old grants table WITHOUT the dir column.
+        {
+            let c = rusqlite::Connection::open(&path).unwrap();
+            c.execute_batch(
+                "CREATE TABLE grants(
+                   id INTEGER PRIMARY KEY, idem_key TEXT UNIQUE,
+                   target TEXT NOT NULL, dst_json TEXT NOT NULL DEFAULT '[]',
+                   port_from INTEGER NOT NULL, port_to INTEGER NOT NULL,
+                   proto TEXT NOT NULL, reason TEXT NOT NULL DEFAULT '',
+                   tool TEXT NOT NULL DEFAULT '', ttl_secs INTEGER NOT NULL,
+                   granted_ttl_secs INTEGER, state TEXT NOT NULL,
+                   created_at INTEGER NOT NULL, expires_at REAL,
+                   deny_code TEXT, note TEXT);
+                 CREATE TABLE audit(ts INTEGER NOT NULL, event TEXT NOT NULL,
+                   grant_id INTEGER NOT NULL, detail TEXT NOT NULL DEFAULT '');
+                 INSERT INTO grants(idem_key,target,port_from,port_to,proto,ttl_secs,
+                   state,created_at,expires_at)
+                   VALUES('legacy','ip:10.0.0.1',443,443,'tcp',60,'approved',1,9e9);",
+            )
+            .unwrap();
+        }
+
+        let (ledger, actor) = Ledger::open(&path).unwrap();
+        let legacy = ledger.find_by_idem("legacy").await.expect("legacy row");
+        assert_eq!(legacy.dir, tethys_core::types::Direction::Egress);
+
+        let mut g = newg("dir-ingress");
+        g.dir = tethys_core::types::Direction::Ingress;
+        let gid = ledger.insert_pending(g).await.expect("insert");
+        let row = ledger.find_by_idem("dir-ingress").await.unwrap();
+        assert_eq!(row.id, gid);
+        assert_eq!(row.dir, tethys_core::types::Direction::Ingress);
+        // Default path still egress.
+        let _ = ledger.insert_pending(newg("dir-egress")).await.unwrap();
+        assert_eq!(
+            ledger.find_by_idem("dir-egress").await.unwrap().dir,
+            tethys_core::types::Direction::Egress
+        );
+
+        // Corrupt spelling: the row is skipped, not defaulted.
+        {
+            let c = rusqlite::Connection::open(&path).unwrap();
+            c.execute(
+                "INSERT INTO grants(idem_key,target,port_from,port_to,proto,ttl_secs,
+                 state,created_at,dir) VALUES('junk','ip:10.0.0.2',1,1,'tcp',60,
+                 'approved',1,'sideways')",
+                [],
+            )
+            .unwrap();
+        }
+        assert!(!ledger
+            .list(GrantState::Approved)
+            .await
+            .iter()
+            .any(|r| r.idem_key.as_deref() == Some("junk")));
+
+        actor.abort();
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// Wrong-origin decisions flip zero rows; right-origin flips exactly one.

@@ -87,7 +87,8 @@ pub struct Spec {
 
 impl Spec {
     /// Strict parse of `[netns]` for the provision path. Missing section is
-    /// an error here (the daemon's own requiredness check lands in step 3).
+    /// an error here; the daemon's run-mode boot applies the same strict
+    /// validation through `Spec::from_netns` (main.rs).
     pub fn from_config(file: &FileConfig, table_override: Option<&str>) -> anyhow::Result<Spec> {
         let nf = file
             .netns
