@@ -3,9 +3,18 @@
 //! nft 1.1.6 encoding: CIDR elements must be `{"prefix":{...}}` objects (an
 //! "a.b.c.d/nn" string is parsed as a hostname), per-element TTL lives in
 //! `{"elem":{"val":...,"expires":N}}`, and batches apply atomically.
+//!
+//! Enforcement runs inside the agent's dedicated network namespace: every
+//! batch goes through [`ExecTarget`], which either `setns`s into a cached,
+//! inode-revalidated netns fd ([`Netns`]) or runs on the host stack (routed
+//! mode's delegated-port DNAT chain). No call site spawns `nft` ad hoc.
 
 use std::net::IpAddr;
+use std::os::fd::{AsRawFd, RawFd};
+use std::os::unix::fs::MetadataExt;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::Arc;
 use std::time::Duration;
 
 use ipnet::IpNet;
@@ -13,29 +22,45 @@ use serde_json::{json, Value};
 use thiserror::Error;
 use tokio::process::Command;
 
-use crate::types::{PortSpec, Proto};
+use crate::types::{Direction, PortSpec, Proto};
 
 pub const TABLE: &str = "tethys";
+/// Egress grant sets: key is `ip daddr . meta l4proto . th dport`.
 pub const SET_V4: &str = "grants_v4";
 pub const SET_V6: &str = "grants_v6";
-/// Operator allow-list tuples (`allow` in config). Flush+reinstall from
-/// config; live in the baseline carve sets so stop.grants does not touch them.
+/// Ingress counterpart sets. Same element grammar with the address slot
+/// flipped to `saddr`: an ingress grant matches source . proto . LOCAL port
+/// (th dport on inbound packets is the local listener's port). The element
+/// JSON is identical for both families; only the set typing differs.
+pub const SET_IGRANT_V4: &str = "igrants_v4";
+pub const SET_IGRANT_V6: &str = "igrants_v6";
+/// Operator allow-list tuples (`allow`/`allow_in` in config). Flush+reinstall
+/// from config; live in the carve sets so stop.grants does not touch them.
 pub const SET_CARVE_V4: &str = "carve_v4";
 pub const SET_CARVE_V6: &str = "carve_v6";
-/// Accounting chains (empty in the static baseline; contents owned here).
-/// Rules carry counters and no verdict, so they cannot bypass egress.
+/// Ingress operator allow list (`allow_in`): saddr-keyed like the igrants.
+pub const SET_CARVE_IN_V4: &str = "carve_in_v4";
+pub const SET_CARVE_IN_V6: &str = "carve_in_v6";
+/// Base chains with policy drop, built here (the static baseline.nft is
+/// retired — the Rust builder is the single source of enforcement truth).
+/// Inside the netns everything belongs to the policed account by
+/// construction, so these carry no uid expressions: pure header filtering.
+pub const CHAIN_EGRESS: &str = "egress";
+pub const CHAIN_INGRESS: &str = "ingress";
+/// Accounting chains (contents owned here). Rules carry counters and no
+/// verdict, so they cannot bypass enforcement.
 pub const CHAIN_ACCT_OUT: &str = "acct_out";
 pub const CHAIN_ACCT_IN: &str = "acct_in";
-/// Enforcement scope chain (empty in the baseline; flush-and-rebuild like
-/// acct). The egress chain `jump`s here before drop. A hooked base chain
-/// cannot pre-exempt packets from a lower-priority base chain (independent
-/// netfilter callbacks; only `drop` short-circuits). Policed uids `return`
-/// (caller drop continues); everyone else `accept`s.
-pub const CHAIN_SCOPE: &str = "scope";
-/// Counter for unpoliced (exempt) egress.
-pub const COUNTER_EXEMPT: &str = "tethys_exempt";
+/// Drop counters (rate-limited log + drop at the end of each base chain).
+pub const COUNTER_DROPS: &str = "tethys_drops";
+pub const COUNTER_DROPS_IN: &str = "tethys_drops_in";
+pub const LOG_PREFIX_EGRESS: &str = "TETHYS-DROP: ";
+pub const LOG_PREFIX_INGRESS: &str = "TETHYS-DROP-IN: ";
 /// Long default so per-element `expires` is the only thing that reaps grants.
 const SET_DEFAULT_TIMEOUT_SECS: u64 = 24 * 3600;
+/// Drop-log rate cap (packets/sec) shared by both base chains, mirroring
+/// `limit rate 20/second` in the retired static baseline.
+const DROP_LOG_RATE: u32 = 20;
 
 /// Per-grant accounting object names. These outlive the grant's set element:
 /// counters are swept only when the ledger row leaves the approved state.
@@ -66,6 +91,111 @@ pub enum NftError {
     Failed { code: Option<i32>, stderr: String },
     #[error("json: {0}")]
     Json(#[from] serde_json::Error),
+    #[error("cannot open netns {path}: {src}")]
+    NetnsOpen { path: String, src: std::io::Error },
+    #[error(
+        "netns path {path} no longer exists (cached fd survives) — namespace was deleted; \
+         re-provision before applying batches"
+    )]
+    NetnsGone { path: String },
+    #[error(
+        "netns at {path} changed inode since it was opened ({cached_ino} -> {found_ino}) — \
+         namespace was recreated; reopen required, refusing to act on a foreign stack"
+    )]
+    NetnsReplaced {
+        path: String,
+        cached_ino: u64,
+        found_ino: u64,
+    },
+}
+
+/// The agent account's network namespace, opened once and cached. Every
+/// namespaced batch revalidates the path against the cached fd's inode
+/// before spawning, so a deleted or recreated netns fails loudly instead of
+/// silently applying to whatever stack now owns that path (including the
+/// host one). Cheap: two stat calls per batch.
+#[derive(Debug)]
+pub struct Netns {
+    path: PathBuf,
+    file: std::fs::File,
+    ino: u64,
+}
+
+impl Netns {
+    /// Open `/run/netns/<name>` (any readable nsfs file) and pin its inode.
+    pub fn open(path: impl AsRef<Path>) -> Result<Self, NftError> {
+        let path = path.as_ref().to_path_buf();
+        let file = std::fs::File::open(&path).map_err(|src| NftError::NetnsOpen {
+            path: path.display().to_string(),
+            src,
+        })?;
+        let ino = Self::ino_of(&file)?;
+        Ok(Self { path, file, ino })
+    }
+
+    fn ino_of(f: &std::fs::File) -> Result<u64, NftError> {
+        f.metadata().map(|m| m.ino()).map_err(NftError::Io)
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Raw fd to `setns` into from a child (see [`setns_pre_exec`]).
+    pub fn fd(&self) -> RawFd {
+        self.file.as_raw_fd()
+    }
+
+    /// Fail-closed check that the cached fd still refers to the namespace at
+    /// `path`: the path must exist and its inode must match. Called by every
+    /// namespaced batch before the spawn.
+    pub fn revalidate(&self) -> Result<(), NftError> {
+        let found = std::fs::metadata(&self.path).map_err(|_| NftError::NetnsGone {
+            path: self.path.display().to_string(),
+        })?;
+        if found.ino() != self.ino {
+            return Err(NftError::NetnsReplaced {
+                path: self.path.display().to_string(),
+                cached_ino: self.ino,
+                found_ino: found.ino(),
+            });
+        }
+        Ok(())
+    }
+}
+
+/// Where `nft` subprocesses run. `Host` is for the host-stack projection
+/// (routed mode's delegated-port DNAT chain); `Netns` applies inside the
+/// agent namespace through [`setns_pre_exec`].
+#[derive(Clone, Debug, Default)]
+pub enum ExecTarget {
+    /// Batches run on the host stack (dev default + routed-mode projection).
+    #[default]
+    Host,
+    /// Batches `setns` into the agent namespace first.
+    Netns(Arc<Netns>),
+}
+
+/// `pre_exec` hook that moves the child into `fd`'s network namespace before
+/// exec. Works with both std and tokio `Command`. The fd is inherited across
+/// the fork, so its CLOEXEC flag (std sets it) is cleared in the child first;
+/// clearing happens post-fork, so the parent's flag is untouched.
+pub fn setns_pre_exec(fd: RawFd) -> impl FnMut() -> std::io::Result<()> + Send + Sync + 'static {
+    move || {
+        // SAFETY: post-fork/pre-exec child context. `fcntl` and `setns` are
+        // plain syscalls (no allocator, no locks); the fd is a long-lived
+        // parent-owned handle to an nsfs file. Audit note for the
+        // workspace unsafe_code="deny" policy.
+        #[allow(unsafe_code)]
+        let rc = unsafe {
+            libc::fcntl(fd, libc::F_SETFD, 0);
+            libc::setns(fd, libc::CLONE_NEWNET)
+        };
+        if rc != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(())
+    }
 }
 
 /// One grant element: destination key + proto + normalized port range.
@@ -129,19 +259,35 @@ impl Dir {
 }
 
 impl GrantElem {
-    pub fn set_name(&self) -> &'static str {
-        match &self.dst {
-            ElemDst::Ip(IpAddr::V4(_)) | ElemDst::Net(IpNet::V4(_)) => SET_V4,
-            _ => SET_V6,
+    pub fn set_name(&self, dir: Direction) -> &'static str {
+        match (&self.dst, dir) {
+            (ElemDst::Ip(IpAddr::V4(_)) | ElemDst::Net(IpNet::V4(_)), Direction::Egress) => SET_V4,
+            (ElemDst::Ip(IpAddr::V6(_)) | ElemDst::Net(IpNet::V6(_)), Direction::Egress) => SET_V6,
+            (ElemDst::Ip(IpAddr::V4(_)) | ElemDst::Net(IpNet::V4(_)), Direction::Ingress) => {
+                SET_IGRANT_V4
+            }
+            (ElemDst::Ip(IpAddr::V6(_)) | ElemDst::Net(IpNet::V6(_)), Direction::Ingress) => {
+                SET_IGRANT_V6
+            }
         }
     }
 
     /// Carve-set counterpart (operator allow list): same key grammar, but the
     /// carve sets carry no timeout flag, so elements persist until reinstalled.
-    pub fn carve_set_name(&self) -> &'static str {
-        match &self.dst {
-            ElemDst::Ip(IpAddr::V4(_)) | ElemDst::Net(IpNet::V4(_)) => SET_CARVE_V4,
-            _ => SET_CARVE_V6,
+    pub fn carve_set_name(&self, dir: Direction) -> &'static str {
+        match (&self.dst, dir) {
+            (ElemDst::Ip(IpAddr::V4(_)) | ElemDst::Net(IpNet::V4(_)), Direction::Egress) => {
+                SET_CARVE_V4
+            }
+            (ElemDst::Ip(IpAddr::V6(_)) | ElemDst::Net(IpNet::V6(_)), Direction::Egress) => {
+                SET_CARVE_V6
+            }
+            (ElemDst::Ip(IpAddr::V4(_)) | ElemDst::Net(IpNet::V4(_)), Direction::Ingress) => {
+                SET_CARVE_IN_V4
+            }
+            (ElemDst::Ip(IpAddr::V6(_)) | ElemDst::Net(IpNet::V6(_)), Direction::Ingress) => {
+                SET_CARVE_IN_V6
+            }
         }
     }
 
@@ -202,8 +348,7 @@ impl Batch {
             .push(json!({"add":{"table":{"family":"inet","name":&self.table}}}));
     }
 
-    fn push_grant_set(&mut self, name: &str, proto_field: &str) {
-        let addr_field = "daddr";
+    fn push_grant_set(&mut self, name: &str, proto_field: &str, addr_field: &str) {
         self.cmds.push(json!({"add":{"set":{
             "family":"inet","table":&self.table,"name":name,
             "type":{"typeof":{"concat":[
@@ -216,94 +361,233 @@ impl Batch {
         }}}));
     }
 
-    /// Idempotent add of table, grant sets, acct chains, scope, exempt counter.
-    /// The acct chains and scope chain are also declared by the static
-    /// baseline; ensuring them here lets dev runs work without it, and an
-    /// unhooked add is idempotent on this nft build.
+    /// One rule in a base chain: `exprs` is the full expression list.
+    fn push_rule(&mut self, chain: &str, exprs: Vec<Value>) {
+        self.cmds.push(json!({"add":{"rule":{
+            "family":"inet","table":&self.table,"chain":chain,"expr":exprs
+        }}}));
+    }
+
+    /// Counted, rate-limit-logged verdict rule closing a base chain.
+    fn push_drop_rule(&mut self, chain: &str, counter: &str, prefix: &str) {
+        self.push_rule(
+            chain,
+            vec![
+                json!({"counter": counter}),
+                json!({"limit":{"rate": DROP_LOG_RATE, "unit":"second"}}),
+                json!({"log":{"prefix": prefix}}),
+                json!({"drop":null}),
+            ],
+        );
+    }
+
+    /// Idempotent build of the full netns table: table, grant sets (egress
+    /// daddr-keyed, ingress saddr-keyed), carve sets, drop counters, acct
+    /// chains, and both hooked base chains with their complete rule bodies.
+    /// The static baseline.nft is retired; this builder is the single source
+    /// of enforcement truth, and there are no uid expressions anywhere —
+    /// inside the namespace every packet belongs to the policed account by
+    /// construction (INGRESS-REVIEW.md: `meta skuid` cannot name a listener
+    /// at input anyway). Idempotent via flush-and-rebuild of the base chain
+    /// rule bodies inside the same atomic batch.
     pub fn ensure_base(&mut self) {
         self.ensure_table();
-        self.push_grant_set(SET_V4, "ip");
-        self.push_grant_set(SET_V6, "ip6");
+        self.push_grant_set(SET_V4, "ip", "daddr");
+        self.push_grant_set(SET_V6, "ip6", "daddr");
+        self.push_grant_set(SET_IGRANT_V4, "ip", "saddr");
+        self.push_grant_set(SET_IGRANT_V6, "ip6", "saddr");
+        self.ensure_carve_sets();
+        self.add_counter(COUNTER_DROPS);
+        self.add_counter(COUNTER_DROPS_IN);
         for (chain, hook) in [(CHAIN_ACCT_OUT, "output"), (CHAIN_ACCT_IN, "input")] {
             self.cmds.push(json!({"add":{"chain":{
                 "family":"inet","table":&self.table,"name":chain,
                 "hook":hook,"type":"filter","prio":-10,"policy":"accept"
             }}}));
         }
-        self.cmds.push(json!({"add":{"chain":{
-            "family":"inet","table":&self.table,"name":CHAIN_SCOPE
-        }}}));
-        self.add_counter(COUNTER_EXEMPT);
-    }
-
-    /// Rebuild scope: policed uids `return` (egress drop continues); others
-    /// are counted and accepted. An empty list means host-wide (every packet
-    /// faces the caller's verdict), which is what happens when `agent_user`
-    /// cannot be resolved.
-    pub fn rebuild_scope(&mut self, policed_uids: &[u32]) {
-        self.cmds.push(json!({"flush":{"chain":{
-            "family":"inet","table":&self.table,"name":CHAIN_SCOPE
-        }}}));
-        if policed_uids.is_empty() {
-            return;
-        }
-        for uid in policed_uids {
-            self.cmds.push(json!({"add":{"rule":{
-                "family":"inet","table":&self.table,"chain":CHAIN_SCOPE,
-                "expr":[
-                    {"match":{"op":"==",
-                              "left":{"meta":{"key":"skuid"}},
-                              "right":uid}},
-                    {"return":null}
-                ]
+        for (chain, hook) in [(CHAIN_EGRESS, "output"), (CHAIN_INGRESS, "input")] {
+            self.cmds.push(json!({"add":{"chain":{
+                "family":"inet","table":&self.table,"name":chain,
+                "hook":hook,"type":"filter","prio":0,"policy":"drop"
             }}}));
         }
-        self.cmds.push(json!({"add":{"rule":{
-            "family":"inet","table":&self.table,"chain":CHAIN_SCOPE,
-            "expr":[{"counter":COUNTER_EXEMPT},{"accept":null}]
-        }}}));
+        self.flush_chain(CHAIN_EGRESS);
+        self.flush_chain(CHAIN_INGRESS);
+
+        // Egress: loopback and replies pass; DHCP/DNS/ICMP always resolve
+        // (resolution is never blocked); carve then grant lookups; else drop.
+        self.push_rule(
+            CHAIN_EGRESS,
+            vec![
+                json!({"match":{"op":"==","left":{"meta":{"key":"oifname"}},"right":"lo"}}),
+                json!({"accept":null}),
+            ],
+        );
+        self.push_ct_established_accept(CHAIN_EGRESS);
+        for proto in ["icmp", "icmpv6"] {
+            self.push_rule(
+                CHAIN_EGRESS,
+                vec![
+                    json!({"match":{"op":"==","left":{"meta":{"key":"l4proto"}},"right":proto}}),
+                    json!({"accept":null}),
+                ],
+            );
+        }
+        // DHCP (v4 client/server, v6) — before proto-port lookups so it is
+        // never hostage to a grant.
+        self.push_rule(
+            CHAIN_EGRESS,
+            vec![
+                json!({"match":{"op":"==","left":{"meta":{"key":"l4proto"}},"right":"udp"}}),
+                json!({"match":{"op":"in","left":{"payload":{"protocol":"th","field":"dport"}},
+                                 "right":[67, 68, 546, 547]}}),
+                json!({"accept":null}),
+            ],
+        );
+        for proto in ["udp", "tcp"] {
+            self.push_rule(
+                CHAIN_EGRESS,
+                vec![
+                    json!({"match":{"op":"==","left":{"meta":{"key":"l4proto"}},"right":proto}}),
+                    json!({"match":{"op":"==","left":{"payload":{"protocol":"th","field":"dport"}},
+                                     "right":53}}),
+                    json!({"accept":null}),
+                ],
+            );
+        }
+        self.push_set_lookups(
+            CHAIN_EGRESS,
+            "daddr",
+            [SET_CARVE_V4, SET_CARVE_V6, SET_V4, SET_V6],
+        );
+        self.push_drop_rule(CHAIN_EGRESS, COUNTER_DROPS, LOG_PREFIX_EGRESS);
+
+        // Ingress: loopback and replies pass; ICMP/ICMPv6 must pass or NDP
+        // and PMTU break the namespace outright (INGRESS-REVIEW.md: omitting
+        // these is how a fix becomes an outage). Everything else is gated by
+        // carve_in/igrant lookups on saddr . l4proto . local dport.
+        self.push_rule(
+            CHAIN_INGRESS,
+            vec![
+                json!({"match":{"op":"==","left":{"meta":{"key":"iifname"}},"right":"lo"}}),
+                json!({"accept":null}),
+            ],
+        );
+        self.push_ct_established_accept(CHAIN_INGRESS);
+        for proto in ["icmp", "icmpv6"] {
+            self.push_rule(
+                CHAIN_INGRESS,
+                vec![
+                    json!({"match":{"op":"==","left":{"meta":{"key":"l4proto"}},"right":proto}}),
+                    json!({"accept":null}),
+                ],
+            );
+        }
+        self.push_set_lookups(
+            CHAIN_INGRESS,
+            "saddr",
+            [
+                SET_CARVE_IN_V4,
+                SET_CARVE_IN_V6,
+                SET_IGRANT_V4,
+                SET_IGRANT_V6,
+            ],
+        );
+        self.push_drop_rule(CHAIN_INGRESS, COUNTER_DROPS_IN, LOG_PREFIX_INGRESS);
+    }
+
+    /// `ct state established,related accept` — replies are never re-gated.
+    /// (Live-flow kill on revoke/expiry is step 4; until a flow dies, its
+    /// packets ride this rule.)
+    fn push_ct_established_accept(&mut self, chain: &str) {
+        self.push_rule(
+            chain,
+            vec![
+                json!({"match":{"op":"in","left":{"ct":{"key":"state"}},
+                                 "right":[{"established":null},{"related":null}]}}),
+                json!({"accept":null}),
+            ],
+        );
+    }
+
+    /// `ip saddr|daddr . meta l4proto . <proto> dport @set accept` — the
+    /// production-proven concat-match shape (same grammar as add_acct_rule).
+    /// One tcp + one udp rule per set; family from the set name suffix.
+    fn push_set_lookups(
+        &mut self,
+        chain: &str,
+        addr_field: &str,
+        sets: impl IntoIterator<Item = &'static str>,
+    ) {
+        for set in sets {
+            let af = if set.ends_with("_v6") { "ip6" } else { "ip" };
+            for proto in [Proto::Tcp, Proto::Udp] {
+                self.push_rule(
+                    chain,
+                    vec![
+                        json!({"match":{"op":"==","left":{"concat":[
+                            {"payload":{"protocol":af,"field":addr_field}},
+                            {"meta":{"key":"l4proto"}},
+                            {"payload":{"protocol":proto.nft_key(),"field":"dport"}}
+                        ]},"right":format!("@{set}")}}),
+                        json!({"accept":null}),
+                    ],
+                );
+            }
+        }
     }
 
     /// Add a grant element with kernel TTL and `tethys:g<gid>` comment.
     /// Comment persists in the live dump; concat deletes still match.
-    pub fn add_grant(&mut self, e: &GrantElem, ttl: Duration, gid: i64) {
+    /// `dir` picks the egress (daddr-keyed) or ingress (saddr-keyed) family:
+    /// the element JSON is identical for both — th dport on inbound packets
+    /// IS the local port, exactly what an ingress grant constrains. Only the
+    /// set typing (which header field `addr` reads) differs.
+    pub fn add_grant(&mut self, e: &GrantElem, ttl: Duration, gid: i64, dir: Direction) {
         self.cmds.push(json!({"add":{"element":{
-            "family":"inet","table":&self.table,"name":e.set_name(),
+            "family":"inet","table":&self.table,"name":e.set_name(dir),
             "elem":[{"elem":{"val": e.concat(), "expires": ttl.as_secs(),
                               "comment": format!("tethys:g{gid}")}}]
         }}}));
     }
 
-    pub fn delete_grant(&mut self, e: &GrantElem) {
-        self.delete_in(e, e.set_name())
+    pub fn delete_grant(&mut self, e: &GrantElem, dir: Direction) {
+        self.delete_in(e, e.set_name(dir))
     }
 
     /// Allow-list element: same key as a grant, no timeout/comment.
     /// Callers must `flush_carves()` first, because deleting a missing element
     /// aborts the whole nft batch.
-    pub fn add_carve(&mut self, e: &GrantElem) {
+    pub fn add_carve(&mut self, e: &GrantElem, dir: Direction) {
         self.cmds.push(json!({"add":{"element":{
-            "family":"inet","table":&self.table,"name":e.carve_set_name(),
+            "family":"inet","table":&self.table,"name":e.carve_set_name(dir),
             "elem":[e.concat()]
         }}}));
     }
 
-    /// Flush both carve sets before reinstalling from config.
+    /// Flush all four carve sets (egress + ingress) before reinstalling from
+    /// config.
     pub fn flush_carves(&mut self) {
-        for name in [SET_CARVE_V4, SET_CARVE_V6] {
+        for name in [SET_CARVE_V4, SET_CARVE_V6, SET_CARVE_IN_V4, SET_CARVE_IN_V6] {
             self.cmds.push(json!({"flush":{"set":{
                 "family":"inet","table":&self.table,"name":name
             }}}));
         }
     }
 
-    /// Ensure carve sets exist (baseline also declares them).
+    /// Ensure carve sets exist. Ingress carves are saddr-keyed like the
+    /// igrant sets.
     pub fn ensure_carve_sets(&mut self) {
-        for (name, proto_field) in [(SET_CARVE_V4, "ip"), (SET_CARVE_V6, "ip6")] {
+        for (name, proto_field, addr_field) in [
+            (SET_CARVE_V4, "ip", "daddr"),
+            (SET_CARVE_V6, "ip6", "daddr"),
+            (SET_CARVE_IN_V4, "ip", "saddr"),
+            (SET_CARVE_IN_V6, "ip6", "saddr"),
+        ] {
             self.cmds.push(json!({"add":{"set":{
                 "family":"inet","table":&self.table,"name":name,
                 "type":{"typeof":{"concat":[
-                    {"payload":{"protocol":proto_field,"field":"daddr"}},
+                    {"payload":{"protocol":proto_field,"field":addr_field}},
                     {"meta":{"key":"l4proto"}},
                     {"payload":{"protocol":"th","field":"dport"}}
                 ]}},
@@ -418,6 +702,9 @@ impl Batch {
 #[derive(Clone, Debug)]
 pub struct LiveElement {
     pub set: String,
+    /// Which grant family this element came from (derived from the set name:
+    /// `grants_*` => Egress, `igrants_*` => Ingress).
+    pub dir: Direction,
     pub dst: String, // canonical "1.2.3.4" / "10.0.0.0/8"
     pub proto: Proto,
     pub port_from: u16,
@@ -434,10 +721,92 @@ pub struct PollState {
     pub counters: std::collections::HashMap<String, (u64, u64)>,
 }
 
-/// `nft` CLI backend: argv-pinned, env-cleared, JSON on stdin.
+/// Whether the live ruleset actually references each grant set family. A set
+/// can exist with zero referencing rules (daemon upgraded onto an older
+/// ruleset, half-provisioned table), which is exactly the INGRESS-REVIEW.md
+/// Medium failure mode: elements installed, verdicts APPROVED, nothing
+/// filtered. Each family counts as active only when a live rule in the
+/// target table looks it up; dual-stack is mandatory, so v4 and v6 must both
+/// be referenced for a direction to report active.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct EnforcementStatus {
+    pub grants_v4: bool,
+    pub grants_v6: bool,
+    pub igrants_v4: bool,
+    pub igrants_v6: bool,
+}
+
+impl EnforcementStatus {
+    pub fn egress_active(&self) -> bool {
+        self.grants_v4 && self.grants_v6
+    }
+    pub fn ingress_active(&self) -> bool {
+        self.igrants_v4 && self.igrants_v6
+    }
+    /// Both directions fully wired; the daemon's "enforcement boundary
+    /// active" condition (step 3 refuses installs when this is false).
+    pub fn active(&self) -> bool {
+        self.egress_active() && self.ingress_active()
+    }
+}
+
+fn set_family_of(name: &str) -> Option<fn(&mut EnforcementStatus) -> &mut bool> {
+    match name {
+        SET_V4 => Some(|s| &mut s.grants_v4),
+        SET_V6 => Some(|s| &mut s.grants_v6),
+        SET_IGRANT_V4 => Some(|s| &mut s.igrants_v4),
+        SET_IGRANT_V6 => Some(|s| &mut s.igrants_v6),
+        _ => None,
+    }
+}
+
+/// Scan `nft --json list ruleset` output for live rules in table `tname`
+/// that look up each grant set (`"right": "@grants_v4"` style matches).
+/// Pure JSON — no netlink, unit-testable. Element-only presence does NOT
+/// count: only rule references mean the traffic path consults the set.
+pub fn parse_enforcement(doc: &Value, tname: &str) -> EnforcementStatus {
+    let mut st = EnforcementStatus::default();
+    let Some(arr) = doc.get("nftables").and_then(|v| v.as_array()) else {
+        return st;
+    };
+    for item in arr {
+        // `list ruleset` nests rules as {"rule":{...}}; also tolerate the
+        // full-dump shape where table is a sibling object.
+        let Some(rule) = item.get("rule") else {
+            continue;
+        };
+        if rule.get("table").and_then(|v| v.as_str()) != Some(tname) {
+            continue;
+        }
+        let Some(exprs) = rule.get("expr").and_then(|v| v.as_array()) else {
+            continue;
+        };
+        for expr in exprs {
+            // A set reference is a string match RHS like "@grants_v4". Only
+            // the RHS can name a set, so scan exactly that slot.
+            let Some(right) = expr.get("match").and_then(|m| m.get("right")) else {
+                continue;
+            };
+            let Some(name) = right.as_str().and_then(|s| s.strip_prefix('@')) else {
+                continue;
+            };
+            if let Some(field) = set_family_of(name) {
+                *field(&mut st) = true;
+            }
+        }
+    }
+    st
+}
+
+/// `nft` CLI backend: argv-pinned, env-cleared, JSON on stdin. Every spawn
+/// funnels through [`NftCli::run_json`] so the [`ExecTarget`] (host stack or
+/// setns into the agent netns) is applied uniformly — no call site spawns
+/// nft ad hoc.
 pub struct NftCli {
     pub bin: std::path::PathBuf,
     pub timeout: Duration,
+    /// Where batches execute. `Host` until a namespace handle is supplied.
+    pub target: ExecTarget,
 }
 
 impl Default for NftCli {
@@ -445,18 +814,28 @@ impl Default for NftCli {
         Self {
             bin: "/usr/sbin/nft".into(),
             timeout: Duration::from_secs(5),
+            target: ExecTarget::Host,
         }
     }
 }
 
 impl NftCli {
+    /// Backend that applies every batch inside the netns at `path` (the fd
+    /// is opened and pinned once; each batch revalidates the inode).
+    pub fn in_netns(path: impl AsRef<Path>) -> Result<Self, NftError> {
+        Ok(Self {
+            target: ExecTarget::Netns(Arc::new(Netns::open(path)?)),
+            ..Default::default()
+        })
+    }
+
     /// Apply a JSON batch atomically (nft processes a batch as one transact).
     pub async fn apply(&self, batch: &Batch) -> Result<(), NftError> {
         if batch.is_empty() {
             return Ok(());
         }
         let payload = batch.to_json();
-        run_nft_json(&self.bin, &payload, self.timeout).await?;
+        self.run_json(&payload).await?;
         Ok(())
     }
 
@@ -472,7 +851,7 @@ impl NftCli {
             None => cmd.insert(what.to_string(), serde_json::json!({})),
         };
         let batch = json!({"nftables": [{"list": Value::Object(cmd)}]});
-        let out = run_nft_json(&self.bin, &batch.to_string(), self.timeout).await?;
+        let out = self.run_json(&batch.to_string()).await?;
         Ok(serde_json::from_str(&out)?)
     }
 
@@ -483,25 +862,57 @@ impl NftCli {
         let c = self.list_json("counters", None).await?;
         Ok(parse_poll(&t, &c, table))
     }
+
+    /// Probe the live ruleset (inside this backend's execution target) for
+    /// rules that reference each grant set family. The daemon polls this at
+    /// start and periodically so APPROVED can never silently mean
+    /// "elements loaded but nothing filtering".
+    pub async fn enforcement_status(&self, table: &str) -> Result<EnforcementStatus, NftError> {
+        let doc = self.list_json("ruleset", None).await?;
+        Ok(parse_enforcement(&doc, table))
+    }
+
+    /// The one spawn helper: every `nft` subprocess starts here. Namespaced
+    /// targets revalidate the cached netns inode first (fail closed), then
+    /// setns in the child via [`setns_pre_exec`]; host batches run plain.
+    async fn run_json(&self, payload: &str) -> Result<String, NftError> {
+        let mut cmd = Command::new(&self.bin);
+        cmd.env_clear();
+        // nft 1.1.6: --json must precede -f.
+        cmd.args(["--json", "-f", "-"]);
+        match &self.target {
+            ExecTarget::Host => {}
+            ExecTarget::Netns(ns) => {
+                ns.revalidate()?;
+                // SAFETY (audited unsafe_code exception, like the daemon's
+                // umask guard): setns_pre_exec returns a post-fork/pre-exec
+                // closure doing only fcntl+setns syscalls on a parent-owned
+                // nsfs fd. tokio falls back from posix_spawn to fork+exec
+                // once pre_exec is installed, so the hook always runs.
+                #[allow(unsafe_code)]
+                unsafe {
+                    cmd.pre_exec(setns_pre_exec(ns.fd()))
+                };
+            }
+        }
+        run_nft_json(cmd, payload, self.timeout).await
+    }
 }
 
-/// Run one JSON batch through the nft CLI on stdin and return stdout.
-/// A failed stdin write means nft never saw the batch, so it is surfaced as
-/// an error rather than letting the child fail or hang on empty stdin (an
-/// apply miss). Stdout/stderr handles are taken before waiting so the
-/// timeout path can still kill the child by &mut; on timeout the readers are
-/// reaped as well (the kill closes their pipes, so they should EOF promptly,
-/// but they are never left detached). Non-zero exit becomes
-/// [`NftError::Failed`] with the captured stderr.
+/// Run one pre-configured (argv-pinned, env-cleared, target-attached) JSON
+/// batch through the nft CLI on stdin and return stdout. A failed stdin
+/// write means nft never saw the batch, so it is surfaced as an error rather
+/// than letting the child fail or hang on empty stdin (an apply miss).
+/// Stdout/stderr handles are taken before waiting so the timeout path can
+/// still kill the child by &mut; on timeout the readers are reaped as well
+/// (the kill closes their pipes, so they should EOF promptly, but they are
+/// never left detached). Non-zero exit becomes [`NftError::Failed`] with the
+/// captured stderr.
 async fn run_nft_json(
-    bin: &std::path::Path,
+    mut cmd: Command,
     payload: &str,
     timeout: Duration,
 ) -> Result<String, NftError> {
-    let mut cmd = Command::new(bin);
-    cmd.env_clear();
-    // nft 1.1.6: --json must precede -f.
-    cmd.args(["--json", "-f", "-"]);
     cmd.stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -580,9 +991,11 @@ pub fn parse_poll(doc: &Value, counters: &Value, tname: &str) -> PollState {
                 .and_then(|v| v.as_str())
                 .unwrap_or("")
                 .to_string();
-            if name != SET_V4 && name != SET_V6 {
-                continue;
-            }
+            let dir = match name.as_str() {
+                SET_V4 | SET_V6 => Direction::Egress,
+                SET_IGRANT_V4 | SET_IGRANT_V6 => Direction::Ingress,
+                _ => continue,
+            };
             let Some(elems) = set.get("elem").and_then(|v| v.as_array()) else {
                 continue;
             };
@@ -647,6 +1060,7 @@ pub fn parse_poll(doc: &Value, counters: &Value, tname: &str) -> PollState {
                 };
                 elements.push(LiveElement {
                     set: name.clone(),
+                    dir,
                     dst,
                     proto,
                     port_from: pf,
@@ -731,7 +1145,7 @@ mod tests {
         let s = v.to_string();
         assert!(!s.contains("10.0.0.0/8"), "slash string would trigger DNS");
         assert!(s.contains("\"prefix\""));
-        assert_eq!(e.set_name(), SET_V4);
+        assert_eq!(e.set_name(Direction::Egress), SET_V4);
     }
 
     #[test]
@@ -741,14 +1155,19 @@ mod tests {
             proto: Proto::Udp,
             port: PortSpec { from: 0, to: 0 },
         };
-        assert_eq!(e.set_name(), SET_V6);
+        assert_eq!(e.set_name(Direction::Egress), SET_V6);
+        assert_eq!(e.carve_set_name(Direction::Egress), SET_CARVE_V6);
+        // Ingress flips the family, never the element grammar.
+        assert_eq!(e.set_name(Direction::Ingress), SET_IGRANT_V6);
+        assert_eq!(e.carve_set_name(Direction::Ingress), SET_CARVE_IN_V6);
         let s = e.concat().to_string();
         assert!(s.contains("\"range\":[0,65535]"));
     }
 
     // serde_json sorts keys, so assert against the parsed structure rather
     // than substrings. The grant add must carry the elem wrapper with its
-    // expires value and tethys:g7 comment.
+    // expires value and tethys:g7 comment; direction selects only the set
+    // name — the element JSON is byte-identical across directions.
     #[test]
     fn grant_add_uses_elem_wrapper() {
         let mut b = Batch::new();
@@ -760,6 +1179,7 @@ mod tests {
             },
             Duration::from_secs(600),
             7,
+            Direction::Egress,
         );
         let j: serde_json::Value = serde_json::from_str(&b.to_json()).unwrap();
         let cmds = j["nftables"].as_array().unwrap();
@@ -770,65 +1190,295 @@ mod tests {
         assert_eq!(e0["elem"]["comment"], "tethys:g7");
     }
 
+    #[test]
+    fn grant_direction_selects_set_not_element() {
+        let e = GrantElem {
+            dst: ElemDst::Ip(ip("203.0.113.7")),
+            proto: Proto::Tcp,
+            port: PortSpec { from: 443, to: 443 },
+        };
+        let mut out = Batch::new();
+        let mut inb = Batch::new();
+        out.add_grant(&e, Duration::from_secs(60), 7, Direction::Egress);
+        inb.add_grant(&e, Duration::from_secs(60), 7, Direction::Ingress);
+        let cmd = |b: &Batch| -> Value {
+            serde_json::from_str::<Value>(&b.to_json()).unwrap()["nftables"][0]["add"]["element"]
+                .clone()
+        };
+        let (o, i) = (cmd(&out), cmd(&inb));
+        assert_eq!(o["name"], SET_V4);
+        assert_eq!(i["name"], SET_IGRANT_V4);
+        // Value, TTL and comment are byte-identical across directions.
+        assert_eq!(o["elem"], i["elem"]);
+    }
+
     // Checks that carve sets carry no timeout flag, that the batch orders
-    // sets, then flushes, then the element, and that the carve element is a
-    // plain concat with no expires/comment wrapper.
+    // sets (all four), then flushes (all four), then the element, and that
+    // the carve element is a plain concat with no expires/comment wrapper.
     #[test]
     fn carve_batch_shape() {
         let mut b = Batch::new();
         b.ensure_carve_sets();
         b.flush_carves();
-        b.add_carve(&GrantElem {
-            dst: ElemDst::Ip("203.0.113.7".parse().unwrap()),
-            proto: Proto::Tcp,
-            port: PortSpec { from: 443, to: 443 },
-        });
+        b.add_carve(
+            &GrantElem {
+                dst: ElemDst::Ip("203.0.113.7".parse().unwrap()),
+                proto: Proto::Tcp,
+                port: PortSpec { from: 443, to: 443 },
+            },
+            Direction::Egress,
+        );
         let cmds = serde_json::from_str::<Value>(&b.to_json()).unwrap()["nftables"]
             .as_array()
             .unwrap()
             .clone();
-        let s0 = &cmds[0]["add"]["set"];
-        assert_eq!(s0["name"], "carve_v4");
-        assert_eq!(s0["flags"], json!(["interval"]));
-        assert!(cmds[2]["flush"]["set"]["name"].as_str() == Some("carve_v4"));
-        let e = &cmds[4]["add"]["element"];
+        // Four set adds, no timeout flag (key typing is covered by
+        // ensure_base_netns_shape; the point here is install order)...
+        assert_eq!(cmds[0]["add"]["set"]["name"], "carve_v4");
+        assert_eq!(cmds[0]["add"]["set"]["flags"], json!(["interval"]));
+        assert_eq!(cmds[2]["add"]["set"]["name"], "carve_in_v4");
+        // ...then four flushes (stop.grants-safe reinstall order)...
+        assert!(cmds[4]["flush"]["set"]["name"].as_str() == Some("carve_v4"));
+        assert!(cmds[7]["flush"]["set"]["name"].as_str() == Some("carve_in_v6"));
+        // ...then the plain-concat element.
+        let e = &cmds[8]["add"]["element"];
         assert_eq!(e["name"], "carve_v4");
         assert_eq!(e["elem"][0]["concat"][1], json!("tcp"));
         assert!(e["elem"][0]["concat"].is_array());
     }
 
+    // The netns table shape: both base chains hooked with policy drop, no
+    // uid/skuid expressions anywhere (the whole namespace is policed by
+    // construction), all four grant families present with the right address
+    // slots, and each chain closed by counter+limit+log+drop. Rule bodies
+    // are rebuilt via flush inside the same batch: chain add must precede
+    // its flush, and the flush must precede that chain's rules, so a rerun
+    // converges instead of duplicating.
     #[test]
-    fn scope_rules_encode_policed_return_then_exempt_accept() {
-        let mut b = Batch::new();
-        b.rebuild_scope(&[990]);
-        let cmds = &b.cmds;
-        assert_eq!(
-            cmds[0]["flush"]["chain"]["name"],
-            serde_json::json!(CHAIN_SCOPE)
+    fn ensure_base_netns_shape() {
+        let mut b = Batch::with_table("tethys_test");
+        b.ensure_base();
+        let json = b.to_json();
+        assert!(
+            !json.contains("skuid"),
+            "netns shape carries no uid expressions"
         );
-        let policed = &cmds[1]["add"]["rule"];
-        assert_eq!(policed["chain"], serde_json::json!(CHAIN_SCOPE));
-        let exprs = policed["expr"].as_array().unwrap();
-        assert_eq!(
-            exprs[0]["match"]["left"],
-            serde_json::json!({"meta":{"key":"skuid"}})
+        let cmds = serde_json::from_str::<Value>(&json).unwrap()["nftables"]
+            .as_array()
+            .unwrap()
+            .clone();
+        assert!(
+            !cmds
+                .iter()
+                .any(|c| c["add"]["chain"]["name"].as_str() == Some("scope")),
+            "no uid scope chain in the netns shape"
         );
-        assert_eq!(exprs[0]["match"]["op"], serde_json::json!("=="));
-        assert_eq!(exprs[0]["match"]["right"], serde_json::json!(990));
-        assert!(exprs[1].get("return").is_some(), "policed uids must RETURN");
-        let exempt = &cmds[2]["add"]["rule"];
-        let exprs = exempt["expr"].as_array().unwrap();
-        assert_eq!(exprs[0]["counter"], serde_json::json!(COUNTER_EXEMPT));
-        assert!(exprs[1].get("accept").is_some(), "everyone else ACCEPTs");
+        assert!(
+            !json.contains("\"jump\""),
+            "base chains never jump out to scoping"
+        );
+
+        // Sets: daddr-keyed grants, saddr-keyed igrants, carve pairs.
+        let set_addr = |name: &str| -> String {
+            cmds.iter()
+                .find(|c| c["add"]["set"]["name"].as_str() == Some(name))
+                .unwrap_or_else(|| panic!("missing set {name}"))["add"]["set"]["type"]["typeof"]
+                ["concat"][0]["payload"]["field"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        };
+        for (set, want) in [
+            (SET_V4, "daddr"),
+            (SET_V6, "daddr"),
+            (SET_CARVE_V4, "daddr"),
+            (SET_CARVE_V6, "daddr"),
+            (SET_IGRANT_V4, "saddr"),
+            (SET_IGRANT_V6, "saddr"),
+            (SET_CARVE_IN_V4, "saddr"),
+            (SET_CARVE_IN_V6, "saddr"),
+        ] {
+            assert_eq!(set_addr(set), want, "{set} address slot");
+        }
+
+        // Base chains: hooked, priority filter (0), policy drop.
+        for (chain, hook) in [(CHAIN_EGRESS, "output"), (CHAIN_INGRESS, "input")] {
+            let add = cmds
+                .iter()
+                .find(|c| c["add"]["chain"]["name"].as_str() == Some(chain))
+                .unwrap();
+            assert_eq!(add["add"]["chain"]["hook"], hook);
+            assert_eq!(add["add"]["chain"]["prio"], 0);
+            assert_eq!(add["add"]["chain"]["policy"], "drop");
+        }
+
+        // Idempotent rebuild: flush after chain add, before that chain's rules.
+        let idx = |pred: &dyn Fn(&Value) -> bool| cmds.iter().position(pred).unwrap_or(usize::MAX);
+        for chain in [CHAIN_EGRESS, CHAIN_INGRESS] {
+            let add_i = idx(&|c| c["add"]["chain"]["name"].as_str() == Some(chain));
+            let flush_i = idx(&|c| c["flush"]["chain"]["name"].as_str() == Some(chain));
+            let rule_i = idx(&|c| {
+                c["add"]["rule"]["chain"].as_str() == Some(chain)
+                    && !c["add"]["rule"]["expr"][0]["match"]["left"]["concat"].is_null()
+            });
+            assert!(add_i < flush_i, "{chain}: chain declared before flush");
+            assert!(flush_i < rule_i, "{chain}: rules only after flush");
+        }
+
+        // Every grant family is looked up from its base chain as a tcp AND
+        // a udp concat rule; ingress gates on saddr + LOCAL dport, egress
+        // stays daddr-keyed. A missing proto variant would silently leave
+        // one protocol permanently dropped.
+        let lookup = |set: &str| -> Vec<Value> {
+            cmds.iter()
+                .filter(|c| {
+                    c["add"]["rule"]["expr"][0]["match"]["right"].as_str()
+                        == Some(&format!("@{set}"))
+                })
+                .map(|c| c["add"]["rule"]["expr"][0].clone())
+                .collect()
+        };
+        for set in [
+            SET_CARVE_IN_V4,
+            SET_CARVE_IN_V6,
+            SET_IGRANT_V4,
+            SET_IGRANT_V6,
+        ] {
+            let l = lookup(set);
+            assert_eq!(l.len(), 2, "{set}: tcp + udp variants");
+            for m in &l {
+                assert_eq!(m["match"]["left"]["concat"][0]["payload"]["field"], "saddr");
+                assert_eq!(m["match"]["left"]["concat"][2]["payload"]["field"], "dport");
+            }
+        }
+        for set in [SET_CARVE_V4, SET_CARVE_V6, SET_V4, SET_V6] {
+            let l = lookup(set);
+            assert_eq!(l.len(), 2, "{set}: tcp + udp variants");
+            for m in &l {
+                assert_eq!(m["match"]["left"]["concat"][0]["payload"]["field"], "daddr");
+            }
+        }
+
+        // Each base chain ends with its counted, rate-limited logged drop.
+        let tail = |chain: &str| -> Value {
+            cmds.iter()
+                .rev()
+                .find(|c| c["add"]["rule"]["chain"].as_str() == Some(chain))
+                .unwrap()["add"]["rule"]["expr"]
+                .clone()
+        };
+        let egress_tail = tail(CHAIN_EGRESS);
+        assert_eq!(egress_tail[0]["counter"], COUNTER_DROPS);
+        assert_eq!(egress_tail[1]["limit"]["rate"], DROP_LOG_RATE);
+        assert_eq!(egress_tail[2]["log"]["prefix"], LOG_PREFIX_EGRESS);
+        assert!(egress_tail[3].get("drop").is_some());
+        let ingress_tail = tail(CHAIN_INGRESS);
+        assert_eq!(ingress_tail[0]["counter"], COUNTER_DROPS_IN);
+        assert_eq!(ingress_tail[2]["log"]["prefix"], LOG_PREFIX_INGRESS);
+
+        // Replies pass in both chains (kill-on-revoke is step 4's job).
+        for chain in [CHAIN_EGRESS, CHAIN_INGRESS] {
+            assert!(cmds.iter().any(|c| {
+                c["add"]["rule"]["chain"].as_str() == Some(chain)
+                    && c["add"]["rule"]["expr"][0]["match"]["left"]["ct"]["key"].as_str()
+                        == Some("state")
+            }));
+        }
+
+        // ICMP/ICMPv6 must pass on BOTH hooks: dropping NDP/PMTU at input
+        // breaks the namespace outright (INGRESS-REVIEW.md outage warning).
+        for chain in [CHAIN_EGRESS, CHAIN_INGRESS] {
+            for proto in ["icmp", "icmpv6"] {
+                assert!(
+                    cmds.iter().any(|c| {
+                        c["add"]["rule"]["chain"].as_str() == Some(chain)
+                            && c["add"]["rule"]["expr"][0]["match"]["right"].as_str() == Some(proto)
+                    }),
+                    "{proto} must pass at {chain}"
+                );
+            }
+        }
     }
 
     #[test]
-    // Flush only: no accept rule, all packets fall through to the drop.
-    fn scope_empty_list_means_no_exempt_rule() {
-        let mut b = Batch::new();
-        b.rebuild_scope(&[]);
-        assert_eq!(b.cmds.len(), 1);
-        assert!(b.cmds[0].get("flush").is_some());
+    fn parse_enforcement_requires_live_rule_references() {
+        let doc = json!({"nftables": [
+            {"table": {"family":"inet","name":"tethys"}},
+            // Elements alone do not count.
+            {"set":{"name":"grants_v4","elem":[{"elem":{"val":{"concat":["1.2.3.4","tcp",443]}}}]}},
+            {"rule":{"family":"inet","table":"tethys","chain":"egress","expr":[
+                {"match":{"op":"==","left":{"concat":["..."]},"right":"@grants_v4"}},{"accept":null}]}},
+            {"rule":{"family":"inet","table":"tethys","chain":"egress","expr":[
+                {"match":{"op":"==","left":{"concat":["..."]},"right":"@grants_v6"}},{"accept":null}]}},
+            {"rule":{"family":"inet","table":"tethys","chain":"ingress","expr":[
+                {"match":{"op":"==","left":{"concat":["..."]},"right":"@igrants_v4"}},{"accept":null}]}},
+            // A rule in a different table must not light up our status.
+            {"rule":{"family":"inet","table":"other","chain":"ingress","expr":[
+                {"match":{"op":"==","left":{"concat":["..."]},"right":"@igrants_v6"}},{"accept":null}]}}
+        ]});
+        let st = parse_enforcement(&doc, "tethys");
+        assert!(
+            st.egress_active(),
+            "both grant sets referenced by live rules"
+        );
+        assert!(
+            !st.ingress_active(),
+            "igrants_v6 only referenced in table `other`"
+        );
+        assert!(st.igrants_v4);
+        assert!(!st.igrants_v6);
+        assert!(!st.active());
+
+        // All four wired -> fully active; empty/garbage docs -> all false.
+        let mut full = doc.clone();
+        full["nftables"].as_array_mut().unwrap().push(json!(
+            {"rule":{"family":"inet","table":"tethys","chain":"ingress","expr":[
+                {"match":{"op":"==","left":{"concat":["..."]},"right":"@igrants_v6"}},{"accept":null}]}}));
+        assert!(parse_enforcement(&full, "tethys").active());
+        assert!(!parse_enforcement(&json!({"nftables": []}), "tethys").active());
+        assert!(!parse_enforcement(&json!("nope"), "tethys").egress_active());
+    }
+
+    // Netns revalidation is pure inode logic, testable on plain files: the
+    // point is that a deleted or replaced path never silently executes a
+    // batch against whatever stack owns it afterwards.
+    #[test]
+    fn netns_revalidate_detects_gone_and_replaced() {
+        let dir = std::env::temp_dir().join(format!("tethys-netns-probe-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("probe");
+        std::fs::write(&path, b"a").unwrap();
+
+        let ns = Netns::open(&path).expect("open");
+        assert_eq!(ns.path(), path.as_path());
+        ns.revalidate().expect("unchanged path validates");
+
+        // Recreated (new inode at the same path) -> loud failure.
+        std::fs::write(dir.join("fresh"), b"b").unwrap();
+        std::fs::rename(dir.join("fresh"), &path).unwrap();
+        match ns.revalidate() {
+            Err(NftError::NetnsReplaced { .. }) => {}
+            other => panic!("expected NetnsReplaced, got {other:?}"),
+        }
+
+        // Deleted -> loud failure (cached fd keeps working; the path does not).
+        std::fs::remove_file(&path).unwrap();
+        match ns.revalidate() {
+            Err(NftError::NetnsGone { .. }) => {}
+            other => panic!("expected NetnsGone, got {other:?}"),
+        }
+
+        assert!(matches!(
+            Netns::open(dir.join("absent")),
+            Err(NftError::NetnsOpen { .. })
+        ));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    // Dev/test default stays host-stack; netns is opted into explicitly.
+    fn default_exec_target_is_host() {
+        assert!(matches!(NftCli::default().target, ExecTarget::Host));
     }
 
     /// Every command must target the batch's table. A missed substitution
@@ -838,16 +1488,15 @@ mod tests {
     fn every_command_targets_the_batches_table() {
         let mut b = Batch::with_table("tethys_alt");
         b.ensure_base();
-        b.rebuild_scope(&[990]);
         let e = GrantElem {
             dst: ElemDst::Ip(ip("203.0.113.7")),
             proto: Proto::Tcp,
             port: PortSpec { from: 443, to: 443 },
         };
-        b.add_grant(&e, Duration::from_secs(60), 7);
-        b.delete_grant(&e);
+        b.add_grant(&e, Duration::from_secs(60), 7, Direction::Egress);
+        b.delete_grant(&e, Direction::Ingress);
         b.ensure_carve_sets();
-        b.add_carve(&e);
+        b.add_carve(&e, Direction::Egress);
         b.flush_carves();
         b.add_acct_set(7, Dir::Out, false);
         b.add_acct_elem(7, Dir::Out, &e);
@@ -965,14 +1614,34 @@ mod tests {
             {"set":{"name":SET_V4,"family":"inet","table":TABLE,
                 "elem":[{"elem":{"val":{"concat":["1.2.3.4","tcp",53]},"expires":41.9}},
                         {"elem":{"val":{"concat":[{"prefix":{"addr":"10.0.0.0","len":8}},"udp",
-                            {"range":[8000,8100]}]},"expires":12.0,"comment":"tethys:g7"}}]}}
+                            {"range":[8000,8100]}]},"expires":12.0,"comment":"tethys:g7"}}]}},
+            // Ingress elements parse through the same path but must be
+            // attributed by set family; carve sets are NOT grant state and
+            // must stay out of PollState entirely.
+            {"set":{"name":SET_IGRANT_V6,"family":"inet","table":TABLE,
+                "elem":[{"elem":{"val":{"concat":["2001:db8::5","tcp",443]},"expires":9.0,
+                          "comment":"tethys:g9"}}]}},
+            {"set":{"name":SET_CARVE_V4,"family":"inet","table":TABLE,
+                "elem":[{"val":{"concat":["9.9.9.9","udp",53]}}]}}
         ]});
         let counters = json!({"nftables":[
             {"counter":{"name":"g7_out","table":TABLE,"packets":3,"bytes":120}},
             {"counter":{"name":"other","table":"elsewhere","packets":9,"bytes":9}}
         ]});
         let st = parse_poll(&table, &counters, TABLE);
-        assert_eq!(st.elements.len(), 2);
+        assert_eq!(
+            st.elements.len(),
+            3,
+            "grants + igrants only; carve excluded"
+        );
+        assert_eq!(st.elements[0].dir, Direction::Egress);
+        assert_eq!(st.elements[1].dir, Direction::Egress);
+        assert_eq!(
+            (st.elements[2].set.as_str(), st.elements[2].dst.as_str()),
+            (SET_IGRANT_V6, "2001:db8::5")
+        );
+        assert_eq!(st.elements[2].dir, Direction::Ingress);
+        assert_eq!(st.elements[2].comment.as_deref(), Some("tethys:g9"));
         assert!((st.elements[0].expires_secs - 41.9).abs() < 0.01);
         assert_eq!(st.elements[1].dst, "10.0.0.0/8");
         assert_eq!(

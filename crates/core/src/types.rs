@@ -22,6 +22,8 @@ pub enum SpecError {
     BadPortRange { from: u16, to: u16 },
     #[error("invalid proto {0:?}: expected tcp or udp")]
     BadProto(String),
+    #[error("invalid direction {0:?}: expected egress or ingress")]
+    BadDirection(String),
     #[error("invalid ttl {0:?}: expected e.g. 30s / 15m / 2h")]
     BadTtl(String),
 }
@@ -59,6 +61,53 @@ impl std::str::FromStr for Proto {
             "udp" => Ok(Proto::Udp),
             other => Err(SpecError::BadProto(other.to_string())),
         }
+    }
+}
+
+/// Which way the granted traffic flows. Egress (the original and still the
+/// default): locally-generated outbound to a destination address+port.
+/// Ingress: NEW inbound connections from a source address to local ports —
+/// the reverse-shell/callback direction. Wire/DB spelling is lowercase;
+/// serde is the authority, [`Direction::ALL`] is the alloc-free table behind
+/// `as_str`/`parse`. Rows written before this field existed load as Egress.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Direction {
+    #[default]
+    Egress,
+    Ingress,
+}
+
+impl Direction {
+    pub const ALL: [(Direction, &'static str); 2] = [
+        (Direction::Egress, "egress"),
+        (Direction::Ingress, "ingress"),
+    ];
+    pub fn as_str(self) -> &'static str {
+        Self::ALL
+            .iter()
+            .find(|(d, _)| *d == self)
+            .map(|(_, n)| *n)
+            .unwrap()
+    }
+    pub fn parse(s: &str) -> Option<Self> {
+        Self::ALL.iter().find(|(_, n)| *n == s).map(|(d, _)| *d)
+    }
+    pub fn is_ingress(self) -> bool {
+        self == Direction::Ingress
+    }
+}
+
+impl fmt::Display for Direction {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl std::str::FromStr for Direction {
+    type Err = SpecError;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Self::parse(s).ok_or_else(|| SpecError::BadDirection(s.to_string()))
     }
 }
 

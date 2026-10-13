@@ -26,7 +26,7 @@ use tethys_core::types::{fmt_ttl, parse_ttl, PortSpec, SpecError, Target};
 
 use crate::admin::handle_admin;
 use crate::install::{
-    install_carves, install_grant, install_scope, rebuild_acct, sweep_grant_objs, uninstall_grant,
+    install_carves, install_grant, rebuild_acct, sweep_grant_objs, uninstall_grant,
 };
 use crate::ledger::{
     now_secs, ttl_expires, Decide, DenyCode, GrantRow, GrantState, Ledger, NewGrant,
@@ -124,7 +124,6 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
             .map_err(|e| anyhow::anyhow!("nft base install failed: {e}"))?;
         tracing::info!("nft base table ready");
         install_carves(&st).await?;
-        install_scope(&st).await?;
         reconcile_on_boot(&st).await;
     } else {
         tracing::warn!("--dry-run: nft objects not installed (dev mode)");

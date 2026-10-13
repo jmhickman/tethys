@@ -241,11 +241,14 @@ async fn stop_grants(req: &RpcRequest, st: &Arc<State>) -> RpcResponse {
         match row_elems(g).await {
             Ok(dsts) => {
                 for d in dsts {
-                    b.delete_grant(&GrantElem {
-                        dst: d,
-                        proto,
-                        port,
-                    });
+                    b.delete_grant(
+                        &GrantElem {
+                            dst: d,
+                            proto,
+                            port,
+                        },
+                        tethys_core::types::Direction::Egress,
+                    );
                 }
                 n += 1;
             }
@@ -265,11 +268,14 @@ async fn stop_grants(req: &RpcRequest, st: &Arc<State>) -> RpcResponse {
                 if let Ok(dsts) = row_elems(g).await {
                     let mut gb = Batch::with_table(&st.cfg.nft_table);
                     for d in dsts {
-                        gb.delete_grant(&GrantElem {
-                            dst: d,
-                            proto,
-                            port,
-                        });
+                        gb.delete_grant(
+                            &GrantElem {
+                                dst: d,
+                                proto,
+                                port,
+                            },
+                            tethys_core::types::Direction::Egress,
+                        );
                     }
                     match st.nft.apply(&gb).await {
                         Ok(()) => ok += 1,
@@ -426,11 +432,14 @@ async fn revoke(st: &Arc<State>, gid: i64) {
                 Ok(dsts) => {
                     let mut b = Batch::with_table(&st.cfg.nft_table);
                     for d in dsts {
-                        b.delete_grant(&GrantElem {
-                            dst: d,
-                            proto,
-                            port,
-                        });
+                        b.delete_grant(
+                            &GrantElem {
+                                dst: d,
+                                proto,
+                                port,
+                            },
+                            tethys_core::types::Direction::Egress,
+                        );
                     }
                     if let Err(e) = st.nft.apply(&b).await {
                         tracing::error!(gid, %e, "revoke delete failed");
@@ -478,6 +487,7 @@ mod tests {
     fn elem(comment: Option<&str>) -> LiveElement {
         LiveElement {
             set: "grants_v4".into(),
+            dir: tethys_core::types::Direction::Egress,
             dst: "10.0.0.1".into(),
             proto: Proto::Tcp,
             port_from: 443,

@@ -1180,6 +1180,7 @@ name = "tethys-core"
 version = "2026.9.1"
 dependencies = [
  "ipnet",
+ "libc",
  "serde",
  "serde_json",
  "thiserror",

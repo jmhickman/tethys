@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use tethys_core::nft::{Batch, Dir, ElemDst, GrantElem, CHAIN_ACCT_IN, CHAIN_ACCT_OUT};
 use tethys_core::protocol::EffectiveGrant;
-use tethys_core::types::{PortSpec, Proto, Target};
+use tethys_core::types::{Direction, PortSpec, Proto, Target};
 
 use crate::ledger::{GrantRow, GrantState};
 use crate::server::State;
@@ -39,6 +39,9 @@ pub(crate) async fn install_grant(
             },
             ttl,
             gid,
+            // Until ingress grants reach the request pipeline (step 3),
+            // every install is egress.
+            Direction::Egress,
         );
     }
     if !st.cfg.dry_run {
@@ -72,37 +75,18 @@ pub(crate) async fn uninstall_grant(
     }
     let mut b = Batch::with_table(&st.cfg.nft_table);
     for d in dsts {
-        b.delete_grant(&GrantElem {
-            dst: d.clone(),
-            proto,
-            port,
-        });
+        b.delete_grant(
+            &GrantElem {
+                dst: d.clone(),
+                proto,
+                port,
+            },
+            Direction::Egress,
+        );
     }
     if let Err(e) = st.nft.apply(&b).await {
         tracing::error!(%e, "uninstall_grant rollback failed (TTL will reap)");
     }
-}
-
-/// Scope egress to `agent_user`. Unresolved uid => empty list => host-wide.
-pub(crate) async fn install_scope(st: &Arc<State>) -> anyhow::Result<()> {
-    let mut b = Batch::with_table(&st.cfg.nft_table);
-    match st.cfg.agent_uid {
-        Some(uid) => {
-            b.rebuild_scope(&[uid]);
-            tracing::info!(uid, user = %st.cfg.agent_user, "egress enforcement scoped to agent uid");
-        }
-        None => {
-            b.rebuild_scope(&[]);
-            tracing::warn!(
-                user = %st.cfg.agent_user,
-                "agent_user unresolved — enforcing host-wide (all uids policed)"
-            );
-        }
-    }
-    st.nft
-        .apply(&b)
-        .await
-        .map_err(|e| anyhow::anyhow!("scope install failed: {e}"))
 }
 
 /// Flush carve sets, resolve hostnames, install the operator allow list.
@@ -138,11 +122,16 @@ pub(crate) async fn install_carves(st: &Arc<State>) -> anyhow::Result<()> {
                 tracing::warn!(target = %target.canonical(), "allow: duplicate tuple skipped");
                 continue;
             }
-            b.add_carve(&GrantElem {
-                dst: d.clone(),
-                proto: *proto,
-                port: *port,
-            });
+            // Egress `allow` today; the ingress allow list (allow_in)
+            // arrives with step 3's runtime rewiring.
+            b.add_carve(
+                &GrantElem {
+                    dst: d.clone(),
+                    proto: *proto,
+                    port: *port,
+                },
+                Direction::Egress,
+            );
             n += 1;
         }
         tracing::info!(target = %target.canonical(), %proto, ports = %format!("{}-{}", port.from, port.to), addrs = dsts.len(), "allow entry installed");
