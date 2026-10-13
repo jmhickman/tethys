@@ -963,6 +963,21 @@ impl NftCli {
         Ok(parse_set_ports(&doc, table, set))
     }
 
+    /// The cached netns fd when this backend targets a namespace (None for
+    /// the host stack). Revalidates the inode first so a deleted/recreated
+    /// netns fails closed. Callers doing in-process syscalls (e.g. a
+    /// thread-local `setns` for sock_diag) use this instead of reaching
+    /// into ExecTarget.
+    pub fn netns_fd(&self) -> Result<Option<RawFd>, NftError> {
+        match &self.target {
+            ExecTarget::Host => Ok(None),
+            ExecTarget::Netns(ns) => {
+                ns.revalidate()?;
+                Ok(Some(ns.fd()))
+            }
+        }
+    }
+
     /// The one spawn helper: every `nft` subprocess starts here. Namespaced
     /// targets revalidate the cached netns inode first (fail closed), then
     /// setns in the child via [`setns_pre_exec`]; host batches run plain.

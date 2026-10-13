@@ -1,6 +1,7 @@
 mod admin;
 mod config;
 mod install;
+mod kill;
 mod ledger;
 mod provision;
 mod reconcile;

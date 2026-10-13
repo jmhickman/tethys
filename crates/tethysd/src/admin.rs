@@ -141,10 +141,10 @@ async fn admin_cmd(req: &RpcRequest, st: &Arc<State>) -> Result<RpcResponse, Rpc
         }
         method::REVOKE => {
             let admin::GrantId { grant_id } = params_as(req)?;
-            revoke(st, grant_id).await;
+            let killed = revoke(st, grant_id).await;
             Ok(RpcResponse::ok(
                 &req.id,
-                serde_json::json!({"revoked": grant_id.to_string()}),
+                serde_json::json!({"revoked": grant_id.to_string(), "killed": killed}),
             ))
         }
         method::LIST_GRANTS => {
@@ -203,6 +203,7 @@ async fn admin_cmd(req: &RpcRequest, st: &Arc<State>) -> Result<RpcResponse, Rpc
             &req.id,
             SubscribeAck {
                 enforcement: st.enforcement.read().await.clone(),
+                sock_destroy: st.sock_destroy.load(std::sync::atomic::Ordering::Relaxed),
                 events: [
                     method::EV_REQUEST_NEW,
                     method::EV_DECIDED,
@@ -328,12 +329,30 @@ async fn stop_grants(req: &RpcRequest, st: &Arc<State>) -> RpcResponse {
     for g in &rows {
         sweep_grant_objs(st, g.id).await;
     }
+    // Elements are gone; now cut the flows those grants carried. Killing
+    // after teardown is the reconnect-safety contract (see revoke()).
+    let mut killed = 0usize;
+    for g in &rows {
+        if let Ok(dsts) = row_elems(g).await {
+            killed += crate::kill::kill_flows(
+                st,
+                g.dir,
+                g.proto,
+                &dsts,
+                PortSpec {
+                    from: g.port_from,
+                    to: g.port_to,
+                },
+            )
+            .await;
+        }
+    }
     // Rows are revoked now: the projection converges to allow_in only.
     if let Err(e) = crate::install::project_delegated(st).await {
         tracing::error!(%e, "delegation projection after stop.grants failed");
     }
     emit(st, method::EV_STOPPED, EvStopped { grants_removed: n });
-    RpcResponse::ok(&req.id, serde_json::json!({"revoked": n}))
+    RpcResponse::ok(&req.id, serde_json::json!({"revoked": n, "killed": killed}))
 }
 
 /// True iff a fresh kernel poll shows no live grant element still
@@ -446,7 +465,11 @@ async fn reload_allow(req: &RpcRequest, st: &Arc<State>) -> Result<RpcResponse, 
     Ok(RpcResponse::ok(&req.id, serde_json::json!({"reloaded": n})))
 }
 
-async fn revoke(st: &Arc<State>, gid: i64) {
+/// Tear one grant down: elements (and delegation) first, then its live
+/// flows — the ordering is what stops a killed process reconnecting through
+/// a still-live rule. Returns the number of TCP sockets destroyed.
+async fn revoke(st: &Arc<State>, gid: i64) -> usize {
+    let mut killed = 0usize;
     if let Some(tx) = st.pending.lock().await.remove(&gid) {
         tx.send(HumanDecision::Deny {
             note: Some("revoked".into()),
@@ -470,10 +493,10 @@ async fn revoke(st: &Arc<State>, gid: i64) {
                         crate::install::delegated_remove(st, &dsts, port).await;
                     }
                     let mut b = Batch::with_table(&st.cfg.nft_table);
-                    for d in dsts {
+                    for d in &dsts {
                         b.delete_grant(
                             &GrantElem {
-                                dst: d,
+                                dst: d.clone(),
                                 proto,
                                 port,
                             },
@@ -483,6 +506,7 @@ async fn revoke(st: &Arc<State>, gid: i64) {
                     if let Err(e) = st.nft.apply(&b).await {
                         tracing::error!(gid, %e, "revoke delete failed");
                     }
+                    killed = crate::kill::kill_flows(st, dir, proto, &dsts, port).await;
                 }
                 Err(e) => tracing::error!(gid, %e, "revoke resolve failed"),
             }
@@ -515,6 +539,7 @@ async fn revoke(st: &Arc<State>, gid: i64) {
             grant_id: gid.to_string(),
         },
     );
+    killed
 }
 
 #[cfg(test)]

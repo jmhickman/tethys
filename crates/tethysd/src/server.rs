@@ -65,6 +65,10 @@ pub struct State {
     /// Enforcement truth: the netns boundary and the probe verdict. All
     /// installs (both directions) are refused while inactive.
     pub enforcement: RwLock<EnforcementInfo>,
+    /// CONFIG_INET_DIAG_DESTROY capability (boot probe, [`crate::kill`]).
+    /// False degrades revoke/expiry/stop.grants to element-deletion-only;
+    /// the condition was logged loudly once at boot.
+    pub sock_destroy: std::sync::atomic::AtomicBool,
     /// pending requests awaiting a human: id -> decision channel
     pub pending: Mutex<HashMap<i64, oneshot::Sender<HumanDecision>>>,
     /// fire-and-forget events for all admin clients
@@ -141,6 +145,7 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
             boundary,
             active: false,
         }),
+        sock_destroy: std::sync::atomic::AtomicBool::new(false),
         ledger,
         nft,
         host_nft: NftCli::default(),
@@ -178,6 +183,10 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
         if let Err(e) = crate::install::project_delegated(&st).await {
             tracing::error!(%e, "delegated-port projection failed at boot");
         }
+        // One-time capability probe for step 4's flow teardown.
+        let ok = crate::kill::probe(&st).await;
+        st.sock_destroy
+            .store(ok, std::sync::atomic::Ordering::Relaxed);
     } else {
         tracing::warn!("--dry-run: nft objects not installed (dev mode)");
     }
@@ -269,21 +278,24 @@ fn spawn_expiry_reconciler(st: Arc<State>) {
             if !expired.is_empty() {
                 // The kernel reaper took the ns elements with their TTL; the
                 // host delegation must not outlive them, so it goes first.
-                for g in approved
-                    .iter()
-                    .filter(|g| expired.contains(&g.id) && g.dir.is_ingress())
-                {
+                // Then the flows themselves: a granted session must not
+                // outlive its element (step 4). Element removal precedes the
+                // kill by construction, so reconnects land on the drop.
+                let mut killed = 0usize;
+                for g in approved.iter().filter(|g| expired.contains(&g.id)) {
+                    let port = tethys_core::types::PortSpec {
+                        from: g.port_from,
+                        to: g.port_to,
+                    };
                     if let Ok(dsts) = crate::install::row_elems(g).await {
-                        crate::install::delegated_remove(
-                            &st,
-                            &dsts,
-                            tethys_core::types::PortSpec {
-                                from: g.port_from,
-                                to: g.port_to,
-                            },
-                        )
-                        .await;
+                        if g.dir.is_ingress() {
+                            crate::install::delegated_remove(&st, &dsts, port).await;
+                        }
+                        killed += crate::kill::kill_flows(&st, g.dir, g.proto, &dsts, port).await;
                     }
+                }
+                if killed > 0 {
+                    tracing::info!(killed, "expiry pass destroyed live flows of expired grants");
                 }
                 for id in &expired {
                     st.ledger.decide(*id, Decide::ExpireByKernel).await;

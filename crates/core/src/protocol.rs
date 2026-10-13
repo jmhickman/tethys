@@ -350,6 +350,11 @@ pub struct SubscribeAck {
     pub version: String,
     /// Daemon's enforcement-boundary view at subscribe time.
     pub enforcement: EnforcementInfo,
+    /// Whether the kernel supports SOCK_DESTROY (boot probe). False means
+    /// revoke/expiry/stop.grants delete elements only and established TCP
+    /// flows outlive their grants — the approver must see this degraded
+    /// mode, not infer it from silence.
+    pub sock_destroy: bool,
 }
 
 #[cfg(test)]
@@ -403,13 +408,16 @@ mod tests {
             "{line}"
         );
 
-        // enforcement is REQUIRED on the subscribe ack.
+        // enforcement and sock_destroy are REQUIRED on the subscribe ack:
+        // the approver must never have to infer degraded modes from silence.
         let ack: SubscribeAck = serde_json::from_value(serde_json::json!({
             "events": [], "approver_timeout_secs": 300, "version": "x",
-            "enforcement": {"boundary": "netns:/run/netns/agent", "active": true}
+            "enforcement": {"boundary": "netns:/run/netns/agent", "active": true},
+            "sock_destroy": true
         }))
         .unwrap();
         assert!(ack.enforcement.active);
+        assert!(ack.sock_destroy);
         let bare = serde_json::json!({
             "events": [], "approver_timeout_secs": 300, "version": "x"
         });
