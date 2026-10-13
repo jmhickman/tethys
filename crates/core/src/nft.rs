@@ -693,6 +693,13 @@ impl Batch {
         self.cmds.is_empty()
     }
 
+    /// Escape hatch for objects outside this builder's vocabulary (the
+    /// host-stack forward/masquerade/DNAT projection built by provisioning).
+    /// One raw JSON command, still applied through the same executor.
+    pub fn push_cmd(&mut self, cmd: Value) {
+        self.cmds.push(cmd);
+    }
+
     pub fn to_json(&self) -> String {
         json!({"nftables": &self.cmds}).to_string()
     }

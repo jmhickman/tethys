@@ -37,6 +37,63 @@ fn default_admin_user() -> String {
     "root".into()
 }
 
+/// `[netns]` — the enforcement namespace provisioning operates on. Parsed
+/// leniently here (the daemon proper only requires it from step 3's runtime
+/// rewiring); `provision::Spec::from_config` does the strict, mode-aware
+/// validation and derives addresses.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NetnsFile {
+    /// Namespace name; live at `<dir>/<name>` (systemd drop-in points
+    /// `NetworkNamespacePath=` at this file).
+    pub name: String,
+    /// Directory holding the nsfs file. Production default `/run/netns`;
+    /// overridable so root-gated tests never touch the real one.
+    #[serde(default)]
+    pub dir: Option<PathBuf>,
+    /// "routed" (default; host is the namespace's router) or "bridge"
+    /// (veth stapled into an operator bridge, real LAN address).
+    #[serde(default = "default_netns_mode")]
+    pub mode: String,
+    /// Host-side veth end. Default `vh-<name>` truncated to IFNAMSIZ.
+    #[serde(default)]
+    pub host_veth: Option<String>,
+    /// Namespace-side veth end (default "veth0").
+    #[serde(default)]
+    pub ns_veth: Option<String>,
+    /// routed: IPv4 point-to-network carrying both veth ends; host takes
+    /// the first address, the namespace the second. Required in routed mode.
+    #[serde(default)]
+    pub prefix4: Option<String>,
+    /// routed: optional site-routed IPv6 /64 (or shorter) for a real GUA
+    /// pair. Absent => fixed ULA pair; enforcement guarantees are identical,
+    /// only the address remotes see differs.
+    #[serde(default)]
+    pub prefix6: Option<String>,
+    /// routed: fixed source address for IPv6 masquerade when the container
+    /// has several GUAs and egress must pin to one. Default: plain
+    /// masquerade (outgoing interface address).
+    #[serde(default)]
+    pub masq_src6: Option<String>,
+    /// bridge: operator-managed bridge the host veth end is stapled into.
+    /// Required in bridge mode.
+    #[serde(default)]
+    pub bridge: Option<String>,
+    /// bridge: namespace addresses as CIDRs (v4 and/or v6), operator-
+    /// assigned LAN addresses. Required (non-empty) in bridge mode.
+    #[serde(default)]
+    pub addrs: Vec<String>,
+    /// bridge: optional default-route gateways (the LAN's).
+    #[serde(default)]
+    pub gw4: Option<String>,
+    #[serde(default)]
+    pub gw6: Option<String>,
+}
+
+fn default_netns_mode() -> String {
+    "routed".into()
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FileConfig {
@@ -64,6 +121,9 @@ pub struct FileConfig {
     /// dry-run: never touch nftables (state machine + sockets only)
     #[serde(default)]
     pub dry_run: bool,
+    /// Enforcement namespace ([netns]); required by `tethysd provision`.
+    #[serde(default)]
+    pub netns: Option<NetnsFile>,
 }
 
 impl Default for FileConfig {
@@ -79,6 +139,7 @@ impl Default for FileConfig {
             admin_user: default_admin_user(),
             allow: Vec::new(),
             dry_run: false,
+            netns: None,
         }
     }
 }

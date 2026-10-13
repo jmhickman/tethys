@@ -2,19 +2,29 @@ mod admin;
 mod config;
 mod install;
 mod ledger;
+mod provision;
 mod reconcile;
 mod server;
 
 use std::path::PathBuf;
 
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use config::FileConfig;
+
+#[derive(Subcommand, Debug)]
+enum Command {
+    /// Create/repair the agent network namespace, its base policy, and the
+    /// host-side veth/DNAT/MASQUERADE projection, then exit. Wired as
+    /// `ExecStartPre=`: failure means no netns path, systemd refuses to
+    /// instantiate the user manager, and agent login fails closed.
+    Provision,
+}
 
 #[derive(Parser, Debug)]
 #[command(name = "tethysd", version, about = "pentest scope enforcement daemon")]
 pub struct Cli {
     /// TOML config file (see config.example.toml)
-    #[arg(long, default_value = "/etc/tethys/config.toml")]
+    #[arg(long, default_value = "/etc/tethys/config.toml", global = true)]
     pub config: PathBuf,
     #[arg(long)]
     pub mcp_socket: Option<PathBuf>,
@@ -23,7 +33,7 @@ pub struct Cli {
     #[arg(long)]
     pub db: Option<PathBuf>,
     /// nftables table to own (default: tethys)
-    #[arg(long)]
+    #[arg(long, global = true)]
     pub nft_table: Option<String>,
     #[arg(long)]
     pub max_ttl: Option<String>,
@@ -45,6 +55,8 @@ pub struct Cli {
     /// dev/test: run without installing nft objects (state machine only)
     #[arg(long)]
     pub dry_run: bool,
+    #[command(subcommand)]
+    command: Option<Command>,
 }
 
 /// File + CLI overrides, with resolved uids.
@@ -117,6 +129,14 @@ async fn main() -> anyhow::Result<()> {
             FileConfig::default()
         }
     };
+
+    // `tethysd provision` (ExecStartPre): netns + base policy + host
+    // projection, then exit. Runs BEFORE uid resolution and allow-list
+    // parsing — provisioning cares only about [netns] and the table name.
+    if matches!(cli.command, Some(Command::Provision)) {
+        let spec = provision::Spec::from_config(&file, cli.nft_table.as_deref())?;
+        return provision::run_spec(&spec).await;
+    }
 
     let mut cfg = Config {
         config_path: cli.config.clone(),

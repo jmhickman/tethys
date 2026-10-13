@@ -5,6 +5,18 @@ After=tethys-baseline.service
 
 [Service]
 Type=simple
+# Provision the agent netns, its base policy table, and the host-side
+# veth/DNAT/MASQUERADE projection before the daemon starts (replaces what
+# tethys-baseline used to do statically; baseline is retired in packaging).
+# Failure here means no /run/netns/<name>, systemd refuses the user manager
+# instance, and agent login fails closed — root sessions are unaffected.
+# The `+` prefix runs it OUTSIDE this unit's sandbox: provisioning
+# bind-mounts /run/netns/<name>, which must land in the host mount
+# namespace to survive and to be resolvable by systemd's
+# NetworkNamespacePath= (this unit's own PrivateTmp/ProtectSystem namespaces
+# would otherwise hide it). The daemon still sees the path because its
+# mount namespace is created afterwards.
+ExecStartPre=+/usr/local/bin/tethysd --config /etc/tethys/config.toml provision
 ExecStart=/usr/local/bin/tethysd --config /etc/tethys/config.toml
 Restart=on-failure
 RestartSec=2s
@@ -12,10 +24,11 @@ RestartSec=2s
 # the default; any account with CAP_NET_ADMIN (see below) may be substituted,
 # and the deployment tooling should make this configurable.
 User=root
-# Hardening: needs CAP_NET_ADMIN for `nft`, CAP_CHOWN to group-own mcp.sock;
-# nothing else beyond sockets + db.
-AmbientCapabilities=CAP_NET_ADMIN CAP_CHOWN
-CapabilityBoundingSet=CAP_NET_ADMIN CAP_CHOWN CAP_SETUID CAP_SETGID
+# Hardening: CAP_NET_ADMIN for `nft`/`ip link`, CAP_SYS_ADMIN to setns into
+# the enforcement namespace (every batch, provision included), CAP_CHOWN to
+# group-own mcp.sock; nothing else beyond sockets + db.
+AmbientCapabilities=CAP_NET_ADMIN CAP_SYS_ADMIN CAP_CHOWN
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_SYS_ADMIN CAP_CHOWN CAP_SETUID CAP_SETGID
 ProtectSystem=strict
 ProtectHome=yes
 # systemd-managed dirs: created (and writable) before ExecStart; plain
