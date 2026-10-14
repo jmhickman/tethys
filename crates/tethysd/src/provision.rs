@@ -549,14 +549,17 @@ pub fn host_batch(spec: &Spec) -> Batch {
         // client connected to, and the client socket would discard them.
         // A pinned masq_src6 turns the v6 rule into a deterministic snat.
         let prefix = |addr: String, len: u8| json!({"prefix":{"addr":addr,"len":len}});
-        // libnftables-json(5) CT object: key + family + dir. The `family`
-        // member is not decoration — in an inet table a family-less ct
-        // saddr fails EVALUATION ("cannot determine ip protocol version",
-        // live-verified), which parsing alone does not catch. `dir` (not
-        // "direction": unknown members are silently ignored) pins the
-        // original direction explicitly.
+        // Family-qualified ct keys, per upstream's own inet JSON tests
+        // (tests/py/inet/ct.t.json): "ip saddr"/"ip6 saddr" are distinct
+        // templates with FIXED datatypes. The generic "saddr" resolves its
+        // family by proto inference and fails evaluation in inet tables
+        // ("cannot determine ip protocol version", live-verified twice);
+        // the man page's `family` member does not exist in the 1.1.6 JSON
+        // parser (json_parse_ct_expr reads key + dir only — unknown
+        // members are silently ignored). `dir` pins the original
+        // direction explicitly.
         let ct_origin_saddr =
-            |fam: &str| json!({"ct":{"key":"saddr","family":fam,"dir":"original"}});
+            |fam: &str| json!({"ct":{"key":format!("{fam} saddr"),"dir":"original"}});
         b.push_cmd(rule(
             HOST_CHAIN_MASQ,
             vec![
@@ -937,7 +940,7 @@ mod tests {
                 .map(|e| {
                     e.iter().any(|m| {
                         m["match"]["left"]["ct"]["dir"].as_str() == Some("original")
-                            && m["match"]["left"]["ct"]["family"].as_str() == Some("ip6")
+                            && m["match"]["left"]["ct"]["key"].as_str() == Some("ip6 saddr")
                             && m["match"]["right"]["prefix"]["addr"].as_str()
                                 == Some("2001:db8:7::")
                     })
@@ -1183,7 +1186,8 @@ mod tests {
                     .map(|e| {
                         e.iter().any(|m| {
                             m["match"]["left"]["ct"]["dir"].as_str() == Some("original")
-                                && m["match"]["left"]["ct"]["key"].as_str() == Some("saddr")
+                                && m["match"]["left"]["ct"]["key"].as_str()
+                                    == Some(if af == "ip6" { "ip6 saddr" } else { "ip saddr" })
                                 && m["match"]["right"]["prefix"]["addr"].as_str()
                                     == Some(net.as_str())
                         })
