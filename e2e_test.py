@@ -285,7 +285,9 @@ prefix6 = "{PREFIX6}"
         state["links"].append(VC_H)
         json.dump(state, open(f"{DIR}/state.json", "w"))
         need(["ip", "link", "add", VC_H, "type", "veth", "peer", "name", VC_C])
-        need(["ip", "link", "set", VC_C, "netns", str(client_proc.pid)])
+        # iproute2 accepts an nsfs file path (anything containing '/'),
+        # and make_netns's fork has already exited — the mount is the ns.
+        need(["ip", "link", "set", VC_C, "netns", str(CLIENT_NSFILE)])
         need(["ip", "addr", "add", f"{HOSTVC4}/30", "dev", VC_H])
         need(["ip", "-6", "addr", "add", f"{HOSTVC6}/64", "dev", VC_H])
         need(["ip", "link", "set", VC_H, "up"])
