@@ -439,8 +439,11 @@ impl Batch {
             CHAIN_EGRESS,
             vec![
                 json!({"match":{"op":"==","left":{"meta":{"key":"l4proto"}},"right":"udp"}}),
+                // `in` needs an explicit anonymous set on the RHS: a plain
+                // array only resolves for bitmask datatypes, and
+                // inet_service is not one (live-verified semantic error).
                 json!({"match":{"op":"in","left":{"payload":{"protocol":"th","field":"dport"}},
-                                 "right":[67, 68, 546, 547]}}),
+                                 "right":{"set":[67, 68, 546, 547]}}}),
                 json!({"accept":null}),
             ],
         );
@@ -504,7 +507,7 @@ impl Batch {
             chain,
             vec![
                 json!({"match":{"op":"in","left":{"ct":{"key":"state"}},
-                                 "right":["established","related"]}}),
+                                 "right":{"set":["established","related"]}}}),
                 json!({"accept":null}),
             ],
         );

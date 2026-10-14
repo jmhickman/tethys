@@ -527,7 +527,7 @@ pub fn host_batch(spec: &Spec) -> Batch {
                         "fib":{"flags":"daddr","result":"type"}},"right":"local"}}),
                     json!({"match":{"op":"!=","left":{"meta":{"key":"iifname"}},"right":hv}}),
                     json!({"match":{"op":"in","left":{"meta":{"key":"l4proto"}},
-                                     "right":["tcp","udp"]}}),
+                                     "right":{"set":["tcp","udp"]}}}),
                     json!({"match":{"op":"in","left":{
                         "payload":{"protocol":"th","field":"dport"}},
                         "right":format!("@{set}")}}),
@@ -1353,47 +1353,64 @@ mod tests {
         let mut ns_batch = Batch::with_table(&table);
         ns_batch.ensure_base();
         let check = |name: &str, body: String| {
-            let mut child = Command::new("nft")
-                .args(["--json", "-f", "-"])
-                .stdin(std::process::Stdio::piped())
-                .stderr(std::process::Stdio::piped())
-                .spawn()
-                .unwrap();
-            child
-                .stdin
-                .take()
-                .unwrap()
-                .write_all(body.as_bytes())
-                .unwrap();
-            let out = child.wait_with_output().unwrap();
-            let err = String::from_utf8_lossy(&out.stderr).to_string();
-            if out.status.success() {
-                // root: the batch really applied — clean up, parse was fine
-                let _ = Command::new("nft")
-                    .args(["delete", "table", "inet", &table])
-                    .output();
-                return;
+            // Validation ladder, strongest first:
+            //  1. `unshare -n nft` (root): a throwaway netns with full
+            //     privileges — the batch is APPLIED there, so semantic
+            //     errors ("Basetype ... is not bitmask") surface too, and
+            //     the netns dies with the process: zero cleanup.
+            //  2. `unshare -Umrn nft` (unprivileged boxes that allow
+            //     userns): same strength via a user namespace.
+            //  3. plain `nft`: parse-only — parsing precedes netlink init,
+            //     so grammar errors still surface; semantics do not.
+            // A wrapper that cannot even run (seccomp, containers) or
+            // leaves only permission errors falls through to the next rung.
+            let wrappers: [&[&str]; 3] = [&["unshare", "-n"], &["unshare", "-Umrn"], &[]];
+            let mut parse_only_ok = false;
+            for wrapper in wrappers {
+                let mut cmd = match wrapper.first() {
+                    Some(prog) => {
+                        let mut c = Command::new(prog);
+                        c.args(&wrapper[1..]).arg("nft");
+                        c
+                    }
+                    None => Command::new("nft"),
+                };
+                cmd.args(["--json", "-f", "-"]);
+                let mut child = match cmd
+                    .stdin(std::process::Stdio::piped())
+                    .stderr(std::process::Stdio::piped())
+                    .spawn()
+                {
+                    Ok(c) => c,
+                    Err(_) => continue, // wrapper binary absent
+                };
+                let mut stdin = child.stdin.take().unwrap();
+                let _ = stdin.write_all(body.as_bytes());
+                drop(stdin);
+                let out = child.wait_with_output().unwrap();
+                let err = String::from_utf8_lossy(&out.stderr).to_string();
+                if out.status.success() {
+                    return; // fully validated (applied in a throwaway netns)
+                }
+                if err.contains("unshare:") {
+                    continue; // wrapper itself failed; next rung
+                }
+                let unexplained: Vec<&str> = err
+                    .lines()
+                    .map(str::trim)
+                    .filter(|l| l.contains("Error:") || l.contains("syntax error"))
+                    .filter(|l| !l.starts_with("netlink: Error: cache initialization failed"))
+                    .filter(|l| {
+                        !l.contains("Operation not permitted") && !l.contains("Permission denied")
+                    })
+                    .collect();
+                assert!(
+                    unexplained.is_empty(),
+                    "{name} batch rejected by nft ({wrapper:?}): {unexplained:?}\nfull: {err}"
+                );
+                parse_only_ok = true; // permission-limited pass; try stronger
             }
-            // Unprivileged: the only acceptable failure is netlink itself
-            // refusing (parsing happens BEFORE the netlink cache init).
-            // nft prints parse errors AND the cache-init line together, so
-            // a substring "was it permitted?" test accepts everything —
-            // every Error line must be the permission one; anything else
-            // (internal:..., "Object item not found", syntax errors) is a
-            // parser rejection.
-            let unexplained: Vec<&str> = err
-                .lines()
-                .map(str::trim)
-                .filter(|l| l.contains("Error:") || l.contains("syntax error"))
-                .filter(|l| !l.starts_with("netlink: Error: cache initialization failed"))
-                .filter(|l| {
-                    !l.contains("Operation not permitted") && !l.contains("Permission denied")
-                })
-                .collect();
-            assert!(
-                unexplained.is_empty(),
-                "{name} batch rejected by the nft parser: {unexplained:?}\nfull: {err}"
-            );
+            assert!(parse_only_ok, "{name}: no nft validation rung ran");
         };
         check("host_batch", host_batch(&spec).to_json());
         check("ensure_base", ns_batch.to_json());
