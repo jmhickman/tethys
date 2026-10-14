@@ -26,36 +26,36 @@ use crate::types::{Direction, PortSpec, Proto};
 
 pub const TABLE: &str = "tethys";
 /// Egress grant sets: key is `ip daddr . meta l4proto . th dport`.
-pub const SET_V4: &str = "grants_v4";
-pub const SET_V6: &str = "grants_v6";
+pub(crate) const SET_V4: &str = "grants_v4";
+pub(crate) const SET_V6: &str = "grants_v6";
 /// Ingress counterpart sets. Same element grammar with the address slot
 /// flipped to `saddr`: an ingress grant matches source . proto . LOCAL port
 /// (th dport on inbound packets is the local listener's port). The element
 /// JSON is identical for both families; only the set typing differs.
-pub const SET_IGRANT_V4: &str = "igrants_v4";
-pub const SET_IGRANT_V6: &str = "igrants_v6";
+pub(crate) const SET_IGRANT_V4: &str = "igrants_v4";
+pub(crate) const SET_IGRANT_V6: &str = "igrants_v6";
 /// Operator allow-list tuples (`allow`/`allow_in` in config). Flush+reinstall
 /// from config; live in the carve sets so stop.grants does not touch them.
-pub const SET_CARVE_V4: &str = "carve_v4";
-pub const SET_CARVE_V6: &str = "carve_v6";
+pub(crate) const SET_CARVE_V4: &str = "carve_v4";
+pub(crate) const SET_CARVE_V6: &str = "carve_v6";
 /// Ingress operator allow list (`allow_in`): saddr-keyed like the igrants.
-pub const SET_CARVE_IN_V4: &str = "carve_in_v4";
-pub const SET_CARVE_IN_V6: &str = "carve_in_v6";
+pub(crate) const SET_CARVE_IN_V4: &str = "carve_in_v4";
+pub(crate) const SET_CARVE_IN_V6: &str = "carve_in_v6";
 /// Base chains with policy drop, built here (the static baseline.nft is
 /// retired — the Rust builder is the single source of enforcement truth).
 /// Inside the netns everything belongs to the policed account by
 /// construction, so these carry no uid expressions: pure header filtering.
-pub const CHAIN_EGRESS: &str = "egress";
-pub const CHAIN_INGRESS: &str = "ingress";
+pub(crate) const CHAIN_EGRESS: &str = "egress";
+pub(crate) const CHAIN_INGRESS: &str = "ingress";
 /// Accounting chains (contents owned here). Rules carry counters and no
 /// verdict, so they cannot bypass enforcement.
 pub const CHAIN_ACCT_OUT: &str = "acct_out";
 pub const CHAIN_ACCT_IN: &str = "acct_in";
 /// Drop counters (rate-limited log + drop at the end of each base chain).
-pub const COUNTER_DROPS: &str = "tethys_drops";
-pub const COUNTER_DROPS_IN: &str = "tethys_drops_in";
-pub const LOG_PREFIX_EGRESS: &str = "TETHYS-DROP: ";
-pub const LOG_PREFIX_INGRESS: &str = "TETHYS-DROP-IN: ";
+pub(crate) const COUNTER_DROPS: &str = "tethys_drops";
+pub(crate) const COUNTER_DROPS_IN: &str = "tethys_drops_in";
+pub(crate) const LOG_PREFIX_EGRESS: &str = "TETHYS-DROP: ";
+pub(crate) const LOG_PREFIX_INGRESS: &str = "TETHYS-DROP-IN: ";
 /// Long default so per-element `expires` is the only thing that reaps grants.
 const SET_DEFAULT_TIMEOUT_SECS: u64 = 24 * 3600;
 /// Drop-log rate cap (packets/sec) shared by both base chains, mirroring
@@ -149,7 +149,7 @@ impl Netns {
     /// Fail-closed check that the cached fd still refers to the namespace at
     /// `path`: the path must exist and its inode must match. Called by every
     /// namespaced batch before the spawn.
-    pub fn revalidate(&self) -> Result<(), NftError> {
+    pub(crate) fn revalidate(&self) -> Result<(), NftError> {
         let found = std::fs::metadata(&self.path).map_err(|_| NftError::NetnsGone {
             path: self.path.display().to_string(),
         })?;
@@ -244,7 +244,7 @@ pub enum Dir {
 }
 
 impl Dir {
-    pub fn slug(self) -> &'static str {
+    pub(crate) fn slug(self) -> &'static str {
         match self {
             Dir::Out => "out",
             Dir::In => "in",
@@ -259,7 +259,7 @@ impl Dir {
 }
 
 impl GrantElem {
-    pub fn set_name(&self, dir: Direction) -> &'static str {
+    pub(crate) fn set_name(&self, dir: Direction) -> &'static str {
         match (&self.dst, dir) {
             (ElemDst::Ip(IpAddr::V4(_)) | ElemDst::Net(IpNet::V4(_)), Direction::Egress) => SET_V4,
             (ElemDst::Ip(IpAddr::V6(_)) | ElemDst::Net(IpNet::V6(_)), Direction::Egress) => SET_V6,
@@ -274,7 +274,7 @@ impl GrantElem {
 
     /// Carve-set counterpart (operator allow list): same key grammar, but the
     /// carve sets carry no timeout flag, so elements persist until reinstalled.
-    pub fn carve_set_name(&self, dir: Direction) -> &'static str {
+    pub(crate) fn carve_set_name(&self, dir: Direction) -> &'static str {
         match (&self.dst, dir) {
             (ElemDst::Ip(IpAddr::V4(_)) | ElemDst::Net(IpNet::V4(_)), Direction::Egress) => {
                 SET_CARVE_V4
@@ -792,10 +792,10 @@ pub struct EnforcementStatus {
 }
 
 impl EnforcementStatus {
-    pub fn egress_active(&self) -> bool {
+    pub(crate) fn egress_active(&self) -> bool {
         self.grants_v4 && self.grants_v6
     }
-    pub fn ingress_active(&self) -> bool {
+    pub(crate) fn ingress_active(&self) -> bool {
         self.igrants_v4 && self.igrants_v6
     }
     /// Both directions fully wired; the daemon's "enforcement boundary
@@ -819,7 +819,7 @@ fn set_family_of(name: &str) -> Option<fn(&mut EnforcementStatus) -> &mut bool> 
 /// that look up each grant set (`"right": "@grants_v4"` style matches).
 /// Pure JSON — no netlink, unit-testable. Element-only presence does NOT
 /// count: only rule references mean the traffic path consults the set.
-pub fn parse_enforcement(doc: &Value, tname: &str) -> EnforcementStatus {
+pub(crate) fn parse_enforcement(doc: &Value, tname: &str) -> EnforcementStatus {
     let mut st = EnforcementStatus::default();
     let Some(arr) = doc.get("nftables").and_then(|v| v.as_array()) else {
         return st;
@@ -858,7 +858,7 @@ pub fn parse_enforcement(doc: &Value, tname: &str) -> EnforcementStatus {
 /// arrays are intervals. Well-known-service annotations (`service` keys)
 /// ride along with numeric `val`s, so only numbers are read; anything else
 /// (strings, odd shapes) is skipped — this parser must never be fatal.
-pub fn parse_set_ports(doc: &Value, tname: &str, sname: &str) -> Vec<(u16, u16)> {
+pub(crate) fn parse_set_ports(doc: &Value, tname: &str, sname: &str) -> Vec<(u16, u16)> {
     let mut out = Vec::new();
     let Some(arr) = doc.get("nftables").and_then(|v| v.as_array()) else {
         return out;

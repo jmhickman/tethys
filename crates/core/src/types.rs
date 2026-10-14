@@ -37,7 +37,7 @@ pub enum Proto {
 
 impl Proto {
     /// String spelling accepted (and emitted) by the nft JSON API.
-    pub fn nft_key(self) -> &'static str {
+    pub(crate) fn nft_key(self) -> &'static str {
         match self {
             Proto::Tcp => "tcp",
             Proto::Udp => "udp",
