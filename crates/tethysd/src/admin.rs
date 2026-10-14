@@ -348,7 +348,12 @@ async fn stop_grants(req: &RpcRequest, st: &Arc<State>) -> RpcResponse {
         }
     }
     // Rows are revoked now: the projection converges to allow_in only.
-    if let Err(e) = crate::install::project_delegated(st).await {
+    // A failed projection must NOT ride out as a clean stop — the kill
+    // switch's whole contract is that nothing survives it, and a stale
+    // DNAT port keeps host listeners hijacked. The event still fires
+    // (it describes the stop that DID happen); the RPC says the truth.
+    let projection_err = crate::install::project_delegated(st).await.err();
+    if let Some(e) = &projection_err {
         tracing::error!(%e, "delegation projection after stop.grants failed");
     }
     emit(
@@ -359,7 +364,18 @@ async fn stop_grants(req: &RpcRequest, st: &Arc<State>) -> RpcResponse {
             killed,
         },
     );
-    RpcResponse::ok(&req.id, serde_json::json!({"revoked": n, "killed": killed}))
+    match projection_err {
+        Some(e) => RpcResponse::err(
+            &req.id,
+            -32001,
+            format!(
+                "grants stopped (revoked={n}, killed={killed}) but delegation projection \
+                 failed: {e}; host ports may still be delegated — retry stop.grants or \
+                 restart to re-project"
+            ),
+        ),
+        None => RpcResponse::ok(&req.id, serde_json::json!({"revoked": n, "killed": killed})),
+    }
 }
 
 /// True iff a fresh kernel poll shows no live grant element still
