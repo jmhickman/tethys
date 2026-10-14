@@ -182,6 +182,10 @@ impl SockInfo {
             }
         }
     }
+    /// Local endpoint — used by the live tests to identify each side of
+    /// a loopback pair; production filtering only ever needs the remote
+    /// side (see `peer`).
+    #[cfg(test)]
     fn src_ip(&self) -> IpAddr {
         self.ip_of(self.src)
     }
@@ -190,12 +194,17 @@ impl SockInfo {
     }
     /// The socket's peer from the namespace's point of view: egress
     /// sockets peer at dst, ingress sockets peer at src (the client).
-    fn peer(&self, dir: Direction) -> IpAddr {
-        if dir.is_ingress() {
-            self.src_ip()
-        } else {
-            self.dst_ip()
-        }
+    /// The remote endpoint of the socket. inet_diag is PER-SOCKET, not
+    /// packet-oriented: net/ipv4/inet_diag.c fills idiag_src from
+    /// sk_rcv_saddr and idiag_dst from sk_daddr — src is LOCAL, dst is
+    /// REMOTE on every socket, in both directions. The peer is therefore
+    /// dst_ip() for either grant direction; what direction selects is the
+    /// PORT (granted_port below), not the address side. (An earlier
+    /// "ingress peer = src" reading — packet-sense — compared ingress
+    /// grants against the socket's local address and silently killed
+    /// nothing; live e2e caught what loopback tests could not.)
+    fn peer(&self, _dir: Direction) -> IpAddr {
+        self.dst_ip()
     }
     /// The granted port from the namespace's point of view: egress is
     /// constrained by peer port (dport), ingress by LOCAL port (sport).
@@ -446,9 +455,11 @@ async fn sock_pass<T: Send + 'static>(
 
 // ----------------------------------------------------------------- filtering
 
-/// Does this dumped socket belong to the grant tuple? Peer sense follows
-/// the direction (see SockInfo); the port is range-checked against the
-/// nft-normalized spec; uid is checked when resolvable.
+/// Does this dumped socket belong to the grant tuple? Peer is the remote
+/// endpoint for both directions (see SockInfo::peer); the DIRECTION picks
+/// which port is the granted one (local sport for ingress, remote dport
+/// for egress), range-checked against the nft-normalized spec; uid is
+/// checked when resolvable.
 fn sock_matches(
     s: &SockInfo,
     dir: Direction,
@@ -641,20 +652,23 @@ mod tests {
         }
     }
 
-    /// An ingress socket: 203.0.113.7 -> ns [2001:db8::42]:22. The client
-    /// is v4-mapped (::ffff:203.0.113.7) exactly as a dual-stack listener
-    /// reports it.
+    /// The accepted socket an ingress grant must kill, exactly as the
+    /// kernel reports it: LOCAL side [2001:db8::42]:22 (idiag_src/
+    /// idiag_sport = sk_rcv_saddr/inet_sport), REMOTE side the v4 client
+    /// ::ffff:203.0.113.7:33333 on a dual-stack listener (idiag_dst).
+    /// The earlier fixture put the client in `src` — packet-sense — and
+    /// thereby asserted the inverted peer rule.
     fn ingress_sock() -> SockInfo {
         let mut src = [0u8; 16];
-        src[10] = 0xff;
-        src[11] = 0xff;
-        src[12..16].copy_from_slice(&[203, 0, 113, 7]);
+        src[0] = 0x20;
+        src[1] = 0x01;
+        src[2] = 0x0d;
+        src[3] = 0xb8;
+        src[15] = 0x42;
         let mut dst = [0u8; 16];
-        dst[0] = 0x20;
-        dst[1] = 0x01;
-        dst[2] = 0x0d;
-        dst[3] = 0xb8;
-        dst[15] = 0x42;
+        dst[10] = 0xff;
+        dst[11] = 0xff;
+        dst[12..16].copy_from_slice(&[203, 0, 113, 7]);
         SockInfo {
             family: AF_INET6,
             sport: 22,
@@ -689,7 +703,7 @@ mod tests {
     }
 
     #[test]
-    fn ingress_matches_client_src_and_local_sport() {
+    fn ingress_matches_client_dst_and_local_sport() {
         let s = ingress_sock();
         let client = ElemDst::Ip("203.0.113.7".parse().unwrap());
         assert!(sock_matches(
@@ -721,22 +735,32 @@ mod tests {
             &port(22, 22),
             None
         ));
-        // Egress sense: peer is the LOCAL v6 address, in 2001:db8::/32.
+        // Per-socket sense: the peer is the REMOTE side for BOTH
+        // directions; direction picks the port. Egress on this socket
+        // means "agent dialed 203.0.113.7:33333" — dport side.
+        let wrong = ElemDst::Net("203.0.113.0/24".parse().unwrap());
         assert!(sock_matches(
+            &s,
+            Direction::Egress,
+            &[wrong],
+            &port(33333, 33333),
+            None
+        ));
+        // The LOCAL net is never an egress peer, and never an ingress
+        // one either: an ingress grant keyed on the local address must
+        // not match (this assertion kills the src-as-peer inversion).
+        assert!(!sock_matches(
             &s,
             Direction::Egress,
             &[net6()],
             &port(33333, 33333),
             None
         ));
-        // Egress sense against the CLIENT's net must not match: that net
-        // is the ingress peer only.
-        let wrong = ElemDst::Net("203.0.113.0/24".parse().unwrap());
         assert!(!sock_matches(
             &s,
-            Direction::Egress,
-            &[wrong],
-            &port(33333, 33333),
+            Direction::Ingress,
+            &[net6()],
+            &port(22, 22),
             None
         ));
     }
@@ -990,8 +1014,10 @@ mod tests {
             Some(me)
         ));
         // ...and an ingress grant on PORT from 127.0.0.1 kills the server
-        // socket. (On loopback both sides share the peer address; the
-        // port sense is what separates them.)
+        // socket. (On loopback both sides share the peer ADDRESS, so this
+        // live pair only exercises the port sense — the address sense is
+        // pinned by the ingress_sock fixture; don't read a stronger
+        // guarantee into this assertion than loopback can give.)
         assert!(sock_matches(
             srv,
             Direction::Ingress,
