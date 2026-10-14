@@ -673,17 +673,36 @@ prefix6 = "{PREFIX6}"
             fails.append(f"S10 non-delegated port: {kn} (want host to answer, ns to never see it)")
         if d3c != d2c:
             fails.append(f"S10 non-delegated SYN reached the namespace: {d2c} -> {d3c}")
-        print("S10 ingress-drop:", "ok" if "S10" not in str(fails) else fails[-1])
-        if any("S10" in f for f in fails):
-            print("--- S10 diagnostics ---")
-            print("host delegated_v4:", run(["nft", "-a", "list", "set", "inet", TABLE, "delegated_v4"]).stdout.strip()[:300])
-            print("host dnat rules:", run(["nft", "-a", "list", "chain", "inet", TABLE, "delegated"]).stdout.strip()[:600])
-            print("host fwd policy:", run(["iptables", "-S", "FORWARD"]).stdout.strip()[:300])
-            print("host route to ns:", run(["ip", "route", "get", NS4]).stdout.strip()[:200])
-            print("veth state:", run(["ip", "-br", "addr", "show", "dev", HOSTVETH]).stdout.strip()[:200])
-            print("client route to gw:", in_ns(["ip", "route", "get", GW4], nsfile=CLIENT_NSFILE).stdout.strip()[:200])
-            print("ns ingress chain:", ns_text(["nft", "list", "chain", "inet", TABLE, "ingress"])[:600])
-            print("ns conntrack (vh):", in_ns(["conntrack", "-L", "-p", "tcp"]).stderr.strip()[:120] or "n/a")
+        s10 = [f for f in fails if "S10" in f]
+        print("S10 ingress-drop:", "ok" if not s10 else "")
+        for f in s10:
+            print("  FAIL:", f)
+        if s10:
+            # The box may lack iptables-legacy/sysctl/conntrack binaries —
+            # every probe must survive a missing tool, not crash the run.
+            def dump(label, argv=None, proc=None, ns=None):
+                try:
+                    if proc is not None:
+                        out = open(proc).read().strip()
+                    else:
+                        out = (in_ns(argv, nsfile=ns) if ns else run(argv)).stdout
+                    print(f"  {label}: {out.strip()[:400]}")
+                except Exception as e:
+                    print(f"  {label}: <{type(e).__name__}: {e}>")
+            print("--- S10 diagnostics (kinds:"
+                  f" v4={k4} v6={k6} nodes={kn}) ---")
+            dump("host delegated_v4", ["nft", "-a", "list", "set", "inet", TABLE, "delegated_v4"])
+            dump("host dnat rules", ["nft", "-a", "list", "chain", "inet", TABLE, "delegated"])
+            dump("host fwd-hook chains", ["nft", "list", "chains"])
+            dump("host route to ns", ["ip", "route", "get", NS4])
+            dump("host gw link", ["ip", "-br", "addr", "show", "dev", HOSTVETH])
+            dump("client gw link", ["ip", "-br", "addr", "show"], ns=CLIENT_NSFILE)
+            dump("client route to gw", ["ip", "route", "get", GW4], ns=CLIENT_NSFILE)
+            dump("ns links+addrs", ["ip", "-br", "addr"], ns=NSPATH)
+            dump("ns ingress chain", ["nft", "list", "chain", "inet", TABLE, "ingress"], ns=NSPATH)
+            dump("ip_forward", proc="/proc/sys/net/ipv4/ip_forward")
+            dump("rp_filter all", proc="/proc/sys/net/ipv4/conf/all/rp_filter")
+            dump("rp_filter vc_h", proc=f"/proc/sys/net/ipv4/conf/{VC_H}/rp_filter")
 
         # S11: grant -> completes with TRUE source (DNAT preserved it) both
         # families; revoke kills the live flow; reconnect is gated again.
