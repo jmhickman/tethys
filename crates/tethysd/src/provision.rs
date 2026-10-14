@@ -1303,9 +1303,37 @@ mod tests {
         std::fs::remove_file(&p).unwrap();
     }
 
+    /// A /29 inside 10/8 that this host does not already route. Fixed test
+    /// prefixes collide with real deployments; random candidates are cheap
+    /// and the route table is the authority. Falls back to a fixed one
+    /// after 8 tries (astronomically unlucky hosts).
+    fn free_prefix4() -> String {
+        let base = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.subsec_nanos())
+            .unwrap_or(0)
+            ^ (std::process::id() << 16);
+        for i in 0..8u32 {
+            let mix = base.wrapping_add(i.wrapping_mul(0x9e37_79b9));
+            let cand = format!("10.{}.{}.0/29", mix & 0xff, (mix >> 8) & 0xff);
+            let out = ip(["route", "show", cand.as_str()])
+                .output()
+                .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+                .unwrap_or_default();
+            if out.is_empty() {
+                return cand;
+            }
+        }
+        "10.231.77.0/29".to_string()
+    }
+
     // Root-gated smoke: real unshare/mount/ip/nft round trip, skipped when
-    // unprivileged (this box cannot even open a userns). Scratch dir +
-    // private names; cleans up best-effort regardless of outcome.
+    // unprivileged. Private names per run; cleans up best-effort regardless
+    // of outcome. Nothing here may assume a specific host: the nsfs dir
+    // prefers /run (tmpfs wherever systemd runs — the class production
+    // uses) and falls back to $TMPDIR; the prefix4 is randomized inside
+    // 10/8 and rejected if the host already routes it, so a box with an
+    // incidental 10.x.y.0/29 cannot spuriously fail this test.
     #[test]
     fn provision_routed_smoke_root_only() {
         if nix::unistd::geteuid().as_raw() != 0 {
@@ -1313,11 +1341,16 @@ mod tests {
             return;
         }
         let tag = std::process::id();
-        let dir = std::env::temp_dir().join(format!("tethys-prov-{tag}"));
+        let dir = if std::path::Path::new("/run").is_dir() {
+            std::path::PathBuf::from(format!("/run/tethys-prov-{tag}"))
+        } else {
+            std::env::temp_dir().join(format!("tethys-prov-{tag}"))
+        };
         let table = format!("tph{tag}"); // <16 chars, nft-friendly
         let hv = format!("vh-s{tag}");
+        let prefix4 = free_prefix4();
         let toml_body = format!(
-            "nft_table='{table}'\n[netns]\nname='smoke{tag}'\ndir='{d}'\nprefix4='10.231.77.0/29'\nhost_veth='{hv}'",
+            "nft_table='{table}'\n[netns]\nname='smoke{tag}'\ndir='{d}'\nprefix4='{prefix4}'\nhost_veth='{hv}'",
             d = dir.display(),
         );
         let file: FileConfig = toml::from_str(&toml_body).unwrap();
@@ -1369,8 +1402,9 @@ mod tests {
         let tag = std::process::id();
         let table = format!("pchk{tag}"); // <16 chars, nft-friendly
         let toml_body = format!(
-            "nft_table='{t}'\n[netns]\nname='pc{tag}'\ndir='/tmp'\nprefix4='10.231.77.0/29'",
-            t = table
+            "nft_table='{t}'\n[netns]\nname='pc{tag}'\ndir='/tmp'\nprefix4='{p}'",
+            t = table,
+            p = free_prefix4()
         );
         let file: FileConfig = toml::from_str(&toml_body).unwrap();
         let spec = Spec::from_config(&file, None).unwrap();

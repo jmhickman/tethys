@@ -38,10 +38,41 @@ egress freely. The sandbox contains the agentic harness, not the machine.
 
 ## REQUIREMENTS
 
-Tethys requires Linux with `nftables`; the ruleset grammar was verified against
-nft 1.1.6 and the kernel shipped with recent Proxmox hosts. Building from
-source needs a Rust toolchain at version 1.87 or newer. Installation of the
+Tethys is Linux-only: it drives netfilter (nftables), network namespaces, and
+the inet-diag socket interface. Building from source needs a Rust toolchain at
+version 1.87 or newer (workspace `rust-version`). Installation of the
 binaries, the configuration file, and the SystemD units requires root.
+
+Runtime kernel and tools:
+
+- `CONFIG_NETFILTER` with nftables, veth pairs, and network namespaces —
+  every distribution kernel.
+- Flow kill (destroying established TCP flows when a grant is revoked or
+  expires) needs kernel >= 4.7 with `CONFIG_INET_DIAG_DESTROY`. The daemon
+  probes the capability at boot and degrades honestly when it is absent:
+  revokes stop new traffic immediately but established flows drain on their
+  own, and the TUI status line shows `flow-kill off`.
+- `nft` (nftables userspace) and `ip` (iproute2) must be on `PATH`. The
+  ruleset grammar uses family-qualified `ct` keys and DNAT (`ct ip saddr`,
+  `dnat ip to`), verified against nft 1.1.6 and the kernel shipped with
+  recent Proxmox hosts. On any other host the authoritative check is
+  `cargo test -p tethysd batches_parse_under_local_nft`: it applies the
+  exact production batches through the host's own nft in a throwaway
+  namespace.
+
+Test-suite requirements — the unit suite runs unprivileged on any Linux
+build host and skips capability-gated tests cleanly:
+
+- `cargo test --workspace` needs no root. The nft parse gate skips when
+  `nft` is absent and fails when the host's nft cannot parse the
+  production grammar (a real deployment blocker, not a test artifact).
+  The provisioning smoke test and the socket-destroy live test require
+  root and skip with a `SKIP` note otherwise.
+- `e2e_test.py` requires root (or a fully privileged user+net
+  namespace), `nft`, `ip`, python3 (stdlib only), a writable `/run` for
+  nsfs bind-mounts, and veth creation. On kernels without
+  `SOCK_DESTROY` the flow-kill assertions skip with a warning; every
+  other scenario still runs.
 
 A deployment needs one unprivileged account to police (the harness user) and
 one privileged account to approve (typically root). No network access is

@@ -29,7 +29,8 @@ Scenarios (all must pass):
   S3  human deny propagates note to the model side
   S4  no admin connected -> immediate denied/approver_offline
   S5  revoke deletes the live kernel element (inside the namespace)
-  S6  stop.grants kills live+pending grants, table survives, killed field
+  S6  stop.grants kills live+pending grants (a REAL held flow must die and
+      the killed count must reflect it), table survives, killed field
   S7  idempotent replay: no re-popup, original verdict; grant_expired after
   S8  list.history: decided-only, newest-first, state filter, limit
   S9  TUI contract: subscribe ack shape, created_at, list.pending, deny event
@@ -45,6 +46,9 @@ Scenarios (all must pass):
   S12 no operator lockout: a host-stack listener is reachable while the
       daemon runs and after it is stopped; the namespace table stays loaded
       and keeps dropping without any daemon (kernel persistence)
+  S13 expiry sweep (separate path from revoke): a 1s-TTL ingress grant's
+      live flow dies, its delegation is dropped with the element (a stale
+      DNAT port would stay open to the whole world), grant.expired lands
 """
 import json, os, re, signal, socket, subprocess, sys, threading, time
 
@@ -78,6 +82,7 @@ HOSTVC6, CLIENT6 = CL_PREFIX6.replace("::/64", "::1"), CL_PREFIX6.replace("::/64
 P_IN = 45300 + R % 700        # delegated ingress test port
 P_NO = P_IN + 1               # never delegated
 P_HOST = P_IN + 2             # host-stack listener (lockout probe)
+P_S6 = P_IN + 3               # egress flow held live across stop.grants
 
 CLONE_NEWNET = 0x40000000
 import ctypes
@@ -272,7 +277,7 @@ prefix4 = "{PREFIX4}"
 prefix6 = "{PREFIX6}"
 """)
 
-    daemon = listener = hostl = None
+    daemon = listener = hostl = hostl6 = None
     fails, skips = [], []
     try:
         # ---- S0a: provisioning (and it must be idempotent) -----------------
@@ -524,6 +529,28 @@ prefix6 = "{PREFIX6}"
                 admin_rpc("approve", {"grant_id": str(g)})
                 if wait_decided(g):
                     approved_gids.append(g)
+        # A REAL live flow rides one of the doomed grants: stop.grants must
+        # destroy it, not just count ledger rows. Egress sense: a process in
+        # the agent namespace holds a session to a host-stack listener.
+        b6h = len(popup_gids())
+        request("r6-live", {"dst_ip": HOSTVC4, "dst_port": {"from": P_S6, "to": P_S6},
+                            "proto": "tcp", "reason": "live flow", "tool": "t",
+                            "ttl_requested": "300s"})
+        gh = new_gid(b6h)
+        if gh:
+            admin_rpc("approve", {"grant_id": str(gh)})
+            if wait_decided(gh):
+                approved_gids.append(gh)
+        LOG6 = f"{DIR}/s6listener.log"
+        hostl6 = subprocess.Popen(["python3", f"{DIR}/listener.py", str(P_S6), LOG6],
+                                  stderr=open(f"{DIR}/s6listener.err", "w"))
+        time.sleep(0.4)
+        held6 = in_ns_popen(["python3", f"{DIR}/probe.py", HOSTVC4, str(P_S6),
+                             "3.0", "6.0", "s6held"], stdout=subprocess.PIPE)
+        time.sleep(1.0)
+        if (open(LOG6).read().count('"accept"') if os.path.exists(LOG6) else 0) < 1:
+            fails.append("S6 held flow never reached the host listener (nothing to kill)")
+
         b6p = len(popup_gids())
         a_pend = request("r6-pending", {"dst_ip": "192.0.2.12", "dst_port": {"from": 80, "to": 80},
                                         "proto": "tcp", "reason": "left pending", "tool": "t", "ttl_requested": "300s"})
@@ -538,10 +565,25 @@ prefix6 = "{PREFIX6}"
         if ("192.0.2.10" in out or "192.0.2.11" in out) or not table_exists or "error" in r:
             fails.append(f"S6 stop.grants: leftover={out[:80]} table={table_exists} resp={r}")
         stopped = [e["params"] for e in events if e.get("method") == "grants.stopped"]
-        if not stopped or stopped[-1].get("grants_removed") != 2:
-            fails.append(f"S6 grants.stopped broadcast missing/wrong: {stopped}")
-        if "killed" not in (stopped[-1] if stopped else {}):
+        if not stopped or stopped[-1].get("grants_removed") != len(approved_gids):
+            fails.append(f"S6 grants.stopped broadcast missing/wrong: {stopped} want removed={len(approved_gids)}")
+        killed6 = (stopped[-1] if stopped else {}).get("killed")
+        if killed6 is None:
             fails.append(f"S6 grants.stopped missing required killed field: {stopped}")
+        elif sock_destroy and not (isinstance(killed6, int) and killed6 >= 1):
+            fails.append(f"S6 stop reported killed={killed6} while a flow was held: want >= 1")
+        if sock_destroy:
+            try:
+                held6.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                held6.kill()
+                fails.append("S6 held flow outlived stop.grants+kill window")
+            if held6.returncode not in (5,):
+                o6 = (held6.stdout.read().decode() if held6.stdout else "").strip()
+                fails.append(f"S6 stop did not kill live flow: rc={held6.returncode} out={o6!r}")
+        else:
+            held6.kill()
+            skips.append("S6 kill check skipped: kernel reports no SOCK_DESTROY")
         if len(approved_gids) != 2:
             fails.append(f"S6 only {len(approved_gids)} grants confirmed approved before stop")
         if d_pend.get("reason_code") != "human_denied" or "stopped" not in (d_pend.get("note") or ""):
@@ -792,6 +834,58 @@ prefix6 = "{PREFIX6}"
             fails.append(f"S11 reconnect after revoke: {kr} (want timeout — gated again)")
         print("S11 ingress-grant-kill:", "ok" if "S11" not in str(fails) else fails[-1])
 
+        # S13: EXPIRY kills live flows too. The 2s sweep is a separate path
+        # from revoke and carries one promise revoke does not: the host
+        # delegation must not outlive the element it fronts (a stale DNAT
+        # port stays open to the whole world). 1s TTL lets the kernel reap
+        # the element; the sweep must then destroy the flow, drop the
+        # delegation, and emit grant.expired — in that order of effects.
+        base13 = len(popup_gids())
+        a13 = request("r13", {"dst_ip": CLIENT4, "dst_port": {"from": P_IN, "to": P_IN},
+                              "proto": "tcp", "dir": "ingress",
+                              "reason": "expiry kill", "tool": "t", "ttl_requested": "300s"})
+        g13 = new_gid(base13)
+        admin_rpc("approve", {"grant_id": str(g13), "ttl_secs": 1})
+        if not wait_decided(g13):
+            fails.append("S13 short-ttl grant never approved")
+        n_acc13 = open(LOG).read().count('"accept"') if os.path.exists(LOG) else 0
+        held13 = in_ns_popen(["python3", f"{DIR}/probe.py", GW4, str(P_IN), "4.0", "8.0", "s13hold"],
+                             stdout=subprocess.PIPE, nsfile=CLIENT_NSFILE)
+        time.sleep(1.0)
+        if (open(LOG).read().count('"accept"') if os.path.exists(LOG) else 0) <= n_acc13:
+            fails.append("S13 held flow never reached the listener (nothing to kill)")
+        t0, expired = time.time(), False
+        while time.time() - t0 < 12 and not expired:
+            expired = any(e.get("method") == "grant.expired"
+                          and e["params"].get("grant_id") == str(g13) for e in events)
+            if not expired:
+                time.sleep(0.2)
+        if not expired:
+            fails.append("S13 grant.expired never emitted (expiry sweep dead?)")
+        if sock_destroy:
+            try:
+                held13.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                held13.kill()
+                fails.append("S13 held flow outlived expiry+kill window")
+            if held13.returncode not in (5,):
+                o13 = (held13.stdout.read().decode() if held13.stdout else "").strip()
+                fails.append(f"S13 expiry did not kill live flow: rc={held13.returncode} out={o13!r}")
+        else:
+            held13.kill()
+            skips.append("S13 kill check skipped: kernel reports no SOCK_DESTROY")
+        igx = ns_text(["nft", "list", "set", "inet", TABLE, "igrants_v4"])
+        if CLIENT4 in igx:
+            fails.append("S13 expired element still in igrants_v4")
+        dgx = run(["nft", "-a", "list", "set", "inet", TABLE, "delegated_v4"]).stdout
+        if str(P_IN) in dgx:
+            fails.append(f"S13 delegation outlived the expired grant: {dgx.strip()[:200]}")
+        delegate(P_IN, 4)  # re-open so the probe reaches the ns policy again
+        kx, _ = probe(GW4, P_IN)
+        if kx != "timeout":
+            fails.append(f"S13 reconnect after expiry: {kx} (want timeout — gated again)")
+        print("S13 expiry-kill:", "ok" if "S13" not in str(fails) else fails[-1])
+
         # S12: host-stack listener reachable while the daemon runs AND after
         # it dies; the namespace keeps enforcing with no daemon at all.
         kh, _ = probe(HOSTVC4, P_HOST, to=2.0)
@@ -813,7 +907,7 @@ prefix6 = "{PREFIX6}"
             fails.append(f"S12 enforcement without daemon: {kd}, drops {d0}->{d1c}")
         print("S12 no-lockout+persistence:", "ok" if "S12" not in str(fails) else fails[-1])
     finally:
-        for p in [daemon, listener, hostl]:
+        for p in [daemon, listener, hostl, hostl6]:
             if p is None:
                 continue
             try:
