@@ -193,6 +193,12 @@ except socket.timeout:
     print("timeout"); sys.exit(2)      # SYN went nowhere: dropped
 except ConnectionRefusedError:
     print("refused"); sys.exit(3)      # RST: host answered, ns never saw it
+except OSError as e:
+    # Any other ICMP/errno answer is still "the host answered and the ns
+    # never saw it"; classifying it beats an rc1 traceback that hides the
+    # real errno (seen live).
+    print({113: "unreach", 101: "unreach-net", 1: "permdenied",
+           13: "permdenied"}.get(e.errno, f"err:{e.errno}")); sys.exit(3)
 print("ok", flush=True)
 if payload:
     s.sendall(payload.encode()); s.settimeout(to)
@@ -371,7 +377,7 @@ prefix6 = "{PREFIX6}"
                 argv.append(payload)
             p = in_ns(argv, timeout=to + hold + 15, nsfile=CLIENT_NSFILE)
             out = (p.stdout or "").strip().splitlines()
-            kind = out[0].split()[0] if out else f"rc{p.returncode}"
+            kind = out[0].split()[0] if out else f"rc{p.returncode}:{(p.stderr or '').strip()[-160:]}"
             return kind, p
 
         # ---- S0b: the ack must tell the truth about the boundary -----------
@@ -473,14 +479,18 @@ prefix6 = "{PREFIX6}"
 
         # S6: stop.grants — several grants + one pending all terminate; the
         # table survives; EvStopped carries the required killed field.
-        ev_base = len([e for e in events if e.get("method") == "grant.request.new"])
+        def popup_gids():
+            return [e["params"]["grant_id"] for e in events
+                    if e.get("method") == "grant.request.new"]
 
-        def new_gid():
+        def new_gid(base):
+            # `base` MUST be captured before the request is sent: a shared
+            # counter went stale once S7/S9 made popups outside this helper,
+            # and the next caller approved a dead gid (live-run failure).
             t0 = time.time()
             while time.time() - t0 < 5:
-                gg = [e["params"]["grant_id"] for e in events if e.get("method") == "grant.request.new"]
-                if len(gg) > S6_STATE["n"]:
-                    S6_STATE["n"] = len(gg)
+                gg = popup_gids()
+                if len(gg) > base:
                     return gg[-1]
                 time.sleep(0.1)
             return None
@@ -496,19 +506,20 @@ prefix6 = "{PREFIX6}"
                 time.sleep(0.1)
             return False
 
-        S6_STATE = {"n": ev_base}
         approved_gids = []
         for ip in ["192.0.2.10", "192.0.2.11"]:
+            b6 = len(popup_gids())
             a = request("r6-" + ip, {"dst_ip": ip, "dst_port": {"from": 80, "to": 80}, "proto": "tcp",
                                      "reason": "batch", "tool": "t", "ttl_requested": "300s"})
-            g = new_gid()
+            g = new_gid(b6)
             if g:
                 admin_rpc("approve", {"grant_id": str(g)})
                 if wait_decided(g):
                     approved_gids.append(g)
+        b6p = len(popup_gids())
         a_pend = request("r6-pending", {"dst_ip": "192.0.2.12", "dst_port": {"from": 80, "to": 80},
                                         "proto": "tcp", "reason": "left pending", "tool": "t", "ttl_requested": "300s"})
-        g = new_gid()
+        g = new_gid(b6p)
         r = admin_rpc("stop.grants")
         try:
             d_pend = json.loads(a_pend.recv(65536).decode())["result"]
@@ -530,10 +541,10 @@ prefix6 = "{PREFIX6}"
         print("S6 stop.grants:", "ok" if "S6" not in str(fails) else fails[-1])
 
         # S7: idempotency re-delivery
-        base7 = len([e for e in events if e.get("method") == "grant.request.new"])
+        base7 = len(popup_gids())
         a7 = request("r7", {"dst_ip": "192.0.2.33", "dst_port": {"from": 443, "to": 443}, "proto": "tcp",
                             "reason": "idempotency", "tool": "t", "ttl_requested": "300s"})
-        g7 = new_gid()
+        g7 = new_gid(base7)
         admin_rpc("approve", {"grant_id": str(g7)})
         a7.settimeout(5)
         d7 = json.loads(a7.recv(65536).decode())["result"]
@@ -656,8 +667,8 @@ prefix6 = "{PREFIX6}"
             fails.append(f"S10 v6 tethys_drops_in did not climb: {d1c} -> {d2c}")
         kn, _ = probe(GW4, P_NO)
         d3c = drops()
-        if kn != "refused":
-            fails.append(f"S10 non-delegated port: {kn} (want refused at host)")
+        if kn not in ("refused", "unreach", "unreach-net", "permdenied"):
+            fails.append(f"S10 non-delegated port: {kn} (want host to answer, ns to never see it)")
         if d3c != d2c:
             fails.append(f"S10 non-delegated SYN reached the namespace: {d2c} -> {d3c}")
         print("S10 ingress-drop:", "ok" if "S10" not in str(fails) else fails[-1])
@@ -665,10 +676,11 @@ prefix6 = "{PREFIX6}"
         # S11: grant -> completes with TRUE source (DNAT preserved it) both
         # families; revoke kills the live flow; reconnect is gated again.
         def approve_ingress(src, port):
+            base = len(popup_gids())
             a = request(f"r11-{src}", {"dst_ip": src, "dst_port": {"from": port, "to": port},
                                        "proto": "tcp", "dir": "ingress",
                                        "reason": "s11", "tool": "t", "ttl_requested": "300s"})
-            gg = new_gid()
+            gg = new_gid(base)
             admin_rpc("approve", {"grant_id": str(gg)})
             a.settimeout(5)
             d = json.loads(a.recv(65536).decode())["result"]
