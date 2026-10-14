@@ -75,9 +75,11 @@ dry_run = false             # true: sockets and ledger only; nftables untouched
 # pre-DNAT guard rule in the kernel — even a hand-added delegated_*
 # element cannot capture them. Grammar: comma-separated ports or ranges.
 # Boot-only: change = edit + restart (provision reapplies via ExecStartPre).
-# Strongly recommended: every port a host daemon listens on.
+# DEFAULT: ["22"] — sshd's classic port is reserved out of the box; set
+# reserved_ports = [] to opt out, and list every OTHER port a host daemon
+# listens on (the guard only covers ports you name).
 reserved_ports = [
-#     "22",                               # sshd — the classic self-lockout
+    "22",                                 # sshd — the classic self-lockout (default)
 #     "8080-8090",                        # local dev/API servers
 ]
 

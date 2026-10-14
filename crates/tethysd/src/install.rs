@@ -390,6 +390,11 @@ async fn delegated_add(st: &Arc<State>, dsts: &[ElemDst], port: PortSpec) -> Res
         return Ok(());
     }
     let want = port.nft_range();
+    // A wildcard is not delegable at ANY layer, even from a legacy row:
+    // 0-65535 on the host address is the whole host stack, not a grant.
+    if port.is_all() {
+        return Err("wildcard port is not delegable on ingress".into());
+    }
     // Operator-reserved ports are off-limits to delegation even if an
     // older request path or a pre-reservation ledger row asks for them
     // (dispatch_access and project_delegated normally refuse earlier).
@@ -460,6 +465,12 @@ pub(crate) async fn project_delegated(st: &Arc<State>) -> anyhow::Result<()> {
     }
     let mut desired: std::collections::BTreeMap<&'static str, Vec<PortRange>> = Default::default();
     let mut want = |dsts: &[ElemDst], port: PortSpec| {
+        // A legacy approved '*' row must not resurrect the full-space
+        // delegation just because the row outlives the ban: projection
+        // mirrors what MAY be delegated, not every live row blindly.
+        if port.is_all() {
+            return;
+        }
         let r = port.nft_range();
         // Reserved ports never delegate, even from an approved row that
         // predates the operator reserving them: reserved wins and the

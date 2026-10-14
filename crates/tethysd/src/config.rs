@@ -36,6 +36,13 @@ fn default_agent_user() -> String {
 fn default_admin_user() -> String {
     "root".into()
 }
+/// sshd's classic port is reserved out of the box: an ingress grant for
+/// 22 moving the host's own sshd is the one hijack an operator is most
+/// likely to sign by accident, and the refusal is visible (port_reserved)
+/// and reversible (drop it from the list). Everyone else overrides.
+fn default_reserved_ports() -> Vec<String> {
+    vec!["22".into()]
+}
 
 /// `[netns]` — the enforcement namespace provisioning operates on. Parsed
 /// leniently here (shape only); `provision::Spec::from_netns` does the
@@ -130,8 +137,9 @@ pub struct FileConfig {
     /// stale or hand-added delegation cannot capture these ports: the host
     /// stack keeps answering them (sshd etc.). Grammar: comma-separated
     /// ports or ranges ("22", "8080-8090", "53,67-68"). Boot-only: change
-    /// requires a daemon restart + reprovision, no reload RPC.
-    #[serde(default)]
+    /// requires a daemon restart + reprovision, no reload RPC. Default:
+    /// ["22"] — set `reserved_ports = []` to opt out entirely.
+    #[serde(default = "default_reserved_ports")]
     pub reserved_ports: Vec<String>,
     /// dry-run: never touch nftables (state machine + sockets only)
     #[serde(default)]
@@ -154,7 +162,7 @@ impl Default for FileConfig {
             admin_user: default_admin_user(),
             allow: Vec::new(),
             allow_in: Vec::new(),
-            reserved_ports: Vec::new(),
+            reserved_ports: default_reserved_ports(),
             dry_run: false,
             netns: None,
         }
@@ -355,6 +363,8 @@ mod tests {
         assert_eq!(f.db, PathBuf::from("/tmp/x.db"));
         assert_eq!(f.agent_user, "hermes-agent");
         assert_eq!(f.approver_timeout_secs, 300);
+        // sshd's port is reserved out of the box (the classic hijack).
+        assert_eq!(f.reserved_ports, vec!["22".to_string()]);
         assert!(!f.dry_run);
     }
 
