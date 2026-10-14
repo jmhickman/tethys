@@ -49,6 +49,7 @@ use crate::server::State;
 /// uapi linux/netlink.h
 const NETLINK_SOCK_DIAG: i32 = 4;
 const NLM_F_REQUEST: u16 = 0x01;
+const NLM_F_ACK: u16 = 0x04; // uapi netlink.h: "Reply with ack, with zero or error code"
 const NLM_F_DUMP: u16 = 0x300;
 const NLMSG_NOOP: u16 = 0x1;
 const NLMSG_ERROR: u16 = 0x2;
@@ -321,6 +322,26 @@ fn open_diag(ns_fd: Option<RawFd>) -> io::Result<RawFd> {
             libc::close(fd);
             return Err(e);
         }
+        // No recv on this fd may ever block unboundedly: a protocol
+        // break (e.g. a reply shape we misread) must surface as a
+        // bounded EAGAIN through kill_flows' error path, not hang the
+        // admin RPC behind this thread.
+        let tv = libc::timeval {
+            tv_sec: 5,
+            tv_usec: 0,
+        };
+        if libc::setsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_RCVTIMEO,
+            &tv as *const _ as *const libc::c_void,
+            mem::size_of::<libc::timeval>() as libc::socklen_t,
+        ) != 0
+        {
+            let e = io::Error::last_os_error();
+            libc::close(fd);
+            return Err(e);
+        }
         Ok(fd)
     }
 }
@@ -392,43 +413,72 @@ fn dump_family(fd: RawFd, family: u8, seq: u32, out: &mut Vec<SockInfo>) -> io::
     }
 }
 
-/// Destroy one socket; returns how many sockets the kernel reported
-/// destroying (1 normally, 0 if it exited mid-race). SOCK_DESTROY is a
-/// DUMP operation: the kernel emits one entry per destroyed socket and
-/// ends with NLMSG_DONE. EOPNOTSUPP here would mean the request shape is
-/// wrong (sock_diag answers that for a missing NLM_F_DUMP flag or an
-/// unregistered msg type), never "kernel config off" at this point — the
-/// probe already cleared that.
+/// Read the terminal NLMSG_ERROR reply of an NLM_F_ACK'd unicast request:
+/// 0 on success, negative errno otherwise. Skips NOOP and foreign-seq
+/// messages (a private, unbound diag socket should see neither, but a
+/// mismatch must never be mistaken for our ACK).
+fn recv_ack(fd: RawFd, seq: u32) -> io::Result<i32> {
+    let mut buf = [0u8; 2048];
+    let n = unsafe { libc::recv(fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len(), 0) };
+    if n < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let buf = &buf[..n as usize];
+    let mut off = 0usize;
+    while off + NLMSG_HDRLEN <= buf.len() {
+        let hdr = unsafe {
+            // SAFETY: bounds checked by the loop condition; repr(C, align 4)
+            // header over an aligned netlink buffer.
+            &*(buf.as_ptr().add(off) as *const NlMsgHdr)
+        };
+        let len = hdr.nlmsg_len as usize;
+        if len < NLMSG_HDRLEN || off + len > buf.len() {
+            break;
+        }
+        match hdr.nlmsg_type {
+            NLMSG_NOOP => {}
+            NLMSG_ERROR if hdr.nlmsg_seq == seq => {
+                let payload = &buf[off + NLMSG_HDRLEN..off + len];
+                if payload.len() < 4 {
+                    return Err(io::Error::from_raw_os_error(libc::EPROTO));
+                }
+                return Ok(i32::from_ne_bytes([
+                    payload[0], payload[1], payload[2], payload[3],
+                ]));
+            }
+            _ => {}
+        }
+        off += (len + 3) & !3;
+    }
+    Err(io::Error::from_raw_os_error(libc::EPROTO))
+}
+
+/// Destroy one socket; returns how many were destroyed (1 normally, 0 if
+/// the tuple raced to nothing). Kernel truth
+/// (net/ipv4/inet_diag.c::inet_diag_handler_cmd): the NLM_F_DUMP branch
+/// is SOCK_DIAG_BY_FAMILY ONLY — SOCK_DESTROY is an EXACT command
+/// (find one socket, `sock_diag_destroy` it), and its success is SILENT
+/// unless NLM_F_ACK is set. An un-ACKed successful destroy sends no reply
+/// at all, so a dump-style recv loop hangs forever on the FIRST socket
+/// actually killed (live-bitten: revoke timed out behind a blocked
+/// sock_pass thread; the probe never hit this because its impossible
+/// tuple always answered -ENOENT).
 fn destroy_sock(fd: RawFd, s: &SockInfo, seq: u32) -> io::Result<usize> {
     let req = InetDiagReqV2::for_sock(s);
     send_msg(
         fd,
         SOCK_DESTROY,
-        NLM_F_REQUEST | NLM_F_DUMP,
+        NLM_F_REQUEST | NLM_F_ACK,
         seq,
         req.as_bytes(),
     )?;
-    let mut buf = [0u8; 4096];
-    let mut destroyed = 0usize;
-    loop {
-        let n = unsafe { libc::recv(fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len(), 0) };
-        if n < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        let walk = for_each_msg(&buf[..n as usize], |_payload| {
-            destroyed += 1;
-            true
-        });
-        match walk {
-            // DONE ends the dump — with or without entries (zero matches
-            // is a completed destroy of nothing, not a hang condition).
-            Ok(true) => return Ok(destroyed),
-            Ok(false) => continue,
-            Err(code) => match -code {
-                libc::ENOENT => return Ok(0),
-                e => return Err(io::Error::from_raw_os_error(e)),
-            },
-        }
+    match recv_ack(fd, seq)? {
+        0 => Ok(1),
+        code if code < 0 => match -code {
+            libc::ENOENT => Ok(0),
+            e => Err(io::Error::from_raw_os_error(e)),
+        },
+        _ => Err(io::Error::from_raw_os_error(libc::EPROTO)),
     }
 }
 
@@ -569,28 +619,24 @@ fn probe_diag(fd: RawFd) -> io::Result<bool> {
     send_msg(
         fd,
         SOCK_DESTROY,
-        NLM_F_REQUEST | NLM_F_DUMP,
+        NLM_F_REQUEST | NLM_F_ACK,
         9,
         req.as_bytes(),
     )?;
-    let mut buf = [0u8; 4096];
-    loop {
-        let n = unsafe { libc::recv(fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len(), 0) };
-        if n < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        match for_each_msg(&buf[..n as usize], |_| true) {
-            // Dump completed (DONE, nothing destroyed): handler exists.
-            Ok(true) => return Ok(true),
-            Ok(false) => continue,
-            Err(code) => match -code {
-                libc::EOPNOTSUPP => return Ok(false),
-                // Zero sockets matched: the destroy handler RAN, which is
-                // exactly the capability being probed.
-                libc::ENOENT => return Ok(true),
-                e => return Err(io::Error::from_raw_os_error(e)),
-            },
-        }
+    // ACK'd unicast: exactly one NLMSG_ERROR answers every outcome —
+    // EOPNOTSUPP (handler absent) vs ENOENT/success (handler ran) is the
+    // separation being probed. ACK also guarantees a reply even in the
+    // impossible case the probe tuple matches something real.
+    match recv_ack(fd, 9)? {
+        0 => Ok(true),
+        code if code < 0 => match -code {
+            libc::EOPNOTSUPP => Ok(false),
+            // Zero sockets matched: the destroy handler RAN, which is
+            // exactly the capability being probed.
+            libc::ENOENT => Ok(true),
+            e => Err(io::Error::from_raw_os_error(e)),
+        },
+        _ => Err(io::Error::from_raw_os_error(libc::EPROTO)),
     }
 }
 
@@ -1087,6 +1133,58 @@ mod tests {
                 panic!("probe unsupported but destroy errored differently: {e}")
             }
             (Err(e), _) => panic!("probe errored: {e}"),
+        }
+    }
+
+    /// Destroying a REAL socket must report exactly one and RETURN.
+    /// Ghost-tuple tests cannot catch a silent-success protocol break:
+    /// an un-ACKed SOCK_DESTROY destroys the socket and sends no reply
+    /// at all, so a dump-style recv loop hangs forever on the first
+    /// real kill (live-bitten: revoke timed out behind a blocked
+    /// sock_pass thread while the flow sat destroyed). Skips cleanly
+    /// when unprivileged or CONFIG_INET_DIAG_DESTROY=n.
+    #[test]
+    fn destroying_a_real_socket_reports_one_and_returns() {
+        use std::net::{TcpListener, TcpStream};
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = l.local_addr().unwrap();
+        let c = TcpStream::connect(addr).unwrap();
+        let (_srv, _) = l.accept().unwrap();
+        let cport = c.local_addr().unwrap().port();
+
+        let out = with_host_diag(|fd| {
+            match probe_diag(fd) {
+                Ok(true) => {}
+                // Unsupported or unpermitted host: nothing to assert.
+                _ => return Ok(None),
+            }
+            let mut socks = Vec::new();
+            dump_family(fd, AF_INET, 1, &mut socks)?;
+            let client = socks
+                .iter()
+                .find(|s| s.sport == cport && s.dport == addr.port())
+                .expect("client side of the loopback pair must be dumped");
+            match destroy_sock(fd, client, 11) {
+                Ok(n) => Ok(Some(n)),
+                Err(e) if e.raw_os_error() == Some(libc::EPERM) => Ok(None),
+                Err(e) => Err(e),
+            }
+        })
+        .expect("destroy pass must not error");
+        if let Some(n) = out {
+            assert_eq!(n, 1, "exact-tuple destroy must report exactly one socket");
+            let socks = with_host_diag(|fd| {
+                let mut v = Vec::new();
+                dump_family(fd, AF_INET, 1, &mut v)?;
+                io::Result::Ok(v)
+            })
+            .unwrap();
+            assert!(
+                !socks
+                    .iter()
+                    .any(|s| s.sport == cport && s.dport == addr.port()),
+                "destroyed socket must vanish from dumps"
+            );
         }
     }
 
