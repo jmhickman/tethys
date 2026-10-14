@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """E2E for tethysd in netns mode: real namespaces, real packets, real nft.
 
-Run from workspace root as a privileged account — the harness creates its own
-PRIVATE network namespace (fresh name per run, under /tmp/tethys-e2e/netns,
+Run from workspace root as a privileged account — the harness starts its own
+PRIVATE network namespace (fresh name per run, under /run/tethys-e2e,
 never /run/netns), provisions it through `tethysd provision`, runs the daemon
 against it, and sends real TCP packets through the host projection. The
 production kernel state is untouched: everything lives in a private netns + a
@@ -54,10 +54,14 @@ ADMIN = f"{DIR}/admin.sock"
 MCP = f"{DIR}/mcp.sock"
 CFG = f"{DIR}/config.toml"
 NS = f"t-e2e-{os.getpid()}"          # fresh name per run
-NSDIR = f"{DIR}/netns"
+# nsfs bind-mounts live under /run (tmpfs), mirroring production's
+# /run/netns — a private sibling dir, never the real one. Binding nsfs
+# onto files of other filesystem classes (ZFS et al.) can EINVAL;
+# first root run proved exactly that on /tmp.
+NSDIR = "/run/tethys-e2e"
 NSPATH = f"{NSDIR}/{NS}"
 HOSTVETH = ("vh-" + NS)[:15]          # provision's default host_veth name
-CLIENT_NSFILE = f"{DIR}/client_ns"    # bind-mount of the client netns
+CLIENT_NSFILE = f"{NSDIR}/c-{NS}"     # bind-mount of the client netns
 VC_H, VC_C = "vc-h", "vc-c"
 TETHYSD_BIN = os.environ.get("TETHYSD_BIN", os.path.join(ROOT, "target/debug/tethysd"))
 TABLE = os.environ.get("TETHYS_E2E_TABLE", "tethys_e2e")
@@ -76,6 +80,31 @@ P_NO = P_IN + 1               # never delegated
 P_HOST = P_IN + 2             # host-stack listener (lockout probe)
 
 CLONE_NEWNET = 0x40000000
+import ctypes
+_LIBC = ctypes.CDLL("libc.so.6", use_errno=True)
+
+
+def make_netns(target):
+    """Pin a fresh netns at `target` (file must exist): fork, unshare,
+    legacy mount(2) bind of /proc/self/ns/net — iproute2's spelling. NOT
+    `mount --bind`: util-linux uses open_tree(OPEN_TREE_CLONE)+move_mount,
+    which AppArmor denies inside LXC containers (EACCES) while the legacy
+    syscall is allowed. The bind itself pins the namespace; no holder."""
+    touch(target)
+    pid = os.fork()
+    if pid == 0:
+        try:
+            if _LIBC.unshare(CLONE_NEWNET) != 0:
+                os._exit(ctypes.get_errno() or 1)
+            rc = _LIBC.mount(b"/proc/self/ns/net", os.fsencode(target),
+                             b"nsfs", 4096, None)   # MS_BIND
+            os._exit(0 if rc == 0 else (ctypes.get_errno() or 1))
+        except OSError:
+            os._exit(127)
+    _, status = os.waitpid(pid, 0)
+    code = os.waitstatus_to_exitcode(status)
+    if code != 0:
+        raise RuntimeError(f"make_netns {target}: {os.strerror(code)}")
 
 
 def run(argv, **kw):
@@ -214,7 +243,7 @@ def main():
             run(["ip", "link", "del", link])
     except Exception:
         pass
-    os.system(f"rm -rf {DIR} && mkdir -p {DIR}")
+    os.system(f"rm -rf {DIR} && mkdir -p {DIR} {NSDIR}")
     open(f"{DIR}/listener.py", "w").write(LISTENER)
     open(f"{DIR}/probe.py", "w").write(PROBE)
     state = {"umounts": [], "links": []}
@@ -235,7 +264,7 @@ prefix4 = "{PREFIX4}"
 prefix6 = "{PREFIX6}"
 """)
 
-    daemon = listener = hostl = client_proc = None
+    daemon = listener = hostl = None
     fails, skips = [], []
     try:
         # ---- S0a: provisioning (and it must be idempotent) -----------------
@@ -248,9 +277,7 @@ prefix6 = "{PREFIX6}"
         json.dump(state, open(f"{DIR}/state.json", "w"))
 
         # ---- client netns: the "remote" whose SYNs enter the host ----------
-        client_proc = subprocess.Popen(["unshare", "-n", "sleep", "36000"])
-        touch(CLIENT_NSFILE)
-        need(["mount", "--bind", f"/proc/{client_proc.pid}/ns/net", CLIENT_NSFILE])
+        make_netns(CLIENT_NSFILE)
         state["umounts"].append(CLIENT_NSFILE)
         state["links"].append(VC_H)
         json.dump(state, open(f"{DIR}/state.json", "w"))
@@ -724,7 +751,7 @@ prefix6 = "{PREFIX6}"
             fails.append(f"S12 enforcement without daemon: {kd}, drops {d0}->{d1c}")
         print("S12 no-lockout+persistence:", "ok" if "S12" not in str(fails) else fails[-1])
     finally:
-        for p in [daemon, listener, hostl, client_proc]:
+        for p in [daemon, listener, hostl]:
             if p is None:
                 continue
             try:
@@ -739,7 +766,7 @@ prefix6 = "{PREFIX6}"
         for link in state["links"]:
             run(["ip", "link", "del", link])
         run(["nft", "delete", "table", "inet", TABLE])   # host stack only
-        os.system(f"rm -rf {DIR}")
+        os.system(f"rm -rf {DIR}; rm -f {NSPATH} {CLIENT_NSFILE}; rmdir {NSDIR} 2>/dev/null")
         # the harness's cargo build ran as root under sudo; hand target/ back
         # so the developer's next unprivileged build isn't locked out
         if os.environ.get("SUDO_UID"):

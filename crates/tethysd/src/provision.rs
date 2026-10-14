@@ -634,24 +634,91 @@ fn ensure_netns(path: &std::path::Path) -> anyhow::Result<bool> {
     }
     let dir = path.parent().unwrap_or_else(|| "/".as_ref());
     std::fs::create_dir_all(dir).map_err(|e| anyhow::anyhow!("create {}: {e}", dir.display()))?;
-    // mount --bind needs the target file to exist — the touch `ip netns add`
+    // The bind needs the target file to exist — the touch `ip netns add`
     // does. If the mount fails, remove the file again so a bare empty file
     // never masquerades as a namespace on the next run.
     std::fs::File::create(path).map_err(|e| anyhow::anyhow!("create {}: {e}", path.display()))?;
-    let mut mount = Command::new("unshare");
-    mount.args([
-        "--net",
-        "mount",
-        "--bind",
-        "/proc/self/ns/net",
-        path.to_str()
-            .ok_or_else(|| anyhow::anyhow!("non-utf8 netns path"))?,
-    ]);
-    if let Err(e) = run(mount, "create netns") {
+    if let Err(e) = create_netns(path) {
         let _ = std::fs::remove_file(path);
         return Err(e);
     }
     Ok(true)
+}
+
+/// Create a pinned netns at `path` (the file must already exist): fork,
+/// `unshare(CLONE_NEWNET)`, legacy `mount("/proc/self/ns/net", path, "nsfs",
+/// MS_BIND)` — exactly what `ip netns add` does, and the bind itself pins
+/// the namespace (no holder process). Deliberately NOT `mount --bind`:
+/// util-linux routes binds through open_tree(OPEN_TREE_CLONE)+move_mount,
+/// which AppArmor denies inside LXC containers (EACCES) while allowing the
+/// legacy syscall — provisioning must not depend on which mount API a
+/// distro's mount(8) happens to use.
+#[allow(unsafe_code)] // fork/unshare/mount/waitpid: raw syscalls by design
+fn create_netns(path: &std::path::Path) -> anyhow::Result<()> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+    let c_path = CString::new(path.as_os_str().as_bytes())
+        .map_err(|_| anyhow::anyhow!("invalid netns path {}", path.display()))?;
+    // Child exit codes: 0 ok; 1..127 = errno of the failed unshare;
+    // 129..255 = 128 + errno of the failed mount. (The child runs after a
+    // fork in a multithreaded process, so it touches nothing but syscalls.)
+    let pid = unsafe { libc::fork() };
+    match pid {
+        -1 => Err(anyhow::anyhow!("fork: {}", std::io::Error::last_os_error())),
+        0 => {
+            if unsafe { libc::unshare(libc::CLONE_NEWNET) } != 0 {
+                let e = std::io::Error::last_os_error().raw_os_error().unwrap_or(1);
+                unsafe { libc::_exit(e.clamp(1, 127)) };
+            }
+            let rc = unsafe {
+                libc::mount(
+                    c"/proc/self/ns/net".as_ptr(),
+                    c_path.as_ptr(),
+                    c"nsfs".as_ptr(),
+                    libc::MS_BIND,
+                    std::ptr::null(),
+                )
+            };
+            let code = if rc == 0 {
+                0
+            } else {
+                let e = std::io::Error::last_os_error().raw_os_error().unwrap_or(1);
+                128 + e.clamp(1, 127)
+            };
+            unsafe { libc::_exit(code) };
+        }
+        _ => {
+            let mut status = 0;
+            loop {
+                if unsafe { libc::waitpid(pid, &mut status, 0) } >= 0 {
+                    break;
+                }
+                if std::io::Error::last_os_error().raw_os_error() != Some(libc::EINTR) {
+                    return Err(anyhow::anyhow!(
+                        "waitpid: {}",
+                        std::io::Error::last_os_error()
+                    ));
+                }
+            }
+            let code = if libc::WIFEXITED(status) {
+                libc::WEXITSTATUS(status)
+            } else {
+                return Err(anyhow::anyhow!("create netns: child killed by signal"));
+            };
+            match code {
+                0 => Ok(()),
+                c @ 1..=127 => Err(anyhow::anyhow!(
+                    "unshare(CLONE_NEWNET): {}",
+                    std::io::Error::from_raw_os_error(c)
+                )),
+                c => Err(anyhow::anyhow!(
+                    "bind-mounting nsfs onto {}: {}",
+                    path.display(),
+                    std::io::Error::from_raw_os_error(c - 128)
+                )),
+            }
+        }
+    }
 }
 
 /// True when `path` is a mount point per /proc/self/mountinfo (mount-point
