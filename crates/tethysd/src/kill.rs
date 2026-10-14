@@ -2,8 +2,9 @@
 //! so a granted session can no longer outlive its kernel element.
 //!
 //! Mechanism: the same netlink calls `ss -K` makes, made directly — a
-//! `NETLINK_SOCK_DIAG` dump (`SOCK_DIAG_BY_FAMILY`) of established TCP
-//! sockets, userspace filtering against the grant tuple, then one
+//! `NETLINK_SOCK_DIAG` dump (`SOCK_DIAG_BY_FAMILY`) of TCP sockets in the
+//! killable states (established, handshake, half-closed — see
+//! [`TCPF_KILL`]), userspace filtering against the grant tuple, then one
 //! `SOCK_DESTROY` request per match (uapi `linux/sock_diag.h`). No external
 //! binary: minimal LXC images — a first-class deployment target — may ship
 //! no iproute2 at all, and ss's filter grammar has no uid term anyway. The
@@ -58,13 +59,37 @@ const NLMSG_HDRLEN: usize = 16;
 /// uapi linux/sock_diag.h
 const SOCK_DIAG_BY_FAMILY: u16 = 20;
 const SOCK_DESTROY: u16 = 21;
-/// uapi linux/inet_diag.h
+/// uapi linux/inet_diag.h states
 const TCP_ESTABLISHED: u8 = 1;
+const TCP_SYN_SENT: u8 = 2;
+const TCP_SYN_RECV: u8 = 3;
+const TCP_FIN_WAIT1: u8 = 4;
+const TCP_FIN_WAIT2: u8 = 5;
+const TCP_CLOSE_WAIT: u8 = 8;
+const TCP_NEW_SYN_RECV: u8 = 12;
 const IPPROTO_TCP: u8 = 6;
 /// Kernel tcp_states.h convention: the bitmask bit is `1 << state`, NOT
 /// `1 << (state - 1)` — off by one here silently requests TCP_CLOSE and
 /// every dump comes back empty (verified live).
-const TCPF_ESTABLISHED: u32 = 1 << TCP_ESTABLISHED;
+///
+/// Kill-pass mask: every state that can still complete a handshake or
+/// carry bytes. SYN-SENT/SYN-RECV/NEW-SYN-RECV close the "handshake
+/// completes after the kill" race: conntrack's established/reply accepts
+/// let the final ACK through without consulting any grant set, so an
+/// in-flight handshake must be destroyed by the pass, not trusted to the
+/// rules it already outran. FIN-WAIT/CLOSE-WAIT cut leftover bytes on
+/// half-closed flows. TIME_WAIT/CLOSE/LAST_ACK/CLOSING carry nothing
+/// killable and LISTEN is not a flow (and never matches the tuple) — all
+/// excluded. A kernel that refuses SOCK_DESTROY on request sockets logs
+/// the per-socket failure and moves on; the pass degrades to
+/// established+half-closed there.
+const TCPF_KILL: u32 = (1 << TCP_ESTABLISHED)
+    | (1 << TCP_SYN_SENT)
+    | (1 << TCP_SYN_RECV)
+    | (1 << TCP_FIN_WAIT1)
+    | (1 << TCP_FIN_WAIT2)
+    | (1 << TCP_CLOSE_WAIT)
+    | (1 << TCP_NEW_SYN_RECV);
 const AF_INET: u8 = 2;
 const AF_INET6: u8 = 10;
 /// CLONE_NEWNET for setns(2)
@@ -113,7 +138,7 @@ impl InetDiagReqV2 {
             sdiag_protocol: IPPROTO_TCP,
             idiag_ext: 0,
             pad: 0,
-            idiag_states: TCPF_ESTABLISHED,
+            idiag_states: TCPF_KILL,
             idiag_sport: [0; 2],
             idiag_dport: [0; 2],
             idiag_src: [0; 16],
@@ -131,7 +156,7 @@ impl InetDiagReqV2 {
             sdiag_protocol: IPPROTO_TCP,
             idiag_ext: 0,
             pad: 0,
-            idiag_states: TCPF_ESTABLISHED,
+            idiag_states: TCPF_KILL,
             idiag_sport: s.sport.to_be_bytes(),
             idiag_dport: s.dport.to_be_bytes(),
             idiag_src: s.src,
@@ -218,12 +243,23 @@ impl SockInfo {
     }
 }
 
-/// Parse one `inet_diag_msg` payload. Short messages and non-established
-/// states yield None.
+/// Parse one `inet_diag_msg` payload. Short messages and states outside
+/// the kill-pass mask yield None.
 fn parse_sock(msg: &[u8]) -> Option<SockInfo> {
     // sizeof(inet_diag_msg) = 4 + sockid(48) + expires/rqueue/wqueue/uid/
     // inode(20) = 72.
-    if msg.len() < 72 || msg[1] != TCP_ESTABLISHED {
+    if msg.len() < 72
+        || !matches!(
+            msg[1],
+            TCP_ESTABLISHED
+                | TCP_SYN_SENT
+                | TCP_SYN_RECV
+                | TCP_FIN_WAIT1
+                | TCP_FIN_WAIT2
+                | TCP_CLOSE_WAIT
+                | TCP_NEW_SYN_RECV
+        )
+    {
         return None;
     }
     // Only the sockid's ports and addresses are network order; if, cookie,
@@ -563,10 +599,11 @@ fn kill_work(
 
 // ---------------------------------------------------------------- public API
 
-/// Destroy established TCP flows matching one grant; returns how many
-/// sockets were killed. Silent no-ops (returning 0): dry-run, UDP (see
-/// module docs), or capability absent — the condition was logged once at
-/// boot by [`probe`].
+/// Destroy TCP flows matching one grant in any killable state (see
+/// [`TCPF_KILL`]: established, in-flight handshake, half-closed); returns
+/// how many sockets were killed. Silent no-ops (returning 0): dry-run, UDP
+/// (see module docs), or capability absent — the condition was logged once
+/// at boot by [`probe`].
 pub(crate) async fn kill_flows(
     st: &Arc<State>,
     dir: Direction,
@@ -607,7 +644,7 @@ fn probe_diag(fd: RawFd) -> io::Result<bool> {
         sdiag_protocol: IPPROTO_TCP,
         idiag_ext: 0,
         pad: 0,
-        idiag_states: TCPF_ESTABLISHED,
+        idiag_states: TCPF_KILL,
         idiag_sport: 65534u16.to_be_bytes(),
         idiag_dport: 65535u16.to_be_bytes(),
         idiag_src: [0; 16],
@@ -861,10 +898,7 @@ mod tests {
         assert_eq!(b.len(), 56);
         assert_eq!(b[0], AF_INET);
         assert_eq!(b[1], IPPROTO_TCP, "byte 1 is the protocol, not a state");
-        assert_eq!(
-            u32::from_ne_bytes([b[4], b[5], b[6], b[7]]),
-            TCPF_ESTABLISHED
-        );
+        assert_eq!(u32::from_ne_bytes([b[4], b[5], b[6], b[7]]), TCPF_KILL);
     }
 
     #[test]
@@ -895,8 +929,14 @@ mod tests {
         m[52..56].copy_from_slice(&999u32.to_ne_bytes()); // idiag_expires
         assert!(parse_sock(&m[..71]).is_none());
         assert_eq!(parse_sock(&m).unwrap().uid, 0, "expires(999) is not uid");
-        // Non-established states are skipped.
-        m[1] = 2; // SYN_RECV
+        // Non-killable states are skipped; killable handshake states are not.
+        m[1] = 2; // SYN_SENT
+        assert!(parse_sock(&m).is_some());
+        m[1] = 3; // SYN_RECV
+        assert!(parse_sock(&m).is_some());
+        m[1] = 6; // TIME_WAIT: carries nothing
+        assert!(parse_sock(&m).is_none());
+        m[1] = 10; // LISTEN: not a flow
         assert!(parse_sock(&m).is_none());
     }
 

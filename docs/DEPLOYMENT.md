@@ -423,8 +423,16 @@ Revoking a grant, letting it expire, and pressing the kill switch
 (`stop.grants`) all make the same two-part promise: the rule goes away,
 and the connections that rule carried are destroyed immediately — every
 granted flow in either direction (egress sessions out of the namespace,
-ingress sessions DNATed into it), whatever state the TCP connection is
-in.
+ingress sessions DNATed into it). The destroy pass covers every state
+that can still complete a handshake or carry bytes: ESTABLISHED,
+SYN-SENT and SYN-RECV (a handshake already in flight dies with the
+switch — conntrack's established/reply accepts would otherwise let its
+final ACK through without ever consulting the grant sets), and the
+FIN-WAIT/CLOSE-WAIT half-closes of a closing session. TIME_WAIT and
+LISTEN are not flows and are left alone. One race remains by
+construction: a SYN that crossed the firewall just before the rule went
+away completes if its final ACK arrives after the socket-table scan —
+a sub-round-trip window, and anything the scan sees is destroyed.
 
 The second half of that promise is `SOCK_DESTROY`, a kernel capability
 (`CONFIG_INET_DIAG_DESTROY`, Linux >= 4.7) the daemon probes once at
