@@ -54,6 +54,7 @@ import json, os, re, signal, socket, subprocess, sys, threading, time
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
 DIR = "/tmp/tethys-e2e"
+DLOG = "/tmp/tethys-e2e-tethysd.log"  # outside DIR: survives the teardown wipe
 ADMIN = f"{DIR}/admin.sock"
 MCP = f"{DIR}/mcp.sock"
 CFG = f"{DIR}/config.toml"
@@ -327,7 +328,7 @@ prefix6 = "{PREFIX6}"
             [TETHYSD_BIN, "--config", CFG,
              "--approver-timeout-secs", "8",
              "--agent-user", "tethys-e2e-absent", "--allow-missing-users"],
-            stdout=open(f"{DIR}/tethysd.log", "w"), stderr=subprocess.STDOUT)
+            stdout=open(DLOG, "w"), stderr=subprocess.STDOUT)
         time.sleep(0.8)
 
         adm = socket.socket(socket.AF_UNIX); adm.connect(ADMIN)
@@ -772,7 +773,14 @@ prefix6 = "{PREFIX6}"
                 fails.append(f"S11 ingress verdict wrong: {d}")
             return d.get("grant_id")
 
+        # S10's MANUAL delegations end here: from now on the daemon owns
+        # delegated_v4/v6 (its one-holder overlap check would — correctly —
+        # deny a grant onto a port the harness pre-opened).
+        undelegate(P_IN, 4); undelegate(P_IN, 6)
         gid11 = approve_ingress(CLIENT4, P_IN)
+        dg = run(["nft", "-a", "list", "set", "inet", TABLE, "delegated_v4"]).stdout
+        if str(P_IN) not in dg:
+            fails.append(f"S11 approve did not delegate the host port: {dg.strip()[:200]}")
         ig = ns_text(["nft", "list", "set", "inet", TABLE, "igrants_v4"])
         if CLIENT4 not in ig or str(P_IN) not in ig:
             fails.append(f"S11 igrants_v4 missing grant element: {ig[:200]}")
@@ -830,12 +838,14 @@ prefix6 = "{PREFIX6}"
         admin_rpc("revoke", {"grant_id": str(gid11b)})
         if CLIENT6 in ns_text(["nft", "list", "set", "inet", TABLE, "igrants_v6"]):
             fails.append("S11 igrants_v6 element survived revoke")
-        # reconnect gated again: daemon undelegated on revoke; re-delegate so
-        # the SYN can reach the namespace, where the removed element drops it.
-        delegate(P_IN, 4)
+        # Revoke must also CLOSE the host port: with the delegation gone the
+        # SYN is answered by the HOST itself (no DNAT, nothing reaches the
+        # ns). A timeout here would mean a leaked delegation — the exact
+        # bug eighteen runs of manual re-delegation hid (poll parser missed
+        # the interval rendering, so delegated_remove deleted nothing).
         kr, _ = probe(GW4, P_IN)
-        if kr != "timeout":
-            fails.append(f"S11 reconnect after revoke: {kr} (want timeout — gated again)")
+        if kr not in ("refused", "unreach", "unreach-net", "permdenied"):
+            fails.append(f"S11 reconnect after revoke: {kr} (want host answer — delegation closed)")
         print("S11 ingress-grant-kill:", "ok" if "S11" not in str(fails) else fails[-1])
 
         # S13: EXPIRY kills live flows too. The 2s sweep is a separate path
@@ -844,6 +854,7 @@ prefix6 = "{PREFIX6}"
         # port stays open to the whole world). 1s TTL lets the kernel reap
         # the element; the sweep must then destroy the flow, drop the
         # delegation, and emit grant.expired — in that order of effects.
+        undelegate(P_IN, 4)  # defensive: the sweep owns this port from here
         base13 = len(popup_gids())
         a13 = request("r13", {"dst_ip": CLIENT4, "dst_port": {"from": P_IN, "to": P_IN},
                               "proto": "tcp", "dir": "ingress",
@@ -852,6 +863,9 @@ prefix6 = "{PREFIX6}"
         admin_rpc("approve", {"grant_id": str(g13), "ttl_secs": 1})
         if not wait_decided(g13):
             fails.append("S13 short-ttl grant never approved")
+        dg13 = run(["nft", "-a", "list", "set", "inet", TABLE, "delegated_v4"]).stdout
+        if str(P_IN) not in dg13:
+            fails.append(f"S13 approve did not delegate the host port: {dg13.strip()[:200]}")
         n_acc13 = open(LOG).read().count('"accept"') if os.path.exists(LOG) else 0
         held13 = in_ns_popen(["python3", f"{DIR}/probe.py", GW4, str(P_IN), "4.0", "8.0", "s13hold"],
                              stdout=subprocess.PIPE, nsfile=CLIENT_NSFILE)
@@ -885,17 +899,16 @@ prefix6 = "{PREFIX6}"
         if str(P_IN) in dgx:
             fails.append(f"S13 delegation outlived the expired grant: {dgx.strip()[:200]}")
             try:
-                dl = open(f"{DIR}/tethysd.log").read().splitlines()
+                dl = open(DLOG).read().splitlines()
                 hits = [l for l in dl if "delegat" in l.lower() or "expiry" in l.lower()][-12:]
                 print("--- S13 daemon log (delegation/expiry lines) ---")
                 for l in hits:
                     print(" ", l[:300])
             except OSError as e:
                 print(f"  (daemon log unreadable: {e})")
-        delegate(P_IN, 4)  # re-open so the probe reaches the ns policy again
         kx, _ = probe(GW4, P_IN)
-        if kx != "timeout":
-            fails.append(f"S13 reconnect after expiry: {kx} (want timeout — gated again)")
+        if kx not in ("refused", "unreach", "unreach-net", "permdenied"):
+            fails.append(f"S13 reconnect after expiry: {kx} (want host answer — sweep closed the port)")
         print("S13 expiry-kill:", "ok" if "S13" not in str(fails) else fails[-1])
 
         # S12: host-stack listener reachable while the daemon runs AND after

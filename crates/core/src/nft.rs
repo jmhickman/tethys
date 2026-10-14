@@ -880,6 +880,14 @@ pub fn parse_set_ports(doc: &Value, tname: &str, sname: &str) -> Vec<(u16, u16)>
                 .get("val")
                 .or_else(|| el.get("elem").and_then(|e| e.get("val")));
             let Some(val) = val else { continue };
+            // Interval sets (ours all are) render elements as RANGE objects:
+            // {"val":{"range":[lo,hi]}} — the same rendering parse_poll sees
+            // inside concats, and the nftables-json model's Expression::Range.
+            // Missing this shape made every delegation poll read empty: the
+            // overlap guard never fired and delegated_remove silently deleted
+            // nothing (live-bitten: delegations leaked on every revoke/expiry
+            // while grants kept working on a stale-open port).
+            let val = val.get("range").unwrap_or(val);
             if let Some(p) = val.as_u64() {
                 if p <= 65535 {
                     out.push((p as u16, p as u16));
@@ -1244,7 +1252,9 @@ mod tests {
         let doc = serde_json::json!({"nftables": [
             {"set": {"family":"inet","table":"tethys","name":"delegated_v4",
                 "elem": [{"val":443}, {"val":[8000,8100],"service":"alt-redirect"},
-                         {"val":"http"}, {"val":70000}]}},
+                         {"val":"http"}, {"val":70000},
+                         {"val":{"range":[45906,45906]}},
+                         {"val":{"range":[9000,9100]}}]}},
             {"set": {"family":"inet","table":"other","name":"delegated_v4",
                 "elem": [{"val":1}]}},
             {"set": {"family":"inet","table":"tethys","name":"delegated_v6",
@@ -1252,7 +1262,7 @@ mod tests {
         ]});
         assert_eq!(
             parse_set_ports(&doc, "tethys", "delegated_v4"),
-            vec![(443, 443), (8000, 8100)]
+            vec![(443, 443), (8000, 8100), (45906, 45906), (9000, 9100)]
         );
         assert_eq!(
             parse_set_ports(&doc, "tethys", "delegated_v6"),
