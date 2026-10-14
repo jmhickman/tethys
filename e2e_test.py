@@ -49,6 +49,11 @@ Scenarios (all must pass):
   S13 expiry sweep (separate path from revoke): a 1s-TTL ingress grant's
       live flow dies, its delegation is dropped with the element (a stale
       DNAT port would stay open to the whole world), grant.expired lands
+  S14 reserved ports (P_NO is reserved in the harness config): an ingress
+      request for a reserved port is denied port_reserved with NO popup,
+      an ingress wildcard is denied ingress_wildcard_port, and even a
+      MANUALLY delegated reserved port is not DNATed — the provisioned
+      pre-DNAT guard rule returns it to the host stack
 """
 import json, os, re, signal, socket, subprocess, sys, threading, time
 
@@ -273,6 +278,7 @@ mcp_socket = "{MCP}"
 admin_socket = "{ADMIN}"
 db = "{DIR}/ledger.db"
 nft_table = "{TABLE}"
+reserved_ports = ["{P_NO}"]
 
 [netns]
 name = "{NS}"
@@ -910,6 +916,42 @@ prefix6 = "{PREFIX6}"
         if kx not in ("refused", "unreach", "unreach-net", "permdenied"):
             fails.append(f"S13 reconnect after expiry: {kx} (want host answer — sweep closed the port)")
         print("S13 expiry-kill:", "ok" if "S13" not in str(fails) else fails[-1])
+
+        # ---- S14: reserved ports stay on the host ---------------------------
+        # P_NO is reserved in the harness config. The request path must
+        # refuse it inline (no popup, no row), refuse ingress wildcards, and
+        # the provisioned pre-DNAT guard rule must keep even a MANUALLY
+        # delegated reserved port out of the namespace.
+        base14 = len(popup_gids())
+        a14 = request("r14", {"dst_ip": CLIENT4, "dst_port": {"from": P_NO, "to": P_NO},
+                              "proto": "tcp", "dir": "ingress",
+                              "reason": "reserved", "tool": "t", "ttl_requested": "60s"})
+        a14.settimeout(5)
+        d14 = json.loads(a14.recv(65536).decode())["result"]
+        if d14.get("decision") != "denied" or d14.get("reason_code") != "port_reserved":
+            fails.append(f"S14 reserved-port ingress: {d14} (want denied/port_reserved)")
+        a14w = request("r14w", {"dst_ip": CLIENT4, "dst_port": {"from": 0, "to": 0},
+                                "proto": "tcp", "dir": "ingress",
+                                "reason": "wildcard", "tool": "t", "ttl_requested": "60s"})
+        a14w.settimeout(5)
+        d14w = json.loads(a14w.recv(65536).decode())["result"]
+        if d14w.get("decision") != "denied" or d14w.get("reason_code") != "ingress_wildcard_port":
+            fails.append(f"S14 wildcard ingress: {d14w} (want denied/ingress_wildcard_port)")
+        if len(popup_gids()) != base14:
+            fails.append("S14 an ungrantable ingress request popped the approver")
+        # Kernel half: reserve is enforced below the control plane. Delegate
+        # P_NO by hand (as a stale element or manual nft edit would) — the
+        # guard rule must return the SYN to the host stack, ns never sees it.
+        delegate(P_NO, 4)
+        d0 = drops()
+        k14, _ = probe(GW4, P_NO)
+        d14c = drops()
+        if k14 not in ("refused", "unreach", "unreach-net", "permdenied"):
+            fails.append(f"S14 reserved port DNATed despite guard: {k14}")
+        if d14c != d0:
+            fails.append(f"S14 guard rule leaked packets into the ns: drops {d0}->{d14c}")
+        undelegate(P_NO, 4)
+        print("S14 reserved-ports:", "ok" if "S14" not in str(fails) else fails[-1])
 
         # S12: host-stack listener reachable while the daemon runs AND after
         # it dies; the namespace keeps enforcing with no daemon at all.
