@@ -80,7 +80,9 @@ dry_run = false             # true: sockets and ledger only; nftables untouched
 # listens on (the guard only covers ports you name).
 reserved_ports = [
     "22",                                 # sshd — the classic self-lockout (default)
-#     "8080-8090",                        # local dev/API servers
+#     "4444",                             # classic reverse-shell listener — the form for
+#                                         # any port a host service holds
+#     "8080-8090",                        # local dev/API servers (ranges work too)
 ]
 
 # Ingress notes (routed mode): an ingress grant or allow_in entry MUST

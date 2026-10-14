@@ -246,6 +246,17 @@ automatically. Default 300. No decision is recorded as a denial.
 : The operator allow list: egress that is always permitted, installed into
 the baseline's carve sets at every daemon start. See THE ALLOW LIST.
 
+`reserved_ports`
+: Host ports that are never delegated to the namespace, whatever an
+approver signs. An ingress request touching one is denied inline
+(`port_reserved`, no popup); an `allow_in` entry touching one aborts
+startup; and provisioning installs a pre-DNAT guard rule so even stale or
+hand-added delegation state cannot capture them — the host stack keeps
+answering. Default `["22"]`; set `[]` to opt out. Boot-only: no reload
+RPC, edit and restart. Ingress grants and `allow_in` entries must also
+pin their ports — a wildcard ingress would delegate every host port at
+once and is refused (`ingress_wildcard_port`).
+
 `dry_run`
 : When true, the daemon binds its sockets and maintains the ledger but
 installs nothing into nftables. Intended for development and for rehearsing
@@ -405,6 +416,38 @@ After expiry the element is removed without any explicit action by the user.
 
 `tethys` displays dropped packets as well, allowing the user to note potentially broken
 pipes.
+
+### Flow kill: the kernel flag the kill switch depends on
+
+Revoking a grant, letting it expire, and pressing the kill switch
+(`stop.grants`) all make the same two-part promise: the rule goes away,
+and the connections that rule carried are destroyed immediately — every
+granted flow in either direction (egress sessions out of the namespace,
+ingress sessions DNATed into it), whatever state the TCP connection is
+in.
+
+The second half of that promise is `SOCK_DESTROY`, a kernel capability
+(`CONFIG_INET_DIAG_DESTROY`, Linux >= 4.7) the daemon probes once at
+boot. On a kernel without it the daemon degrades honestly but the
+contract changes shape: revokes stop **new** traffic immediately, while
+already-established TCP flows keep carrying data until conntrack times
+them out or the endpoints close them — the kill switch becomes a gate,
+not a guillotine. The degradation is visible three ways: the subscribe
+ack reports `sock_destroy: false`, the TUI status line reads
+`flow-kill off`, and the daemon log states it at boot. UDP flows are
+never destroyed on any kernel; they fade with conntrack timeouts.
+
+Distribution kernels (Debian, Ubuntu, Fedora/RHEL) ship the option
+enabled; minimal, embedded, and hand-rolled kernels sometimes do not.
+Check the target host before deploying:
+
+```
+zgrep CONFIG_INET_DIAG_DESTROY /proc/config.gz ||
+  grep CONFIG_INET_DIAG_DESTROY /boot/config-$(uname -r)
+```
+
+If it is unset or modular, rebuild or switch kernels before treating
+`stop.grants` as an emergency brake.
 
 ## UNINSTALL
 
