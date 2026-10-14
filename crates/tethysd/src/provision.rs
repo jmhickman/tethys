@@ -42,6 +42,12 @@ pub const HOST_CHAIN_DNAT: &str = "delegated";
 pub const HOST_CHAIN_MASQ: &str = "host_masq";
 pub const SET_DELEGATED_V4: &str = "delegated_v4";
 pub const SET_DELEGATED_V6: &str = "delegated_v6";
+/// Operator-reserved ports (`reserved_ports` config): the pre-DNAT guard
+/// returns on these so even a stale or hand-added delegation cannot pull
+/// a host-stack port into the namespace. Owned (flush-and-rebuilt) by
+/// provisioning, unlike the runtime-maintained delegated_* sets.
+pub const SET_RESERVED_V4: &str = "reserved_v4";
+pub const SET_RESERVED_V6: &str = "reserved_v6";
 
 #[derive(Debug, Clone)]
 pub struct Routed {
@@ -83,6 +89,11 @@ pub struct Spec {
     pub ns_veth: String,
     pub table: String,
     pub mode: Mode,
+    /// Operator-reserved host ports (normalized ranges, from config
+    /// `reserved_ports`); installed as the pre-DNAT guard sets. Only the
+    /// provision path (`from_config`) populates these — the daemon's own
+    /// Spec copy never builds host batches.
+    pub reserved: Vec<(u16, u16)>,
 }
 
 impl Spec {
@@ -94,7 +105,11 @@ impl Spec {
             .netns
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("[netns] section is required for provision"))?;
-        Spec::from_netns(nf, table_override.unwrap_or(&file.nft_table))
+        let mut spec = Spec::from_netns(nf, table_override.unwrap_or(&file.nft_table))?;
+        // Same strict parse the daemon boot does: a bad reserved_ports entry
+        // aborts provisioning before any kernel effect.
+        spec.reserved = crate::config::parse_reserved_ports(&file.reserved_ports)?;
+        Ok(spec)
     }
 
     pub fn from_netns(nf: &NetnsFile, table: &str) -> anyhow::Result<Spec> {
@@ -138,6 +153,7 @@ impl Spec {
             ns_veth,
             table: table.to_string(),
             mode,
+            reserved: Vec::new(),
         })
     }
 
@@ -462,6 +478,14 @@ pub fn host_batch(spec: &Spec) -> Batch {
                 "type":"inet_service","flags":["interval"]
             }}}));
         }
+        // Reserved-port guard sets: same shape, but owned by provisioning
+        // (flushed and repopulated from config on every provision run).
+        for name in [SET_RESERVED_V4, SET_RESERVED_V6] {
+            b.push_cmd(json!({"add":{"set":{
+                "family":"inet","table":&t,"name":name,
+                "type":"inet_service","flags":["interval"]
+            }}}));
+        }
     }
     for (chain, hook, ty, prio) in [
         (HOST_CHAIN_FWD, "forward", "filter", 0),
@@ -480,6 +504,21 @@ pub fn host_batch(spec: &Spec) -> Batch {
         b.push_cmd(json!({"flush":{"chain":{
             "family":"inet","table":&t,"name":chain
         }}}));
+    }
+    // Reserved sets are provisioning-owned: flush then repopulate, so
+    // shrinking `reserved_ports` in config actually shrinks the kernel
+    // set on the next provision (delegated_* are daemon-owned and stay).
+    if matches!(spec.mode, Mode::Routed(_)) {
+        for name in [SET_RESERVED_V4, SET_RESERVED_V6] {
+            b.push_cmd(json!({"flush":{"set":{
+                "family":"inet","table":&t,"name":name
+            }}}));
+        }
+        for (lo, hi) in &spec.reserved {
+            let port = tethys_core::types::PortSpec { from: *lo, to: *hi };
+            b.add_port(SET_RESERVED_V4, &port);
+            b.add_port(SET_RESERVED_V6, &port);
+        }
     }
 
     // --- forward-accept ------------------------------------------------------
@@ -506,6 +545,28 @@ pub fn host_batch(spec: &Spec) -> Batch {
     }
 
     if let Mode::Routed(r) = &spec.mode {
+        // Reserved-port guard, BEFORE the DNAT rules: a local-destined
+        // tcp/udp packet on a reserved port returns from this chain, so
+        // the host stack keeps answering it even if a stale (or manually
+        // added) delegated_* element names the same port. Control-plane
+        // validation refuses such delegations; this rule makes the promise
+        // kernel-true regardless. Empty sets make the rule inert.
+        for set in [SET_RESERVED_V4, SET_RESERVED_V6] {
+            b.push_cmd(rule(
+                HOST_CHAIN_DNAT,
+                vec![
+                    json!({"match":{"op":"==","left":{
+                        "fib":{"flags":"daddr","result":"type"}},"right":"local"}}),
+                    json!({"match":{"op":"!=","left":{"meta":{"key":"iifname"}},"right":hv}}),
+                    json!({"match":{"op":"in","left":{"meta":{"key":"l4proto"}},
+                                     "right":{"set":["tcp","udp"]}}}),
+                    json!({"match":{"op":"in","left":{
+                        "payload":{"protocol":"th","field":"dport"}},"right":format!("@{set}")}}),
+                    json!({"return":null}),
+                ],
+            ));
+        }
+
         // Delegated-port DNAT: packets destined for THIS host (fib local),
         // arriving from anywhere but our own veth (so ns egress is never
         // hairpinned), tcp/udp on a delegated port, go to the namespace
@@ -1091,7 +1152,8 @@ mod tests {
 
     #[test]
     fn host_batch_routed_wires_all_three_chains() {
-        let s = routed();
+        let mut s = routed();
+        s.reserved = vec![(22, 22), (8080, 8090)];
         let c = cmds(&host_batch(&s));
         for (name, hook, ty, prio) in [
             (HOST_CHAIN_FWD, "forward", "filter", 0i64),
@@ -1122,6 +1184,67 @@ mod tests {
                 .any(|x| x["add"]["set"]["name"].as_str() == Some(set)
                     && x["add"]["set"]["type"].as_str() == Some("inet_service")
                     && x["add"]["set"]["flags"] == json!(["interval"])));
+        }
+
+        // Reserved-port guard: sets exist, are flushed and repopulated
+        // from spec.reserved, and a return-rule per family precedes the
+        // DNAT rules it must shadow (flush-and-rebuild emits in order).
+        for set in [SET_RESERVED_V4, SET_RESERVED_V6] {
+            assert!(
+                c.iter()
+                    .any(|x| x["add"]["set"]["name"].as_str() == Some(set)
+                        && x["add"]["set"]["type"].as_str() == Some("inet_service")
+                        && x["add"]["set"]["flags"] == json!(["interval"])),
+                "missing reserved set {set}"
+            );
+            let flush_at = c
+                .iter()
+                .position(|x| x["flush"]["set"]["name"].as_str() == Some(set))
+                .unwrap_or_else(|| {
+                    panic!("{set} not flushed (stale elements survive config shrink)")
+                });
+            for port in ["22", "8080-8090"] {
+                let elem_at = c.iter().position(|x| {
+                    x["add"]["element"]["name"].as_str() == Some(set)
+                        && x["add"]["element"]["elem"][0].as_str() == Some(port)
+                });
+                assert!(elem_at.is_some(), "no {port} element in {set}");
+                assert!(
+                    flush_at < elem_at.unwrap(),
+                    "{set}: element added before flush"
+                );
+            }
+        }
+        let guard_at = |set: &str| {
+            c.iter().position(|x| {
+                let want = format!("@{set}");
+                x["add"]["rule"]["chain"].as_str() == Some(HOST_CHAIN_DNAT)
+                    && x["add"]["rule"]["expr"]
+                        .as_array()
+                        .map(|e| {
+                            e.last().is_some_and(|v| v["return"].is_null())
+                                && e.iter()
+                                    .any(|m| m["match"]["right"].as_str() == Some(want.as_str()))
+                        })
+                        .unwrap_or(false)
+            })
+        };
+        for set in [SET_RESERVED_V4, SET_RESERVED_V6] {
+            let g = guard_at(set).unwrap_or_else(|| panic!("no guard rule for {set}"));
+            let dnat_at = c
+                .iter()
+                .position(|x| {
+                    x["add"]["rule"]["chain"].as_str() == Some(HOST_CHAIN_DNAT)
+                        && x["add"]["rule"]["expr"]
+                            .as_array()
+                            .map(|e| e.last().is_some_and(|v| v["dnat"].is_object()))
+                            .unwrap_or(false)
+                })
+                .unwrap();
+            assert!(
+                g < dnat_at,
+                "guard rule for {set} emitted after the DNAT rule"
+            );
         }
 
         // DNAT: one rule per family, guarded (fib local; not from our own
@@ -1402,7 +1525,7 @@ mod tests {
         let tag = std::process::id();
         let table = format!("pchk{tag}"); // <16 chars, nft-friendly
         let toml_body = format!(
-            "nft_table='{t}'\n[netns]\nname='pc{tag}'\ndir='/tmp'\nprefix4='{p}'",
+            "nft_table='{t}'\nreserved_ports=['22','8080-8090']\n[netns]\nname='pc{tag}'\ndir='/tmp'\nprefix4='{p}'",
             t = table,
             p = free_prefix4()
         );

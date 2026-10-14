@@ -64,3 +64,26 @@ allow = [
 ]
 
 dry_run = false             # true: sockets and ledger only; nftables untouched
+
+# Reserved host ports — ports that are NEVER delegated (DNAT'd) to the
+# guarded namespace, no matter what an approver signs. In routed mode an
+# ingress grant works by DNATing the granted port on the host address into
+# the namespace; without this list, a grant for the port sshd listens on
+# would silently move that port's inbound traffic away from the host.
+# Reserved ports are refused at REQUEST time (reason_code: port_reserved,
+# no popup), dropped from the delegation projection, and shadowed by a
+# pre-DNAT guard rule in the kernel — even a hand-added delegated_*
+# element cannot capture them. Grammar: comma-separated ports or ranges.
+# Boot-only: change = edit + restart (provision reapplies via ExecStartPre).
+# Strongly recommended: every port a host daemon listens on.
+reserved_ports = [
+#     "22",                               # sshd — the classic self-lockout
+#     "8080-8090",                        # local dev/API servers
+]
+
+# Ingress notes (routed mode): an ingress grant or allow_in entry MUST
+# pin its ports. '*' (all ports) is refused for ingress with
+# reason_code: ingress_wildcard_port — delegating every host port would
+# hijack the whole host stack into the namespace. allow_in entries follow
+# the same rules at boot: a wildcard or reserved-port entry aborts
+# startup rather than installing a surprise DNAT.
