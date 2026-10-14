@@ -374,7 +374,7 @@ impl Batch {
             chain,
             vec![
                 json!({"counter": counter}),
-                json!({"limit":{"rate": DROP_LOG_RATE, "unit":"second"}}),
+                json!({"limit":{"rate": DROP_LOG_RATE, "per":"second"}}),
                 json!({"log":{"prefix": prefix}}),
                 json!({"drop":null}),
             ],
@@ -504,7 +504,7 @@ impl Batch {
             chain,
             vec![
                 json!({"match":{"op":"in","left":{"ct":{"key":"state"}},
-                                 "right":[{"established":null},{"related":null}]}}),
+                                 "right":["established","related"]}}),
                 json!({"accept":null}),
             ],
         );

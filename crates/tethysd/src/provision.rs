@@ -518,15 +518,24 @@ pub fn host_batch(spec: &Spec) -> Batch {
             b.push_cmd(rule(
                 HOST_CHAIN_DNAT,
                 vec![
+                    // nft JSON fib schema: `flags` selects the lookup key,
+                    // `result` the result to return — `fib daddr type
+                    // == local` ("destined for this host"). Member names
+                    // are exact; a wrong one fails the parser (caught live
+                    // on the first root run, and by batches_parse_under_local_nft).
                     json!({"match":{"op":"==","left":{
-                        "fib":{"key":"daddr","flags":"result"}},"right":"local"}}),
+                        "fib":{"flags":"daddr","result":"type"}},"right":"local"}}),
                     json!({"match":{"op":"!=","left":{"meta":{"key":"iifname"}},"right":hv}}),
                     json!({"match":{"op":"in","left":{"meta":{"key":"l4proto"}},
                                      "right":["tcp","udp"]}}),
                     json!({"match":{"op":"in","left":{
                         "payload":{"protocol":"th","field":"dport"}},
                         "right":format!("@{set}")}}),
-                    json!({"dnat":{"addr":daddr}}),
+                    // inet tables require the address family alongside
+                    // the DNAT target (libnftables-json: "Required in inet
+                    // table family").
+                    json!({"dnat":{"addr":daddr,
+                                   "family": if set == SET_DELEGATED_V6 { "ip6" } else { "ip" }}}),
                 ],
             ));
         }
@@ -1318,5 +1327,75 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
 
         outcome.expect("provision round trip");
+    }
+
+    // Parser gate: nft validates the whole batch before it ever opens
+    // netlink, so an UNPRIVILEGED run still catches JSON grammar errors —
+    // apply only fails with EPERM after parsing succeeded. This test
+    // exists because the first root run found a wrong `fib` member name
+    // that every hand-written JSON assertion missed: they asserted my
+    // assumptions about the schema, not the schema.
+    #[test]
+    fn batches_parse_under_local_nft() {
+        use std::io::Write;
+        if Command::new("nft").arg("--version").output().is_err() {
+            eprintln!("SKIP batches_parse_under_local_nft: no nft binary");
+            return;
+        }
+        let tag = std::process::id();
+        let table = format!("pchk{tag}"); // <16 chars, nft-friendly
+        let toml_body = format!(
+            "nft_table='{t}'\n[netns]\nname='pc{tag}'\ndir='/tmp'\nprefix4='10.231.77.0/29'",
+            t = table
+        );
+        let file: FileConfig = toml::from_str(&toml_body).unwrap();
+        let spec = Spec::from_config(&file, None).unwrap();
+        let mut ns_batch = Batch::with_table(&table);
+        ns_batch.ensure_base();
+        let check = |name: &str, body: String| {
+            let mut child = Command::new("nft")
+                .args(["--json", "-f", "-"])
+                .stdin(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .unwrap();
+            child
+                .stdin
+                .take()
+                .unwrap()
+                .write_all(body.as_bytes())
+                .unwrap();
+            let out = child.wait_with_output().unwrap();
+            let err = String::from_utf8_lossy(&out.stderr).to_string();
+            if out.status.success() {
+                // root: the batch really applied — clean up, parse was fine
+                let _ = Command::new("nft")
+                    .args(["delete", "table", "inet", &table])
+                    .output();
+                return;
+            }
+            // Unprivileged: the only acceptable failure is netlink itself
+            // refusing (parsing happens BEFORE the netlink cache init).
+            // nft prints parse errors AND the cache-init line together, so
+            // a substring "was it permitted?" test accepts everything —
+            // every Error line must be the permission one; anything else
+            // (internal:..., "Object item not found", syntax errors) is a
+            // parser rejection.
+            let unexplained: Vec<&str> = err
+                .lines()
+                .map(str::trim)
+                .filter(|l| l.contains("Error:") || l.contains("syntax error"))
+                .filter(|l| !l.starts_with("netlink: Error: cache initialization failed"))
+                .filter(|l| {
+                    !l.contains("Operation not permitted") && !l.contains("Permission denied")
+                })
+                .collect();
+            assert!(
+                unexplained.is_empty(),
+                "{name} batch rejected by the nft parser: {unexplained:?}\nfull: {err}"
+            );
+        };
+        check("host_batch", host_batch(&spec).to_json());
+        check("ensure_base", ns_batch.to_json());
     }
 }

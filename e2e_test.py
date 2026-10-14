@@ -268,13 +268,16 @@ prefix6 = "{PREFIX6}"
     fails, skips = [], []
     try:
         # ---- S0a: provisioning (and it must be idempotent) -----------------
+        # journal the mount/link targets BEFORE provisioning: a mid-run
+        # failure still leaves a mounted nsfs + veth to clean up, and a
+        # later crash (or exit) must not orphan them (seen live).
+        state["umounts"].append(NSPATH)
+        state["links"].append(HOSTVETH)
+        json.dump(state, open(f"{DIR}/state.json", "w"))
         for attempt in (1, 2):
             p = run([TETHYSD_BIN, "provision", "--config", CFG])
             if p.returncode != 0:
                 raise RuntimeError(f"provision attempt {attempt}: {p.stdout[-500:]} {p.stderr[-500:]}")
-        state["umounts"].append(NSPATH)
-        state["links"].append(HOSTVETH)
-        json.dump(state, open(f"{DIR}/state.json", "w"))
 
         # ---- client netns: the "remote" whose SYNs enter the host ----------
         make_netns(CLIENT_NSFILE)
