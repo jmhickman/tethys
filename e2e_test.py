@@ -304,6 +304,12 @@ prefix6 = "{PREFIX6}"
         need_in_ns(["ip", "link", "set", VC_C, "up"], **CN)
         need_in_ns(["ip", "addr", "add", f"{CLIENT4}/30", "dev", VC_C], **CN)
         need_in_ns(["ip", "-6", "addr", "add", f"{CLIENT6}/64", "dev", VC_C], **CN)
+        # The "remote" must be able to ROUTE to the gateway addresses —
+        # they live on another subnet than the client /30s. Without these
+        # defaults every probe died as ENETUNREACH before sending a SYN
+        # (run #10: three kinds=unreach-net, zero ns-side drops).
+        need_in_ns(["ip", "route", "add", "default", "via", HOSTVC4], **CN)
+        need_in_ns(["ip", "-6", "route", "add", "default", "via", HOSTVC6], **CN)
 
         # ---- daemon in netns mode ------------------------------------------
         # agent user deliberately unresolved: the harness (root) speaks mcp.sock

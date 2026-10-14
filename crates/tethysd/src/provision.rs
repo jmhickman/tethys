@@ -540,22 +540,28 @@ pub fn host_batch(spec: &Spec) -> Batch {
             ));
         }
 
-        // MASQUERADE for ns egress in both families (remotes see one
-        // address per family — unchanged from host-mode today). A pinned
-        // masq_src6 turns the v6 rule into a deterministic snat to it.
+        // MASQUERADE for ns-ORIGINATED egress in both families (remotes
+        // see one address per family — unchanged from host-mode today).
+        // Matching ct ORIGINAL saddr rather than the packet's saddr is
+        // load-bearing: replies to DNAT'd ingress flows leave postrouting
+        // with ns-prefix source but their conntrack origin is the remote —
+        // masquerading those would SNAT SYN-ACKs away from the address the
+        // client connected to, and the client socket would discard them.
+        // A pinned masq_src6 turns the v6 rule into a deterministic snat.
         let prefix = |addr: String, len: u8| json!({"prefix":{"addr":addr,"len":len}});
+        let ct_origin_saddr = json!({"ct":{"direction":"original","key":"saddr"}});
         b.push_cmd(rule(
             HOST_CHAIN_MASQ,
             vec![
                 json!({"match":{"op":"!=","left":{"meta":{"key":"oifname"}},"right":hv}}),
-                json!({"match":{"op":"==","left":{"payload":{"protocol":"ip","field":"saddr"}},
+                json!({"match":{"op":"==","left":ct_origin_saddr.clone(),
                                  "right":prefix(r.prefix4.network().to_string(), r.prefix4.prefix_len())}}),
                 json!({"masquerade":null}),
             ],
         ));
         let mut v6 = vec![
             json!({"match":{"op":"!=","left":{"meta":{"key":"oifname"}},"right":hv}}),
-            json!({"match":{"op":"==","left":{"payload":{"protocol":"ip6","field":"saddr"}},
+            json!({"match":{"op":"==","left":ct_origin_saddr,
                              "right":prefix(r.prefix6.network().to_string(), r.prefix6.prefix_len())}}),
         ];
         match r.masq_src6 {
@@ -923,8 +929,9 @@ mod tests {
                 .as_array()
                 .map(|e| {
                     e.iter().any(|m| {
-                        m["match"]["left"]["payload"]["protocol"].as_str() == Some("ip6")
-                            && m["match"]["left"]["payload"]["field"].as_str() == Some("saddr")
+                        m["match"]["left"]["ct"]["direction"].as_str() == Some("original")
+                            && m["match"]["right"]["prefix"]["addr"].as_str()
+                                == Some("2001:db8:7::")
                     })
                 })
                 .unwrap_or(false)
@@ -1159,13 +1166,18 @@ mod tests {
                 r.prefix6.prefix_len(),
             ),
         ] {
+            // ct original-direction saddr, never the post-NAT packet
+            // saddr: DNAT'd ingress replies must not be masqueraded.
+            // The RHS prefix pins which family's rule this is.
             let found = masq_rules.iter().find(|x| {
                 x["add"]["rule"]["expr"]
                     .as_array()
                     .map(|e| {
                         e.iter().any(|m| {
-                            m["match"]["left"]["payload"]["protocol"].as_str() == Some(af)
-                                && m["match"]["left"]["payload"]["field"].as_str() == Some("saddr")
+                            m["match"]["left"]["ct"]["direction"].as_str() == Some("original")
+                                && m["match"]["left"]["ct"]["key"].as_str() == Some("saddr")
+                                && m["match"]["right"]["prefix"]["addr"].as_str()
+                                    == Some(net.as_str())
                         })
                     })
                     .unwrap_or(false)
