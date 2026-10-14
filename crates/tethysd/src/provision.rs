@@ -620,10 +620,24 @@ fn link_exists(name: &str) -> bool {
 /// this call created it.
 fn ensure_netns(path: &std::path::Path) -> anyhow::Result<bool> {
     if path.exists() {
+        // A plain file where a namespace should be means a crash landed
+        // between creating the file and mounting onto it. Fail loudly —
+        // opening a bare file for setns would die later with a confusing
+        // EINVAL from deep inside the daemon.
+        anyhow::ensure!(
+            is_mountpoint(path),
+            "{} exists but is not a mounted namespace (leftover from a crashed \
+             provision?); umount and remove it, then retry",
+            path.display()
+        );
         return Ok(false);
     }
     let dir = path.parent().unwrap_or_else(|| "/".as_ref());
     std::fs::create_dir_all(dir).map_err(|e| anyhow::anyhow!("create {}: {e}", dir.display()))?;
+    // mount --bind needs the target file to exist — the touch `ip netns add`
+    // does. If the mount fails, remove the file again so a bare empty file
+    // never masquerades as a namespace on the next run.
+    std::fs::File::create(path).map_err(|e| anyhow::anyhow!("create {}: {e}", path.display()))?;
     let mut mount = Command::new("unshare");
     mount.args([
         "--net",
@@ -633,8 +647,28 @@ fn ensure_netns(path: &std::path::Path) -> anyhow::Result<bool> {
         path.to_str()
             .ok_or_else(|| anyhow::anyhow!("non-utf8 netns path"))?,
     ]);
-    run(mount, "create netns")?;
+    if let Err(e) = run(mount, "create netns") {
+        let _ = std::fs::remove_file(path);
+        return Err(e);
+    }
     Ok(true)
+}
+
+/// True when `path` is a mount point per /proc/self/mountinfo (mount-point
+/// fields are octal-escaped there; our paths rarely need it, decode anyway).
+fn is_mountpoint(path: &std::path::Path) -> bool {
+    let want = path.display().to_string();
+    std::fs::read_to_string("/proc/self/mountinfo")
+        .map(|mi| {
+            mi.lines().any(|l| {
+                l.split_whitespace().nth(4).map(|mp| {
+                    mp.replace("\\040", " ")
+                        .replace("\\011", "\t")
+                        .replace("\\012", "\n")
+                }) == Some(want.clone())
+            })
+        })
+        .unwrap_or(false)
 }
 
 fn write_sysctl(path: &str, want: &str) -> anyhow::Result<()> {
@@ -1155,6 +1189,18 @@ mod tests {
                     })
                     .unwrap_or(false)
         }));
+    }
+
+    #[test]
+    fn mountpoint_detection() {
+        // needs neither root nor nftables: mountinfo is world-readable
+        assert!(is_mountpoint(std::path::Path::new("/")));
+        assert!(!is_mountpoint(std::path::Path::new("/etc/hostname")));
+        // a file we just made cannot be a mount point
+        let p = std::env::temp_dir().join(format!("tethys-mp-{}", std::process::id()));
+        std::fs::File::create(&p).unwrap();
+        assert!(!is_mountpoint(&p));
+        std::fs::remove_file(&p).unwrap();
     }
 
     // Root-gated smoke: real unshare/mount/ip/nft round trip, skipped when
