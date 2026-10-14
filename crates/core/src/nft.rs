@@ -902,6 +902,14 @@ pub fn parse_set_ports(doc: &Value, tname: &str, sname: &str) -> Vec<(u16, u16)>
 /// funnels through [`NftCli::run_json`] so the [`ExecTarget`] (host stack or
 /// setns into the agent netns) is applied uniformly — no call site spawns
 /// nft ad hoc.
+/// `{"list":{"set":{family,table,name}}}` — `name` is the SET name; the
+/// table goes in `table`. Copying `list table`'s shape (where `name` IS
+/// the table) fails the parser with "Object item not found: table" —
+/// live-bitten on the first granted ingress install.
+pub fn list_set_cmd(table: &str, set: &str) -> Value {
+    json!({"family": "inet", "table": table, "name": set})
+}
+
 pub struct NftCli {
     pub bin: std::path::PathBuf,
     pub timeout: Duration,
@@ -977,7 +985,7 @@ impl NftCli {
     /// against this before add/delete (nft element ops are not idempotent).
     pub async fn set_ports(&self, table: &str, set: &str) -> Result<Vec<(u16, u16)>, NftError> {
         let doc = self
-            .list_json("set", Some(json!({"family": "inet", "name": table})))
+            .list_json("set", Some(list_set_cmd(table, set)))
             .await?;
         Ok(parse_set_ports(&doc, table, set))
     }

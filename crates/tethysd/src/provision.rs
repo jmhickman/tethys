@@ -1438,5 +1438,24 @@ mod tests {
         };
         check("host_batch", host_batch(&spec).to_json());
         check("ensure_base", ns_batch.to_json());
+        // Read-path commands must parse too: the first granted ingress
+        // install died in `list set` built with list-TABLE's shape
+        // (table name in `name`, no `table`) — a parse error only the
+        // real parser on the install path surfaced.
+        // Self-contained so the strongest gate rung (apply in a throwaway
+        // netns) succeeds rather than erroring on a missing set — and a
+        // wrong `name`/`table` member then fails SEMANTICALLY there,
+        // not just at parse time.
+        check(
+            "list_set",
+            format!(
+                "{{\"nftables\":[\
+{{\"add\":{{\"table\":{{\"family\":\"inet\",\"name\":\"{t}\"}}}}}},\
+{{\"add\":{{\"set\":{{\"family\":\"inet\",\"table\":\"{t}\",\"name\":\"delegated_v4\",\"type\":\"inet_service\"}}}}}},\
+{{\"list\":{{\"set\":{cmd}}}}}]}}",
+                t = table,
+                cmd = tethys_core::nft::list_set_cmd(&table, "delegated_v4")
+            ),
+        );
     }
 }
