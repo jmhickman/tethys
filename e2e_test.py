@@ -770,17 +770,20 @@ prefix6 = "{PREFIX6}"
 
         # S11: grant -> completes with TRUE source (DNAT preserved it) both
         # families; revoke kills the live flow; reconnect is gated again.
-        def approve_ingress(src, port):
+        def approve_ingress(src, port, tag="r11"):
+            # The request id is the idempotency key: reusing a tag whose
+            # row has since been revoked replays grant_expired instead of
+            # installing (S7's contract) — every caller needs its own tag.
             base = len(popup_gids())
-            a = request(f"r11-{src}", {"dst_ip": src, "dst_port": {"from": port, "to": port},
-                                       "proto": "tcp", "dir": "ingress",
-                                       "reason": "s11", "tool": "t", "ttl_requested": "300s"})
+            a = request(f"{tag}-{src}", {"dst_ip": src, "dst_port": {"from": port, "to": port},
+                                         "proto": "tcp", "dir": "ingress",
+                                         "reason": "s11", "tool": "t", "ttl_requested": "300s"})
             gg = new_gid(base)
             admin_rpc("approve", {"grant_id": str(gg)})
             a.settimeout(5)
             d = json.loads(a.recv(65536).decode())["result"]
             if d.get("decision") != "approved" or d.get("dir") != "ingress":
-                fails.append(f"S11 ingress verdict wrong: {d}")
+                fails.append(f"{tag} ingress verdict wrong: {d}")
             return d.get("grant_id")
 
         # S10's MANUAL delegations end here: from now on the daemon owns
@@ -961,7 +964,7 @@ prefix6 = "{PREFIX6}"
         # stop.grants destroys egress flows (S6 proves that); this pins the
         # ingress half: a held session DNATed into the namespace dies with
         # the switch, and the host delegation closes with the row.
-        gid15 = approve_ingress(CLIENT4, P_IN)
+        gid15 = approve_ingress(CLIENT4, P_IN, tag="r15")
         dg15 = run(["nft", "-a", "list", "set", "inet", TABLE, "delegated_v4"]).stdout
         if str(P_IN) not in dg15:
             fails.append(f"S15 approve did not delegate the host port: {dg15.strip()[:200]}")
