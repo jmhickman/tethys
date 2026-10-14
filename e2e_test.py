@@ -54,6 +54,10 @@ Scenarios (all must pass):
       an ingress wildcard is denied ingress_wildcard_port, and even a
       MANUALLY delegated reserved port is not DNATed — the provisioned
       pre-DNAT guard rule returns it to the host stack
+  S15 the kill switch is bidirectional: stop.grants destroys a held
+      INGRESS flow (S6's live flow is egress), reports it in killed, and
+      closes the host delegation with the row — the next SYN is answered
+      by the host, not DNATed
 """
 import json, os, re, signal, socket, subprocess, sys, threading, time
 
@@ -952,6 +956,50 @@ prefix6 = "{PREFIX6}"
             fails.append(f"S14 guard rule leaked packets into the ns: drops {d0}->{d14c}")
         undelegate(P_NO, 4)
         print("S14 reserved-ports:", "ok" if "S14" not in str(fails) else fails[-1])
+
+        # ---- S15: the kill switch is bidirectional --------------------------
+        # stop.grants destroys egress flows (S6 proves that); this pins the
+        # ingress half: a held session DNATed into the namespace dies with
+        # the switch, and the host delegation closes with the row.
+        gid15 = approve_ingress(CLIENT4, P_IN)
+        dg15 = run(["nft", "-a", "list", "set", "inet", TABLE, "delegated_v4"]).stdout
+        if str(P_IN) not in dg15:
+            fails.append(f"S15 approve did not delegate the host port: {dg15.strip()[:200]}")
+        n_acc15 = open(LOG).read().count('"accept"') if os.path.exists(LOG) else 0
+        held15 = in_ns_popen(["python3", f"{DIR}/probe.py", GW4, str(P_IN), "4.0", "8.0", "s15hold"],
+                             stdout=subprocess.PIPE, nsfile=CLIENT_NSFILE)
+        time.sleep(1.2)
+        if (open(LOG).read().count('"accept"') if os.path.exists(LOG) else 0) <= n_acc15:
+            fails.append("S15 held ingress flow never reached the listener (nothing to kill)")
+        r15 = admin_rpc("stop.grants")
+        if "error" in r15:
+            fails.append(f"S15 stop.grants errored (projection must succeed here): {r15}")
+        if sock_destroy:
+            try:
+                held15.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                held15.kill()
+                fails.append("S15 held ingress flow outlived stop.grants+kill window")
+            if held15.returncode not in (5,):
+                o15 = (held15.stdout.read().decode() if held15.stdout else "").strip()
+                fails.append(f"S15 stop did not kill the ingress flow: rc={held15.returncode} out={o15!r}")
+            stopped15 = [e["params"] for e in events if e.get("method") == "grants.stopped"]
+            k15 = (stopped15[-1] if stopped15 else {}).get("killed")
+            if not (isinstance(k15, int) and k15 >= 1):
+                fails.append(f"S15 stop reported killed={k15} while an ingress flow was held")
+        else:
+            held15.kill()
+            skips.append("S15 kill check skipped: kernel reports no SOCK_DESTROY")
+        # The host port must be gone with the row: a surviving delegation
+        # answers the next SYN from the namespace side (timeout), not the
+        # host itself (refused).
+        dgx15 = run(["nft", "-a", "list", "set", "inet", TABLE, "delegated_v4"]).stdout
+        if str(P_IN) in dgx15:
+            fails.append(f"S15 delegation outlived stop.grants: {dgx15.strip()[:200]}")
+        k15p, _ = probe(GW4, P_IN)
+        if k15p not in ("refused", "unreach", "unreach-net", "permdenied"):
+            fails.append(f"S15 reconnect after stop.grants: {k15p} (want host answer — delegation closed)")
+        print("S15 stop-grants-ingress:", "ok" if "S15" not in str(fails) else fails[-1])
 
         # S12: host-stack listener reachable while the daemon runs AND after
         # it dies; the namespace keeps enforcing with no daemon at all.
