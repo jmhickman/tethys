@@ -99,6 +99,11 @@ pub struct Config {
         tethys_core::types::PortSpec,
         tethys_core::types::Proto,
     )>,
+    /// Host ports never delegated to the namespace (config
+    /// `reserved_ports`), normalized sorted ranges. Enforced at request
+    /// validation, delegation projection, and (via provisioning's pre-DNAT
+    /// guard rule) in the kernel.
+    pub reserved_ports: Vec<(u16, u16)>,
     /// Validated `[netns]` spec: the enforcement boundary every state
     /// machine batch writes into. Required unless --dry-run (netns mode is
     /// the only mode; a missing or malformed section aborts startup).
@@ -189,6 +194,7 @@ async fn main() -> anyhow::Result<()> {
         mcp_sock_gid: None,
         allow: Vec::new(),
         allow_in: Vec::new(),
+        reserved_ports: config::parse_reserved_ports(&file.reserved_ports)?,
         netns: netns_spec,
         dry_run: cli.dry_run || file.dry_run,
     };
@@ -208,6 +214,10 @@ async fn main() -> anyhow::Result<()> {
             config::parse_allow(entry).map_err(|e| anyhow::anyhow!("config `allow_in`: {e}"))?,
         );
     }
+    // Inbound carves delegate host ports permanently: same constraint as
+    // ingress grants — no wildcard, no reserved port. Bad list aborts boot
+    // (same policy as every other enforcement-relevant config error).
+    config::validate_ingress_specs(&cfg.allow_in, &cfg.reserved_ports, "config `allow_in`")?;
 
     match config::resolve_uid(&cfg.admin_user) {
         Ok(uid) => cfg.admin_peer_uid = Some(uid),

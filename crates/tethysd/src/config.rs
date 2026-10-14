@@ -124,6 +124,15 @@ pub struct FileConfig {
     /// on the host (DNAT). No CLI flag by design (step 2026.10.1 decision).
     #[serde(default)]
     pub allow_in: Vec<String>,
+    /// Host ports that are NEVER delegated to the guarded namespace. An
+    /// ingress grant (or `allow_in` entry) whose port overlaps this list is
+    /// refused, and provisioning installs a pre-DNAT guard rule so even a
+    /// stale or hand-added delegation cannot capture these ports: the host
+    /// stack keeps answering them (sshd etc.). Grammar: comma-separated
+    /// ports or ranges ("22", "8080-8090", "53,67-68"). Boot-only: change
+    /// requires a daemon restart + reprovision, no reload RPC.
+    #[serde(default)]
+    pub reserved_ports: Vec<String>,
     /// dry-run: never touch nftables (state machine + sockets only)
     #[serde(default)]
     pub dry_run: bool,
@@ -145,6 +154,7 @@ impl Default for FileConfig {
             admin_user: default_admin_user(),
             allow: Vec::new(),
             allow_in: Vec::new(),
+            reserved_ports: Vec::new(),
             dry_run: false,
             netns: None,
         }
@@ -253,6 +263,68 @@ pub fn parse_allow(
         .collect())
 }
 
+/// Parse `reserved_ports` entries into normalized, sorted, deduplicated
+/// nft port ranges. Grammar: comma-separated single ports or ranges
+/// ("22", "8080-8090", "53,67-68"). A bad or inverted entry is a boot
+/// error — reserved ports are an enforcement knob, so a typo must abort,
+/// not silently under-protect.
+pub fn parse_reserved_ports(entries: &[String]) -> anyhow::Result<Vec<(u16, u16)>> {
+    use tethys_core::types::PortSpec;
+    let mut out: Vec<(u16, u16)> = Vec::new();
+    for e in entries {
+        for part in e.split(',') {
+            let part = part.trim();
+            anyhow::ensure!(!part.is_empty(), "reserved_ports {e:?}: empty list element");
+            let spec = if let Some((a, b)) = part.split_once('-') {
+                PortSpec {
+                    from: a.trim().parse()?,
+                    to: b.trim().parse()?,
+                }
+            } else {
+                let p = part.trim().parse::<u16>()?;
+                PortSpec { from: p, to: p }
+            };
+            spec.validate()
+                .map_err(|err| anyhow::anyhow!("reserved_ports {e:?}: {err}"))?;
+            out.push(spec.nft_range());
+        }
+    }
+    out.sort();
+    out.dedup();
+    Ok(out)
+}
+
+/// Ingress-delegation constraint for operator allow-list entries (used at
+/// boot and by reload.allow): a wildcard port would DNAT EVERY host port
+/// into the namespace, and a reserved port must never leave the host
+/// stack. Both abort (boot) or refuse (reload) rather than install a
+/// hijack the approver never asked for.
+pub fn validate_ingress_specs(
+    entries: &[(
+        tethys_core::types::Target,
+        tethys_core::types::PortSpec,
+        tethys_core::types::Proto,
+    )],
+    reserved: &[(u16, u16)],
+    what: &str,
+) -> anyhow::Result<()> {
+    use tethys_core::types::ranges_overlap;
+    for (t, p, _) in entries {
+        anyhow::ensure!(
+            !p.is_all(),
+            "{what} {}: explicit port required — '*' would delegate every host port into the namespace",
+            t.canonical()
+        );
+        if let Some((lo, hi)) = reserved.iter().find(|r| ranges_overlap(p.nft_range(), **r)) {
+            anyhow::bail!(
+                "{what} {}: port {lo}-{hi} is reserved by operator",
+                t.canonical()
+            );
+        }
+    }
+    Ok(())
+}
+
 /// Resolve a unix user name to its uid. A username named in config that does
 /// not exist on the box is a deployment error: without the account, the peer
 /// check on mcp.sock cannot hold.
@@ -325,6 +397,49 @@ mod tests {
         assert!(parse_allow("host:443-80").is_err());
         assert!(parse_allow("host:notaport").is_err());
         assert!(parse_allow("host:80,,443").is_err());
+    }
+
+    // reserved_ports: comma lists, ranges, normalization + dedup + sort,
+    // and error cases (empty element, inverted range, non-numeric).
+    #[test]
+    fn reserved_ports_parse_and_normalize() {
+        assert_eq!(
+            parse_reserved_ports(&["22".into()]).unwrap(),
+            vec![(22, 22)]
+        );
+        assert_eq!(
+            parse_reserved_ports(&["8080-8090".into(), "22,22".into(), " 53 ".into()]).unwrap(),
+            vec![(22, 22), (53, 53), (8080, 8090)]
+        );
+        // "0" is the wildcard spelling: normalized to the full space.
+        assert_eq!(
+            parse_reserved_ports(&["0".into()]).unwrap(),
+            vec![(0, 65535)]
+        );
+        assert!(parse_reserved_ports(&["80-22".into()]).is_err());
+        assert!(parse_reserved_ports(&["22,".into()]).is_err());
+        assert!(parse_reserved_ports(&["ssh".into()]).is_err());
+    }
+
+    // Ingress carves may not wildcard (would delegate every host port)
+    // and may not touch a reserved port; clean entries pass.
+    #[test]
+    fn ingress_specs_reject_wildcard_and_reserved() {
+        use tethys_core::types::{PortSpec, Proto, Target};
+        let ip: std::net::IpAddr = "203.0.113.5".parse().unwrap();
+        let t = Target::Ip(ip);
+        let entry = |from, to| (t.clone(), PortSpec { from, to }, Proto::Tcp);
+        let reserved = vec![(22, 22), (8080, 8090)];
+        assert!(validate_ingress_specs(&[entry(0, 0)], &reserved, "allow_in").is_err());
+        assert!(validate_ingress_specs(&[entry(22, 22)], &reserved, "allow_in").is_err());
+        // Overlap, not just equality: 8079-8081 bites the 8080-8090 range.
+        assert!(validate_ingress_specs(&[entry(8079, 8081)], &reserved, "allow_in").is_err());
+        assert!(validate_ingress_specs(
+            &[entry(443, 443), entry(8091, 8091)],
+            &reserved,
+            "allow_in"
+        )
+        .is_ok());
     }
 
     #[test]

@@ -448,6 +448,15 @@ async fn reload_allow(req: &RpcRequest, st: &Arc<State>) -> Result<RpcResponse, 
             }
         }
     }
+    // Inbound carves delegate host ports permanently: refuse a reload
+    // that would wildcard or capture a reserved port (same rule as boot).
+    if let Err(e) = crate::config::validate_ingress_specs(
+        &fresh_in,
+        &st.cfg.reserved_ports,
+        "config `allow_in`",
+    ) {
+        return Err(RpcResponse::err(&req.id, -32001, e.to_string()));
+    }
     // Swap both lists first, then reinstall: install_carves snapshots both
     // under the read lock, so kernel and state converge on one coherent
     // pair (or stay on the old pair if parsing failed above).

@@ -209,6 +209,14 @@ pub enum DenyReason {
     /// Replay of a request whose original is still awaiting a human decision:
     /// pending is not a grant, and the replay does not create a second popup.
     AlreadyPending,
+    /// The requested ingress port overlaps the operator's `reserved_ports`:
+    /// those ports are never delegated to the namespace and stay on the
+    /// host stack (refused inline — the approver cannot fix this).
+    PortReserved,
+    /// A wildcard (`*`) ingress grant cannot be expressed as a host
+    /// delegation: it would DNAT EVERY host port into the namespace.
+    /// Ingress requests must pin ports (egress wildcards remain legal).
+    IngressWildcardPort,
 }
 
 /// Result of `access.request`. Internally tagged on `decision`.

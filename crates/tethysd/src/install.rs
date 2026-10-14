@@ -390,6 +390,14 @@ async fn delegated_add(st: &Arc<State>, dsts: &[ElemDst], port: PortSpec) -> Res
         return Ok(());
     }
     let want = port.nft_range();
+    // Operator-reserved ports are off-limits to delegation even if an
+    // older request path or a pre-reservation ledger row asks for them
+    // (dispatch_access and project_delegated normally refuse earlier).
+    if let Some((lo, hi)) = first_overlap(want, &st.cfg.reserved_ports) {
+        return Err(format!(
+            "port {lo}-{hi} is reserved by operator (reserved_ports); not delegable"
+        ));
+    }
     let mut b = Batch::with_table(&st.cfg.nft_table);
     for set in delegation_sets(dsts) {
         let live = st
@@ -453,6 +461,13 @@ pub(crate) async fn project_delegated(st: &Arc<State>) -> anyhow::Result<()> {
     let mut desired: std::collections::BTreeMap<&'static str, Vec<PortRange>> = Default::default();
     let mut want = |dsts: &[ElemDst], port: PortSpec| {
         let r = port.nft_range();
+        // Reserved ports never delegate, even from an approved row that
+        // predates the operator reserving them: reserved wins and the
+        // stale DNAT port is dropped (fail closed — the ns element may
+        // outlive it, but inbound dies at the host, never hijacked).
+        if first_overlap(r, &st.cfg.reserved_ports).is_some() {
+            return;
+        }
         for set in delegation_sets(dsts) {
             desired.entry(set).or_default().push(r);
         }

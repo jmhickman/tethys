@@ -141,6 +141,13 @@ impl PortSpec {
     }
 }
 
+/// Inclusive overlap between two normalized port ranges (nft interval
+/// semantics: both ends included). `(*,0)` wildcards must be normalized
+/// through `PortSpec::nft_range` before calling.
+pub fn ranges_overlap(a: (u16, u16), b: (u16, u16)) -> bool {
+    a.0 <= b.1 && b.0 <= a.1
+}
+
 /// A target after cardinality validation.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Target {

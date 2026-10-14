@@ -647,6 +647,46 @@ fn dispatch_access(
             }
         }
 
+        // Ingress ports are delegated on the host (DNAT), so two request
+        // shapes can never be honored: '*' would delegate EVERY host port
+        // into the namespace, and an operator-reserved port must never
+        // leave the host stack (sshd etc.). The approver cannot fix either,
+        // so refuse inline — no popup, no row (same shape as the boundary
+        // deny above). Egress wildcards stay legal: nothing is delegated.
+        if params.dir.is_ingress() {
+            let deny = |code: DenyReason, note: String| {
+                resp_line(&RpcResponse::ok(
+                    &id,
+                    Verdict::Denied {
+                        reason_code: code,
+                        grant_id: None,
+                        note: Some(note),
+                    },
+                ))
+            };
+            if params.dst_port.is_all() {
+                respond!(deny(
+                    DenyReason::IngressWildcardPort,
+                    "ingress grants must pin a port: '*' would delegate every host port \
+                     into the namespace"
+                        .into(),
+                ));
+                return;
+            }
+            if let Some(&(lo, hi)) = st
+                .cfg
+                .reserved_ports
+                .iter()
+                .find(|r| tethys_core::types::ranges_overlap(params.dst_port.nft_range(), **r))
+            {
+                respond!(deny(
+                    DenyReason::PortReserved,
+                    format!("port {lo}-{hi} is reserved by the operator (reserved_ports); the host stack keeps it"),
+                ));
+                return;
+            }
+        }
+
         let _pending_permit = match st.pending_budget.clone().try_acquire_owned() {
             Ok(pr) => pr,
             Err(_) => {
