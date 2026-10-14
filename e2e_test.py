@@ -756,11 +756,16 @@ prefix6 = "{PREFIX6}"
 
         # revoke mid-session: a background client holds the v4 flow open
         # across the revoke; the kill pass (step 4) must end it immediately.
+        # nsfile is load-bearing: run from the AGENT namespace and the
+        # probe's own egress chain drops its SYN (correctly!) — the "live
+        # flow" never exists and the kill check silently tests nothing
+        # (run #14: rc=2 timeout masquerading as a kill failure).
+        n_acc = (open(LOG).read().count('"accept"') if os.path.exists(LOG) else 0)
         held = in_ns_popen(["python3", f"{DIR}/probe.py", GW4, str(P_IN), "4.0", "8.0", "held"],
-                           stdout=subprocess.PIPE)
+                           stdout=subprocess.PIPE, nsfile=CLIENT_NSFILE)
         time.sleep(1.2)
         llog = open(LOG).read() if os.path.exists(LOG) else ""
-        if '"accept"' not in llog:
+        if llog.count('"accept"') <= n_acc:
             err = open(f"{DIR}/listener.err").read().strip()[-200:] if os.path.exists(f"{DIR}/listener.err") else ""
             fails.append(f"S11 held flow never reached the listener (log={llog!r} listener_err={err!r})")
         admin_rpc("revoke", {"grant_id": str(gid11)})
