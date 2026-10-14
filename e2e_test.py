@@ -143,10 +143,12 @@ def drops():
 
 
 def delegate(port, family=4):
-    run(["nft", "add", "element", "inet", TABLE, f"delegated_v{family}", "{", str(port), "}"])
+    need(["nft", "add", "element", "inet", TABLE, f"delegated_v{family}", "{", str(port), "}"])
 
 
 def undelegate(port, family=4):
+    # best-effort: the element may already be gone (daemon undelegated on
+    # revoke) — a failed delete is not a harness failure.
     run(["nft", "delete", "element", "inet", TABLE, f"delegated_v{family}", "{", str(port), "}"])
 
 
@@ -672,6 +674,16 @@ prefix6 = "{PREFIX6}"
         if d3c != d2c:
             fails.append(f"S10 non-delegated SYN reached the namespace: {d2c} -> {d3c}")
         print("S10 ingress-drop:", "ok" if "S10" not in str(fails) else fails[-1])
+        if any("S10" in f for f in fails):
+            print("--- S10 diagnostics ---")
+            print("host delegated_v4:", run(["nft", "-a", "list", "set", "inet", TABLE, "delegated_v4"]).stdout.strip()[:300])
+            print("host dnat rules:", run(["nft", "-a", "list", "chain", "inet", TABLE, "delegated"]).stdout.strip()[:600])
+            print("host fwd policy:", run(["iptables", "-S", "FORWARD"]).stdout.strip()[:300])
+            print("host route to ns:", run(["ip", "route", "get", NS4]).stdout.strip()[:200])
+            print("veth state:", run(["ip", "-br", "addr", "show", "dev", HOSTVETH]).stdout.strip()[:200])
+            print("client route to gw:", in_ns(["ip", "route", "get", GW4], nsfile=CLIENT_NSFILE).stdout.strip()[:200])
+            print("ns ingress chain:", ns_text(["nft", "list", "chain", "inet", TABLE, "ingress"])[:600])
+            print("ns conntrack (vh):", in_ns(["conntrack", "-L", "-p", "tcp"]).stderr.strip()[:120] or "n/a")
 
         # S11: grant -> completes with TRUE source (DNAT preserved it) both
         # families; revoke kills the live flow; reconnect is gated again.
