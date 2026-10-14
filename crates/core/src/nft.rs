@@ -499,15 +499,31 @@ impl Batch {
         self.push_drop_rule(CHAIN_INGRESS, COUNTER_DROPS_IN, LOG_PREFIX_INGRESS);
     }
 
-    /// `ct state established,related accept` — replies are never re-gated.
-    /// (Live-flow kill on revoke/expiry is step 4; until a flow dies, its
-    /// packets ride this rule.)
+    /// Replies are never re-gated — and "reply" must be matched on
+    /// DIRECTION, not only on state: conntrack promotes a TCP connection
+    /// to ESTABLISHED only at the client's final ACK, so the SYN-ACK of
+    /// an accepted flow is still state NEW in the reply direction. A
+    /// state-only rule drops every handshake: the granted inbound SYN
+    /// reaches the listener, its SYN-ACK dies at the egress chain, and
+    /// the flow times out (live-verified: S10 passed, S11 never saw an
+    /// accept). Direction needs no family inference, so the plain
+    /// `ct direction` key is inet-safe.
+    /// (Live-flow kill on revoke/expiry is step 4; until a flow dies,
+    /// its packets ride these rules.)
     fn push_ct_established_accept(&mut self, chain: &str) {
         self.push_rule(
             chain,
             vec![
                 json!({"match":{"op":"in","left":{"ct":{"key":"state"}},
                                  "right":{"set":["established","related"]}}}),
+                json!({"accept":null}),
+            ],
+        );
+        self.push_rule(
+            chain,
+            vec![
+                json!({"match":{"op":"==","left":{"ct":{"key":"direction"}},
+                                 "right":"reply"}}),
                 json!({"accept":null}),
             ],
         );
@@ -1534,13 +1550,30 @@ mod tests {
         assert_eq!(ingress_tail[0]["counter"], COUNTER_DROPS_IN);
         assert_eq!(ingress_tail[2]["log"]["prefix"], LOG_PREFIX_INGRESS);
 
-        // Replies pass in both chains (kill-on-revoke is step 4's job).
+        // Replies pass in both chains (kill-on-revoke is step 4's job) —
+        // BOTH rules: state covers post-handshake, direction covers the
+        // SYN-ACK (still NEW). Dropping either one breaks every handshake
+        // or every session; both were live-bitten.
         for chain in [CHAIN_EGRESS, CHAIN_INGRESS] {
-            assert!(cmds.iter().any(|c| {
-                c["add"]["rule"]["chain"].as_str() == Some(chain)
-                    && c["add"]["rule"]["expr"][0]["match"]["left"]["ct"]["key"].as_str()
-                        == Some("state")
-            }));
+            let has = |key: &str, right: &str| {
+                cmds.iter().any(|c| {
+                    c["add"]["rule"]["chain"].as_str() == Some(chain)
+                        && c["add"]["rule"]["expr"][0]["match"]["left"]["ct"]["key"].as_str()
+                            == Some(key)
+                        && match right {
+                            "reply" => {
+                                c["add"]["rule"]["expr"][0]["match"]["right"].as_str()
+                                    == Some("reply")
+                            }
+                            _ => true,
+                        }
+                })
+            };
+            assert!(has("state", ""), "{chain}: no ct-state accept rule");
+            assert!(
+                has("direction", "reply"),
+                "{chain}: no ct-direction-reply accept rule"
+            );
         }
 
         // ICMP/ICMPv6 must pass on BOTH hooks: dropping NDP/PMTU at input

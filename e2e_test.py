@@ -647,7 +647,8 @@ prefix6 = "{PREFIX6}"
 
         # ---- packet scenarios ----------------------------------------------
         LOG = f"{DIR}/listener.log"
-        listener = in_ns_popen(["python3", f"{DIR}/listener.py", str(P_IN), LOG])
+        listener = in_ns_popen(["python3", f"{DIR}/listener.py", str(P_IN), LOG],
+                               stderr=open(f"{DIR}/listener.err", "w"))
         hostl = subprocess.Popen(
             ["python3", "-c",
              "import socket,sys; s=socket.socket(); s.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1);"
@@ -758,8 +759,10 @@ prefix6 = "{PREFIX6}"
         held = in_ns_popen(["python3", f"{DIR}/probe.py", GW4, str(P_IN), "4.0", "8.0", "held"],
                            stdout=subprocess.PIPE)
         time.sleep(1.2)
-        if '"accept"' not in open(LOG).read():
-            fails.append("S11 held flow never reached the listener")
+        llog = open(LOG).read() if os.path.exists(LOG) else ""
+        if '"accept"' not in llog:
+            err = open(f"{DIR}/listener.err").read().strip()[-200:] if os.path.exists(f"{DIR}/listener.err") else ""
+            fails.append(f"S11 held flow never reached the listener (log={llog!r} listener_err={err!r})")
         admin_rpc("revoke", {"grant_id": str(gid11)})
         try:
             held.wait(timeout=10)
@@ -848,13 +851,13 @@ def need_in_ns(argv, nsfile):
     return r.stdout
 
 
-def in_ns_popen(argv, nsfile=NSPATH, stdout=None):
+def in_ns_popen(argv, nsfile=NSPATH, stdout=None, stderr=None):
     def _pre():
         fd = os.open(nsfile, os.O_RDONLY)
         os.setns(fd, CLONE_NEWNET)
         os.close(fd)
     return subprocess.Popen(argv, stdout=stdout or subprocess.DEVNULL,
-                            stderr=subprocess.DEVNULL, preexec_fn=_pre)
+                            stderr=stderr or subprocess.DEVNULL, preexec_fn=_pre)
 
 
 if __name__ == "__main__":
