@@ -224,7 +224,11 @@ if hold > 0:
     except socket.timeout:
         print("held"); sys.exit(0)                          # survived hold
     except ConnectionResetError:
-        print("reset"); sys.exit(5)                         # flow died
+        print("reset"); sys.exit(5)                         # peer saw RST
+    except OSError as e:
+        # OWNER-side kill: SOCK_DESTROY leaves ENOTCONN (or EPIPE) on the
+        # killed fd itself. That is the flow dying, not a probe bug.
+        print(f"dead:{e.errno}"); sys.exit(5)
 sys.exit(0)
 """
 
@@ -584,8 +588,8 @@ prefix6 = "{PREFIX6}"
         else:
             held6.kill()
             skips.append("S6 kill check skipped: kernel reports no SOCK_DESTROY")
-        if len(approved_gids) != 2:
-            fails.append(f"S6 only {len(approved_gids)} grants confirmed approved before stop")
+        if len(approved_gids) != 3:
+            fails.append(f"S6 only {len(approved_gids)} grants confirmed approved before stop (want 3)")
         if d_pend.get("reason_code") != "human_denied" or "stopped" not in (d_pend.get("note") or ""):
             fails.append(f"S6 pending not denied by stop: {d_pend}")
         print("S6 stop.grants:", "ok" if "S6" not in str(fails) else fails[-1])
@@ -880,6 +884,14 @@ prefix6 = "{PREFIX6}"
         dgx = run(["nft", "-a", "list", "set", "inet", TABLE, "delegated_v4"]).stdout
         if str(P_IN) in dgx:
             fails.append(f"S13 delegation outlived the expired grant: {dgx.strip()[:200]}")
+            try:
+                dl = open(f"{DIR}/tethysd.log").read().splitlines()
+                hits = [l for l in dl if "delegat" in l.lower() or "expiry" in l.lower()][-12:]
+                print("--- S13 daemon log (delegation/expiry lines) ---")
+                for l in hits:
+                    print(" ", l[:300])
+            except OSError as e:
+                print(f"  (daemon log unreadable: {e})")
         delegate(P_IN, 4)  # re-open so the probe reaches the ns policy again
         kx, _ = probe(GW4, P_IN)
         if kx != "timeout":
