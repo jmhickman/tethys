@@ -874,19 +874,24 @@ pub fn parse_set_ports(doc: &Value, tname: &str, sname: &str) -> Vec<(u16, u16)>
             continue;
         };
         for el in elems {
-            // Accept both the direct {"val":N} shape and an {"elem":{...}}
-            // wrapper; some nft versions nest element metadata one level in.
-            let val = el
+            // Element shapes, per live `list set` output (run #19: the leak
+            // survived the first fix because ONLY the wrapped shapes were
+            // read): a plain single value is the bare number (Immediate in
+            // the nftables-json model), an interval-set element is the
+            // RANGE object itself {"range":[lo,hi]} (Expression::Range),
+            // and concat-set elements wrap in {"val":...} (sometimes under
+            // {"elem":{...}}) with ranges again as {"range":[lo,hi]}.
+            // Missing the first two made every delegation poll read empty:
+            // the overlap guard never fired and delegated_remove silently
+            // deleted nothing — delegations leaked on every revoke/expiry
+            // while grants kept working on a stale-open port.
+            let val = match el
                 .get("val")
-                .or_else(|| el.get("elem").and_then(|e| e.get("val")));
-            let Some(val) = val else { continue };
-            // Interval sets (ours all are) render elements as RANGE objects:
-            // {"val":{"range":[lo,hi]}} — the same rendering parse_poll sees
-            // inside concats, and the nftables-json model's Expression::Range.
-            // Missing this shape made every delegation poll read empty: the
-            // overlap guard never fired and delegated_remove silently deleted
-            // nothing (live-bitten: delegations leaked on every revoke/expiry
-            // while grants kept working on a stale-open port).
+                .or_else(|| el.get("elem").and_then(|e| e.get("val")))
+            {
+                Some(inner) => inner,
+                None => el,
+            };
             let val = val.get("range").unwrap_or(val);
             if let Some(p) = val.as_u64() {
                 if p <= 65535 {
@@ -1255,6 +1260,9 @@ mod tests {
                          {"val":"http"}, {"val":70000},
                          {"val":{"range":[45906,45906]}},
                          {"val":{"range":[9000,9100]}}]}},
+            {"set": {"family":"inet","table":"tethys","name":"delegated_bare",
+                "elem": [443, {"range":[8000,8100]}, {"range":[45906,45906]},
+                         "http", 70000]}},
             {"set": {"family":"inet","table":"other","name":"delegated_v4",
                 "elem": [{"val":1}]}},
             {"set": {"family":"inet","table":"tethys","name":"delegated_v6",
@@ -1267,6 +1275,14 @@ mod tests {
         assert_eq!(
             parse_set_ports(&doc, "tethys", "delegated_v6"),
             vec![(993, 993)]
+        );
+        // The REAL `list set` rendering for plain (non-concat) sets: bare
+        // numbers and bare range objects, no {"val":...} wrapper. Run #19
+        // proved parsers that only read wrapped shapes poll these sets as
+        // empty and leak every delegation.
+        assert_eq!(
+            parse_set_ports(&doc, "tethys", "delegated_bare"),
+            vec![(443, 443), (8000, 8100), (45906, 45906)]
         );
         assert!(parse_set_ports(&doc, "other2", "delegated_v4").is_empty());
         assert!(parse_set_ports(&doc, "tethys", "missing").is_empty());
